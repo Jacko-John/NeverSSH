@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2
+
+### Fixes
+
+- Shortened every tool description and the MCP server instructions. Descriptions now total about 1.4 KB (from 3.8 KB) and instructions about 0.7 KB, cutting the text sent with every request. Behavior and parameters are unchanged; details live in the skill and `docs/interfaces.md`.
+
 ## 0.2.1
 
 ### Fixes

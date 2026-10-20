@@ -132,7 +132,14 @@ launcher 需要本机有 `curl`、`bun` 1.3+ 和 OpenSSH 客户端。Release 解
 
 需要自定义配置时，在 `args` 中增加 `--config` 和配置文件绝对路径。
 
-MCP 无法重定向客户端自带的本地 shell、编辑器或搜索工具。可将 [Agent 指引](docs/agent-instructions.md) 加入客户端的项目指令。
+MCP 无法重定向客户端自带的本地 shell、编辑器或搜索工具。仓库内的 [Agent skill](skills/neverssh/SKILL.md) 覆盖安装、目标选择、命令与文件操作流程。以 Claude Code 为例，复制到用户级 skill 目录即可使用：
+
+```sh
+mkdir -p ~/.claude/skills
+cp -R skills/neverssh ~/.claude/skills/
+```
+
+skill 会在需要远端操作时触发；安装与排错细节见 `skills/neverssh/references/installation.md`。
 
 ## 工具使用
 

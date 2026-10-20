@@ -6,7 +6,7 @@ import fileOpsSource from "./remote/file_ops.py" with { type: "text" };
 import helperSource from "./remote/helper.py" with { type: "text" };
 import workerSource from "./remote/worker.py" with { type: "text" };
 
-export const SERVER_VERSION = "0.2.0";
+export const SERVER_VERSION = "0.2.1";
 export const PROTOCOL_VERSION = 1;
 export const MIN_PYTHON = "3.8";
 export const ARCHIVE_FORMAT = 1;

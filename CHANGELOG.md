@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1
+
+### Fixes
+
+- Tool input schemas no longer publish the JSON Schema `pattern` keyword. Some model providers reject it with HTTP 400 as soon as the tools are attached. Shape checks now use Zod refines, so server-side validation is unchanged.
+- Added a regression test that no published tool schema contains `pattern`.
+
 ## 0.2.0
 
 ### Breaking changes

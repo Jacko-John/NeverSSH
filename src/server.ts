@@ -26,7 +26,7 @@ const scope = {
   connection_id: connectionId,
   cwd: remotePath.optional().describe("Remote working directory; defaults to this connection's remote home directory."),
 };
-const hash = z.string().regex(/^[a-f0-9]{64}$/).optional();
+const hash = z.string().refine((value) => /^[a-f0-9]{64}$/.test(value), "Use a lowercase hex SHA-256").optional();
 
 /** Owns runtime state for one client process, including its connection and task lifetimes. */
 export class Runtime {

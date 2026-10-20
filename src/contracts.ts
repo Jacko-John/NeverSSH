@@ -2,10 +2,11 @@
 import { z } from "zod";
 import { cleanString, hostField, portField, userField } from "./config";
 
-const shortId = z.string().regex(/^[a-f0-9]{8}$/);
+const shortId = z.string().refine((value) => /^[a-f0-9]{8}$/.test(value), "Use the short ID returned by ssh_connect");
 export const connectionId = shortId.describe("Short connection_id returned by ssh_connect in this MCP instance.");
 const target = { host: hostField, user: userField.optional(), port: portField.optional() };
-const taskId = z.string().regex(/^task_[a-f0-9]{8}$/).describe("Prefixed task_id returned by ssh_bash; unique within this MCP instance.");
+const taskId = z.string().refine((value) => /^task_[a-f0-9]{8}$/.test(value), "Use the task_id returned by ssh_bash")
+  .describe("Prefixed task_id returned by ssh_bash; unique within this MCP instance.");
 const taskScope = { task_id: taskId };
 const waitSeconds = z.number().min(0).max(300);
 

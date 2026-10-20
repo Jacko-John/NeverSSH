@@ -128,6 +128,10 @@ describe("MCP and connections", () => {
     expect(properties("ssh_write_file")).toEqual(["connection_id", "file_path", "content"]);
     expect(properties("ssh_edit_file")).toEqual(["connection_id", "file_path", "old_string", "new_string", "replace_all"]);
     expect(properties("ssh_task_list")).toEqual(["connection_id"]);
+    // Some model providers reject the JSON Schema `pattern` keyword with a 400.
+    for (const tool of listing.tools) {
+      expect(JSON.stringify(tool.inputSchema), tool.name).not.toContain('"pattern"');
+    }
     expect(properties("ssh_upload")).not.toContain("parents");
     const result = await call("ssh_discover");
     expect(result).toEqual({ servers: ["fixture", "missing-python", "slow", "slow-cancel", "untrusted"].map((host) => ({ host })) });

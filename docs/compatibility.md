@@ -6,7 +6,7 @@ NeverSSH 不安装远端服务。远端 Python 源码由本地包提供，首次
 
 | 维度 | 当前值 | 兼容规则 |
 | --- | --- | --- |
-| MCP 服务版本 | `0.2.0` | 工具增删改、参数重命名按 semver 的 major 处理 |
+| MCP 服务版本 | `0.2.1` | 工具增删改、参数重命名按 semver 的 major 处理 |
 | worker 协议 | `1` | 只在 wire 不兼容时递增；客户端校验，不匹配返回 `PROTOCOL_INCOMPATIBLE` |
 | 构建 ID | 源码内容哈希 | 本地与远端必须完全一致；不匹配返回 `BUILD_MISMATCH` |
 | 最低 Python | `3.8` | 在加载任何源码前检查；过旧返回 `RUNTIME_UNSUPPORTED` |

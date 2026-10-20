@@ -4,11 +4,20 @@ import { resolve } from "node:path";
 import { z } from "zod";
 
 export const cleanString = z.string().min(1).refine((value) => !value.includes("\0"), "NUL is not allowed");
-export const hostField = cleanString.max(255).regex(/^[a-zA-Z0-9_:[\]][a-zA-Z0-9_.:[\]%-]*$/, "Use an SSH alias, hostname, or IP; pass user separately");
-export const userField = cleanString.max(255).regex(/^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$/, "Use an SSH login name");
+
+/**
+ * Shape checks use refine rather than regex: a regex constraint is published as the JSON Schema
+ * `pattern` keyword, which some model providers reject with a 400. Validation is unchanged.
+ */
+const shaped = (schema: z.ZodString, expression: RegExp, message: string) =>
+  schema.refine((value) => expression.test(value), message);
+
+export const hostField = shaped(cleanString.max(255), /^[a-zA-Z0-9_:[\]][a-zA-Z0-9_.:[\]%-]*$/,
+  "Use an SSH alias, hostname, or IP; pass user separately");
+export const userField = shaped(cleanString.max(255), /^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$/, "Use an SSH login name");
 export const portField = z.number().int().min(1).max(65535);
 const accessRule = z.strictObject({
-  host: cleanString.max(255).regex(/^[a-zA-Z0-9_*?.:[\]%-]+$/, "Use a host pattern with optional * and ?"),
+  host: shaped(cleanString.max(255), /^[a-zA-Z0-9_*?.:[\]%-]+$/, "Use a host pattern with optional * and ?"),
   user: cleanString.max(255).optional(),
   port: portField.optional(),
 });

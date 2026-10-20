@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "access": { "deny": [] },
+  "localTransferRoots": [],
+  "compression": true,
+  "maxFileBytes": 4194304,
+  "maxTaskOutputBytes": 67108864,
+  "maxArchiveBytes": 1073741824
+}

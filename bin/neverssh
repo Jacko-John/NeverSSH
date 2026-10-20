@@ -1,0 +1,46 @@
+#!/bin/sh
+# Resolve the latest NeverSSH GitHub release, cache its Bun bundle, and start it.
+set -eu
+
+REPO="Jacko-John/NeverSSH"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/neverssh"
+LATEST_FILE="$CACHE/latest"
+mkdir -p "$CACHE"
+chmod 700 "$CACHE" 2>/dev/null || true
+
+TAG=""
+if URL=$(curl --proto '=https' --tlsv1.2 -fsSLI --connect-timeout 5 --max-time 15 \
+    -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" 2>/dev/null); then
+  TAG=${URL##*/}
+  case "$TAG" in
+    */*) TAG="" ;;
+    v*) printf '%s\n' "$TAG" > "$LATEST_FILE" ;;
+    *) TAG="" ;;
+  esac
+fi
+if [ -z "$TAG" ] && [ -f "$LATEST_FILE" ]; then
+  TAG=$(cat "$LATEST_FILE")
+fi
+case "$TAG" in
+  */*) TAG="" ;;
+esac
+case "$TAG" in
+  v*) ;;
+  *) echo "neverssh: cannot determine the latest release" >&2; exit 1 ;;
+esac
+
+DIR="$CACHE/$TAG"
+FILE="$DIR/neverssh.js"
+if [ ! -f "$FILE" ]; then
+  mkdir -p "$DIR"
+  chmod 700 "$DIR" 2>/dev/null || true
+  TMP="$FILE.$$"
+  trap 'rm -f "$TMP"' EXIT HUP INT TERM
+  curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 10 --max-time 120 \
+    "https://github.com/$REPO/releases/download/$TAG/neverssh.js" -o "$TMP"
+  chmod 600 "$TMP"
+  mv "$TMP" "$FILE"
+  trap - EXIT HUP INT TERM
+fi
+
+exec bun "$FILE" "$@"

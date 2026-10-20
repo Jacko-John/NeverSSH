@@ -1,6 +1,6 @@
 ---
 name: neverssh
-description: Operate remote Linux hosts through NeverSSH MCP tools (ssh_*). Use whenever a task touches another machine over SSH — commands, file reads or edits, transfers, or a host the user names — and never run ssh, scp, or sftp directly. Also use when the ssh_* tools are missing or failing and NeverSSH needs to be installed or diagnosed.
+description: Always use NeverSSH MCP tools (ssh_*) for remote hosts; never run ssh, scp, sftp, sshpass, or rsync -e ssh through Bash — not even a hostname or connectivity check. Run remote commands with ssh_bash, read and edit with ssh_read_file/ssh_write_file/ssh_edit_file, and transfer with ssh_upload/ssh_download, reusing a connection_id from ssh_sessions or ssh_connect. Use whenever a task touches another machine over SSH, or when the ssh_* tools are missing or failing.
 ---
 
 # NeverSSH
@@ -9,27 +9,9 @@ NeverSSH turns the user's existing SSH access into MCP tools. The MCP server and
 
 Tool names appear here without a prefix. Clients that namespace MCP tools may show them as `mcp__neverssh__ssh_*`.
 
-## Never run ssh yourself
-
-The user installed NeverSSH so that remote work goes through it. Do not run `ssh`, `scp`, `sftp`, `sshpass`, or `rsync -e ssh` through the client's Bash or terminal tool — not even a single `hostname`, a one-line `cat`, or a connectivity check. Map the intent to a tool:
-
-| You want to | Use |
-| --- | --- |
-| Run any remote command | `ssh_bash` |
-| Read or edit a remote file | `ssh_read_file`, `ssh_write_file`, `ssh_edit_file` |
-| List a directory, find files, search contents | `ssh_bash` with `ls`, `find`, `rg` |
-| Copy a file in either direction | `ssh_upload`, `ssh_download` |
-| Check that a host is reachable | `ssh_connect`, then `ssh_bash` |
-
-Before any remote call, get a `connection_id` from `ssh_sessions` or open one with `ssh_connect`. Reuse that handle for the whole task.
-
-Raw SSH bypasses the user's access policy, connection reuse, task tracking, archived logs, and file revision checks. Its results are invisible to NeverSSH, so the user cannot audit or reproduce the work. If a task truly cannot be expressed through the tools — an interactive TTY, port forwarding, stdin streaming, or a long-lived tunnel — say so and ask the user instead of opening an SSH session behind their back.
-
-Local SSH tooling that does not open a remote session is fine: `ssh-keygen`, `ssh-add`, `ssh-agent`, `ssh-keyscan`, `ssh-copy-id`, and `git` over SSH.
-
 ## Start with the client's state
 
-If the `ssh_*` tools are not available, read [references/installation.md](references/installation.md) and install or repair the server first. Do not fall back to `ssh` while you do it: the user's access rules, connection lifecycle, and task history live in NeverSSH.
+If the `ssh_*` tools are not available, read [references/installation.md](references/installation.md) and install or repair the server first. Do not silently replace remote work with local `ssh` commands; the user's access rules and connection lifecycle live in NeverSSH.
 
 When the tools are available, call `ssh_sessions({})` before connecting. Reuse an existing `connection_id` for the target instead of opening a second connection. `ssh_connect` also reuses ready connections, but `ssh_sessions` is the only reliable way to learn their IDs.
 

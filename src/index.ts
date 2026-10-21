@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /** CLI entry point: stdio MCP by default, or an explicit connection diagnostic. */
-import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import { serveStdio, StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { loadConfig } from "./config";
 import { createServer, Runtime, VERSION } from "./server";
 
@@ -37,7 +37,10 @@ async function main(): Promise<void> {
     } finally { await runtime.close(); }
     return;
   }
-  const handle = serveStdio(() => createServer(runtime), { onerror: (error) => console.error("NeverSSH MCP:", error.message) });
+  const transport = new StdioServerTransport();
+  const handle = serveStdio(() => createServer(runtime), {
+    transport, onerror: (error) => console.error("NeverSSH MCP:", error.message),
+  });
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;
@@ -45,8 +48,13 @@ async function main(): Promise<void> {
     await runtime.close();
     await handle.close();
   };
+  // Observe the entry-owned wire, preserving SDK teardown while probe instances come and go.
+  const onWireClose = transport.onclose;
+  transport.onclose = () => {
+    try { onWireClose?.(); }
+    finally { void shutdown().catch((error) => console.error(error.message)); }
+  };
   for (const event of ["SIGINT", "SIGTERM"] as const) process.once(event, () => { void shutdown().catch((error) => console.error(error.message)); });
-  process.stdin.once("end", () => { void shutdown().catch((error) => console.error(error.message)); });
 }
 
 if (import.meta.main) {

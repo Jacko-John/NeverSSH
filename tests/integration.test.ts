@@ -2,8 +2,10 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { spawn } from "node:child_process";
 import { chmod, lstat, mkdir, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import { SshFixture } from "./fixture";
 import { Runtime } from "../src/server";
@@ -684,4 +686,111 @@ describe("Bash tasks and archives", () => {
     }
     expect(metadata).toHaveProperty("finished_at");
   }, 12000);
+});
+
+/** Clients whose stdio transport subclasses the SDK's (Claude Code's does) probe the protocol era
+ * on the connection itself instead of on a throwaway sibling process. */
+class InPlaceTransport extends StdioClientTransport {}
+
+describe("MCP era negotiation", () => {
+  test("a legacy handshake after the server/discover probe leaves the connection usable", async () => {
+    const transport = new InPlaceTransport({
+      command: process.execPath, args: ["run", resolve(process.env.NEVERSSH_TEST_ENTRYPOINT ?? "src/index.ts"), "--config", fixture.configPath],
+      env: { ...process.env } as Record<string, string>, stderr: "pipe",
+    });
+    let negotiationStderr = "";
+    transport.stderr?.on("data", (chunk: Buffer) => { negotiationStderr = (negotiationStderr + chunk.toString()).slice(-4096); });
+    // A 1ms probe bound expires long before this server answers, so the client probes with
+    // server/discover and then keeps the 2025-era handshake on the same process: the server
+    // discards its probe instance, which must not take the connection's runtime down with it.
+    const client = new Client({ name: "neverssh-negotiation-test", version: "1.0.0" },
+      { versionNegotiation: { mode: "auto", probe: { timeoutMs: 1 } } });
+    await client.connect(transport);
+    try {
+      expect(client.getProtocolEra()).toBe("legacy");
+      const connection = await client.callTool({ name: "ssh_connect", arguments: { host: "fixture" } });
+      expect(connection.isError, JSON.stringify(connection.content)).toBeFalsy();
+      expect(connection.structuredContent).toMatchObject({ connection_id: expect.any(String) });
+    } finally { await client.close(); }
+    expect(negotiationStderr).not.toContain("SyntaxError");
+  }, 20000);
+});
+
+describe("MCP wire lifecycle", () => {
+  test("stdout EPIPE closes the runtime even while the client keeps stdin open", async () => {
+    const epipeFixture = new SshFixture();
+    try {
+      await epipeFixture.start();
+      const child = spawn(process.execPath, [
+        "run", resolve(process.env.NEVERSSH_TEST_ENTRYPOINT ?? "src/index.ts"), "--config", epipeFixture.configPath,
+      ], { stdio: ["pipe", "pipe", "pipe"], env: process.env });
+      const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      const reader = createInterface({ input: child.stdout });
+      const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
+      let sequence = 0;
+      let diagnostic = "";
+      reader.on("line", (line) => {
+        const message = JSON.parse(line);
+        pending.get(message.id)?.resolve(message);
+      });
+      child.stderr.on("data", (chunk: Buffer) => { diagnostic = (diagnostic + chunk.toString()).slice(-8192); });
+      child.stdin.on("error", () => {});
+      child.once("exit", () => {
+        for (const request of pending.values()) request.reject(new Error(`Server exited: ${diagnostic}`));
+      });
+
+      /** Use raw pipes so the test can close stdout without also ending the client's stdin. */
+      const rpc = (method: string, params: Record<string, unknown>): Promise<any> => {
+        const id = ++sequence;
+        let timer: ReturnType<typeof setTimeout>;
+        return new Promise((resolve, reject) => {
+          timer = setTimeout(() => reject(new Error(`Timed out awaiting ${method}: ${diagnostic}`)), 5000);
+          pending.set(id, { resolve, reject });
+          child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+        }).finally(() => {
+          clearTimeout(timer);
+          pending.delete(id);
+        });
+      };
+
+      try {
+        await rpc("initialize", {
+          protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "neverssh-epipe-test", version: "1" },
+        });
+        child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+        const connection = await rpc("tools/call", { name: "ssh_connect", arguments: { host: "fixture" } });
+        expect(connection.result.isError).toBeFalsy();
+        const started = await rpc("tools/call", {
+          name: "ssh_bash", arguments: {
+            connection_id: connection.result.structuredContent.connection_id,
+            command: "printf retained; (sleep 3; touch epipe-leak) & wait", run_in_background: true,
+          },
+        });
+        expect(started.result.isError).toBeFalsy();
+        const running = started.result.content.map((item: { text: string }) => item.text).join("\n");
+
+        // The next response hits EPIPE; stdin deliberately remains open throughout cleanup.
+        child.stdout.destroy();
+        child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: ++sequence, method: "tools/list", params: {} }) + "\n");
+        const deadline = Date.now() + 5000;
+        while ((child.exitCode === null || epipeFixture.commands.size || epipeFixture.connections.size) && Date.now() < deadline) {
+          await delay(50);
+        }
+        expect(diagnostic).toContain("EPIPE");
+        expect(child.exitCode, diagnostic).toBe(0);
+        expect(epipeFixture.commands.size).toBe(0);
+        expect(epipeFixture.connections.size).toBe(0);
+        expect(await logOutput(running)).toBe("retained");
+        const metadata = JSON.parse(await readFile(logPath(running).replace(".log", ".meta.json"), "utf8"));
+        expect(metadata).toHaveProperty("finished_at");
+        await delay(3100);
+        expect(await readdir(epipeFixture.workspace)).not.toContain("epipe-leak");
+      } finally {
+        reader.close();
+        child.stdin.end();
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+        await exited;
+      }
+    } finally { await epipeFixture.close(); }
+  }, 20000);
 });

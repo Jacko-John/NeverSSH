@@ -252,8 +252,9 @@ export function createServer(runtime: Runtime): McpServer {
     ...scope, remotePath, localPath: cleanString.max(4096), overwrite: z.boolean().default(false),
   }, false, format.downloadText, (args, context) => download(runtime.ssh, args.connection_id, args, args.cwd, context.mcpReq.signal));
 
-  server.server.onclose = () => {
-    void runtime.close().catch((error) => console.error("NeverSSH cleanup failed:", error.message));
-  };
+  // The runtime outlives every server instance: serveStdio builds a throwaway instance for its
+  // era probe and closes it when the connection falls back to the legacy handshake, so closing
+  // the runtime from an instance's onclose would leave the pinned instance serving a dead
+  // transport. index.ts owns the runtime and closes it when the stdio wire ends or the process shuts down.
   return server;
 }

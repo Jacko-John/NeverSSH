@@ -27,7 +27,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
-            gh release create "$GITHUB_REF_NAME" --generate-notes
-          gh release upload "$GITHUB_REF_NAME" \
-            neverssh.js bin/neverssh neverssh.config.example.json --clobber
+          TITLE="NeverSSH ${GITHUB_REF_NAME#v}"
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --draft --latest=false --verify-tag \
+              --title "$TITLE" --generate-notes
+          fi
+          for attempt in 1 2 3; do
+            if gh release upload "$GITHUB_REF_NAME" \
+                neverssh.js bin/neverssh neverssh.config.example.json --clobber; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "Release asset upload failed after 3 attempts; release was not published by this run" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+          # Publish only after GitHub confirms every required asset finished uploading.
+          if [ "$(gh release view "$GITHUB_REF_NAME" --json assets --jq \
+              '[.assets[] | select(.state == "uploaded") | .name] | (index("neverssh.js") != null and index("neverssh") != null and index("neverssh.config.example.json") != null)')" != true ]; then
+            echo "Release assets are incomplete; release was not published by this run" >&2
+            exit 1
+          fi
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest --title "$TITLE"

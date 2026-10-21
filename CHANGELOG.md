@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.3
 
 ### Fixes
 
@@ -8,7 +8,9 @@
 - Resolve `~/` transfer paths against the remote home directory even when `cwd` is supplied.
 - Send file responses incrementally under backpressure and account for JSON escaping in response limits, preserving connections during concurrent reads.
 - Share file revisions across previously read relative and absolute path spellings.
-- Keep the last usable launcher cache when a new release download fails.
+- Start cached releases immediately and refresh them in the background. Failed or interrupted downloads preserve the last complete bundle; a refreshed release takes effect on the next start.
+- Keep the shared runtime alive during MCP protocol negotiation and close it when the actual stdio connection ends, including output errors.
+- Publish releases only after all assets have uploaded, with bounded retries for transient upload failures.
 
 ## 0.2.2
 

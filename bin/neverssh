@@ -1,5 +1,5 @@
 #!/bin/sh
-# Resolve the latest NeverSSH GitHub release, cache its Bun bundle, and start it.
+# Start a cached NeverSSH release immediately, then refresh that cache in the background.
 set -eu
 
 REPO="Jacko-John/NeverSSH"
@@ -8,73 +8,101 @@ LATEST_FILE="$CACHE/latest"
 mkdir -p "$CACHE"
 chmod 700 "$CACHE" 2>/dev/null || true
 
-# Keep interrupted downloads and pointer updates out of the reusable cache.
-TMP=""
-LATEST_TMP=""
-cleanup() {
-  if [ -n "$TMP" ]; then rm -f "$TMP"; fi
-  if [ -n "$LATEST_TMP" ]; then rm -f "$LATEST_TMP"; fi
-}
-trap cleanup EXIT
-trap 'exit 129' HUP
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-# Only a complete cached bundle can serve as the last known working release.
-CACHED_TAG=""
-if [ -f "$LATEST_FILE" ]; then CACHED_TAG=$(cat "$LATEST_FILE"); fi
-case "$CACHED_TAG" in
-  */*) CACHED_TAG="" ;;
-  v*) if [ ! -f "$CACHE/$CACHED_TAG/neverssh.js" ]; then CACHED_TAG=""; fi ;;
-  *) CACHED_TAG="" ;;
-esac
-
-TAG=""
-PUBLISH_LATEST=false
-if URL=$(curl --proto '=https' --tlsv1.2 -fsSLI --connect-timeout 5 --max-time 15 \
-    -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" 2>/dev/null); then
-  TAG=${URL##*/}
-  case "$TAG" in
-    */*) TAG="" ;;
-    v*) PUBLISH_LATEST=true ;;
-    *) TAG="" ;;
+# Keep release tags inside one cache directory, including tags read from an older pointer.
+valid_tag() {
+  case "$1" in
+    */*) return 1 ;;
+    v*) return 0 ;;
+    *) return 1 ;;
   esac
-fi
-if [ -z "$TAG" ]; then TAG="$CACHED_TAG"; fi
-case "$TAG" in
-  v*) ;;
-  *) echo "neverssh: cannot determine the latest release" >&2; exit 1 ;;
-esac
+}
 
-DIR="$CACHE/$TAG"
-FILE="$DIR/neverssh.js"
-if [ ! -f "$FILE" ]; then
-  mkdir -p "$DIR"
-  chmod 700 "$DIR" 2>/dev/null || true
-  TMP=$(mktemp "$FILE.XXXXXX")
-  if curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 10 --max-time 120 \
-      "https://github.com/$REPO/releases/download/$TAG/neverssh.js" -o "$TMP" && \
-      chmod 600 "$TMP" && mv -f "$TMP" "$FILE"; then
-    TMP=""
-  elif [ -n "$CACHED_TAG" ]; then
-    echo "neverssh: cannot cache $TAG; using cached $CACHED_TAG" >&2
-    TAG="$CACHED_TAG"
-    FILE="$CACHE/$TAG/neverssh.js"
-    PUBLISH_LATEST=false
-  else
-    echo "neverssh: cannot cache $TAG and no previous release is available" >&2
+# Print the tag recorded by an earlier run, when it is a release tag.
+recorded_tag() {
+  if [ -f "$LATEST_FILE" ]; then
+    tag=$(cat "$LATEST_FILE" 2>/dev/null) || tag=""
+    if valid_tag "$tag"; then printf '%s\n' "$tag"; fi
+  fi
+}
+
+# Find a complete cached bundle when the recorded tag is missing or unusable.
+newest_cached_tag() {
+  newest=""
+  for file in "$CACHE"/v*/neverssh.js; do
+    if [ ! -f "$file" ]; then continue; fi
+    if [ -z "$newest" ] || [ "$file" -nt "$CACHE/$newest/neverssh.js" ]; then
+      newest=${file#"$CACHE"/}
+      newest=${newest%/neverssh.js}
+    fi
+  done
+  if [ -n "$newest" ]; then printf '%s\n' "$newest"; fi
+}
+
+# Ask GitHub for the current release tag; empty output means the network failed.
+resolve_tag() {
+  url=$(curl --proto '=https' --tlsv1.2 -fsSLI --connect-timeout 5 --max-time 15 \
+    -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" 2>/dev/null) || url=""
+  tag=${url##*/}
+  if valid_tag "$tag"; then printf '%s\n' "$tag"; fi
+}
+
+# Isolate staging and traps for each refresh. Every failure is explicit because callers may
+# use this function in a condition, where POSIX shells disable errexit throughout the function.
+cache_release() (
+  tag=$1
+  file="$CACHE/$tag/neverssh.js"
+  tmp=""
+  latest_tmp=""
+  cleanup() {
+    if [ -n "$tmp" ]; then rm -f "$tmp"; fi
+    if [ -n "$latest_tmp" ]; then rm -f "$latest_tmp"; fi
+  }
+  trap cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  # Publish a complete bundle atomically, keeping failed downloads out of discovery.
+  if [ ! -f "$file" ]; then
+    mkdir -p "$CACHE/$tag" || exit 1
+    chmod 700 "$CACHE/$tag" 2>/dev/null || true
+    tmp=$(mktemp "$file.XXXXXX") || exit 1
+    if curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 10 --max-time 120 \
+        "https://github.com/$REPO/releases/download/$tag/neverssh.js" -o "$tmp" && \
+        chmod 600 "$tmp" && mv -f "$tmp" "$file"; then
+      tmp=""
+    else
+      exit 1
+    fi
+  fi
+
+  # Concurrent starts always read a whole pointer to an already usable bundle.
+  latest_tmp=$(mktemp "$CACHE/latest.XXXXXX") || exit 1
+  printf '%s\n' "$tag" > "$latest_tmp" || exit 1
+  mv -f "$latest_tmp" "$LATEST_FILE" || exit 1
+  latest_tmp=""
+)
+
+# Detach refresh from MCP stdio so it cannot delay startup or keep the client connection open.
+refresh_in_background() {
+  (
+    tag=$(resolve_tag)
+    if [ -n "$tag" ]; then cache_release "$tag" || exit 1; fi
+  ) </dev/null >/dev/null 2>&1 &
+}
+
+tag=$(recorded_tag)
+if [ -z "$tag" ] || [ ! -f "$CACHE/$tag/neverssh.js" ]; then tag=$(newest_cached_tag); fi
+if [ -n "$tag" ]; then
+  refresh_in_background
+else
+  # Only an empty cache requires this start to wait for the network.
+  tag=$(resolve_tag)
+  if [ -z "$tag" ]; then
+    echo "neverssh: GitHub is unreachable and no release is cached" >&2
     exit 1
   fi
+  cache_release "$tag"
 fi
 
-# Publish only usable releases, replacing the pointer atomically for concurrent launchers.
-if [ "$PUBLISH_LATEST" = true ]; then
-  LATEST_TMP=$(mktemp "$CACHE/latest.XXXXXX")
-  printf '%s\n' "$TAG" > "$LATEST_TMP"
-  mv -f "$LATEST_TMP" "$LATEST_FILE"
-  LATEST_TMP=""
-fi
-
-cleanup
-trap - EXIT HUP INT TERM
-exec bun "$FILE" "$@"
+exec bun "$CACHE/$tag/neverssh.js" "$@"

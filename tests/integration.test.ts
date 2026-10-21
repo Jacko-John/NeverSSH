@@ -292,6 +292,27 @@ describe("remote files", () => {
     expect(await readFile(join(fixture.workspace, "guard.txt"), "utf8")).toBe("replaced");
   });
 
+  test("fresh revisions remain usable across relative, absolute, and home-relative paths", async () => {
+    const path = join(fixture.workspace, "revision-alias.txt");
+    await writeFile(path, "original");
+    await call("ssh_read_file", { connection_id: dev, file_path: "revision-alias.txt" });
+
+    // A fresh absolute read must also refresh an earlier relative spelling.
+    await writeFile(path, "external update");
+    await call("ssh_read_file", { connection_id: dev, file_path: path });
+    await call("ssh_edit_file", {
+      connection_id: dev, file_path: "revision-alias.txt", old_string: "external update", new_string: "relative edit",
+    });
+
+    // Each later mutation refreshes every spelling already associated with this file.
+    await call("ssh_write_file", { connection_id: dev, file_path: path, content: "absolute write" });
+    await call("ssh_read_file", { connection_id: dev, file_path: "~/revision-alias.txt" });
+    await call("ssh_edit_file", {
+      connection_id: dev, file_path: "revision-alias.txt", old_string: "absolute write", new_string: "final edit",
+    });
+    expect(await readFile(path, "utf8")).toBe("final edit");
+  });
+
   test("large file responses cross worker protocol chunks", async () => {
     const content = "x".repeat(200000);
     const written = await call("ssh_write_file", { connection_id: dev, file_path: "large.txt", content });

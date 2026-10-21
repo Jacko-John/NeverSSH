@@ -6,6 +6,16 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
+
+
+# Fixed lock striping bounds memory while aliases of one canonical path share admission.
+PATH_LOCKS = tuple(threading.Lock() for _ in range(64))
+
+
+def mutation_lock(filename):
+    """Serialize this worker's checks and commits for one already canonicalized path."""
+    return PATH_LOCKS[hash(filename) % len(PATH_LOCKS)]
 
 
 def path_for(value, cwd):
@@ -57,8 +67,9 @@ def fsync_directory(path):
 def atomic_write(filename, data, original, expected, limit):
     """Replace content in the same directory, preserving Unix mode and ownership.
 
-    Recheck the content just before rename. This detects stale reads but is not a
-    filesystem transaction against unrelated writers racing the final rename.
+    Callers hold the canonical path's mutation lock across their read and this
+    commit. The final recheck also detects changes by unrelated writers, without
+    promising a filesystem transaction against other processes.
     """
     if len(data) > limit:
         raise ValueError("Content exceeds maxFileBytes")
@@ -118,49 +129,85 @@ def write_file(request):
     """Create or explicitly overwrite a regular file, following its final symlink."""
     args = request.get("args", {})
     filename = os.path.realpath(path_for(args["path"], request["cwd"]))
-    limit = request["maxFileBytes"]
-    original = None
-    expected = args.get("expectedSha256")
-    try:
-        current, original = load_bytes(filename, limit)
-    except FileNotFoundError:
-        if expected is not None:
-            raise ValueError("Content conflict: expected file does not exist")
-    if original is not None:
-        if expected is None:
-            raise ValueError("File exists: read it with ssh_read_file first")
-        if digest(current) != expected:
-            raise ValueError("Content conflict: file changed since it was read; read it again")
-        expected = digest(current)
-    data = (base64.b64decode(args["base64"], validate=True) if "base64" in args
-            else args["content"].encode("utf-8"))
-    result = atomic_write(filename, data, original, expected, limit)
-    result["created"] = original is None
-    return result
+    with mutation_lock(filename):
+        limit = request["maxFileBytes"]
+        original = None
+        expected = args.get("expectedSha256")
+        try:
+            current, original = load_bytes(filename, limit)
+        except FileNotFoundError:
+            if expected is not None:
+                raise ValueError("Content conflict: expected file does not exist")
+        if original is not None:
+            if expected is None:
+                raise ValueError("File exists: read it with ssh_read_file first")
+            if digest(current) != expected:
+                raise ValueError("Content conflict: file changed since it was read; read it again")
+            expected = digest(current)
+        data = (base64.b64decode(args["base64"], validate=True) if "base64" in args
+                else args["content"].encode("utf-8"))
+        result = atomic_write(filename, data, original, expected, limit)
+        result["created"] = original is None
+        return result
 
 
 def edit_file(request):
     """Apply one exact replacement, mirroring Claude Code's Edit semantics."""
     args = request.get("args", {})
     filename = os.path.realpath(path_for(args["path"], request["cwd"]))
-    data, info = load_bytes(filename, request["maxFileBytes"])
-    revision = digest(data)
-    if args.get("expectedSha256", revision) != revision:
-        raise ValueError("Content conflict: file changed since it was read; read it again before editing")
-    content = text_from(data)
-    old = args["oldText"]
-    if not old:
-        raise ValueError("oldText must not be empty")
-    found = content.count(old)
-    if args.get("replaceAll", False):
-        if found == 0:
-            raise ValueError("oldText not found; file was not changed")
-        content = content.replace(old, args["newText"])
-    else:
-        if found != 1:
-            raise ValueError("Expected exactly one occurrence of oldText, found %d; file was not changed" % found)
-        content = content.replace(old, args["newText"], 1)
-    return atomic_write(filename, content.encode("utf-8"), info, revision, request["maxFileBytes"])
+    with mutation_lock(filename):
+        data, info = load_bytes(filename, request["maxFileBytes"])
+        revision = digest(data)
+        if args.get("expectedSha256", revision) != revision:
+            raise ValueError("Content conflict: file changed since it was read; read it again before editing")
+        content = text_from(data)
+        old = args["oldText"]
+        if not old:
+            raise ValueError("oldText must not be empty")
+        found = content.count(old)
+        if args.get("replaceAll", False):
+            if found == 0:
+                raise ValueError("oldText not found; file was not changed")
+            content = content.replace(old, args["newText"])
+        else:
+            if found != 1:
+                raise ValueError("Expected exactly one occurrence of oldText, found %d; file was not changed" % found)
+            content = content.replace(old, args["newText"], 1)
+        return atomic_write(filename, content.encode("utf-8"), info, revision, request["maxFileBytes"])
+
+
+def commit_upload(request):
+    """Verify staged SFTP bytes, then check and commit under the text writers' path lock."""
+    args = request.get("args", {})
+    filename = os.path.realpath(path_for(args["path"], request["cwd"]))
+    temporary = path_for(args["temporary"], request["cwd"])
+    try:
+        with mutation_lock(filename):
+            # Verify before changing the destination; a failed transfer never becomes visible.
+            data, _ = load_bytes(temporary, request["maxFileBytes"])
+            revision = digest(data)
+            if revision != args["sha256"]:
+                raise ValueError("Upload size or SHA-256 verification failed")
+            expected = args.get("expectedSha256")
+            if expected is not None:
+                try:
+                    current, _ = load_bytes(filename, request["maxFileBytes"])
+                except FileNotFoundError:
+                    raise ValueError("Content conflict: expected file does not exist") from None
+                if digest(current) != expected:
+                    raise ValueError("Content conflict: SHA-256 does not match")
+
+            # No-overwrite must remain atomic even when an unrelated process creates the file.
+            if expected is None and not args.get("overwrite", False):
+                os.link(temporary, filename)
+                os.unlink(temporary)
+            else:
+                os.replace(temporary, filename)
+            fsync_directory(os.path.dirname(filename))
+            return {"path": filename, "bytesWritten": len(data), "sha256": revision}
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def stat_file(request):
@@ -230,6 +277,8 @@ def dispatch(request):
         return write_file(request)
     if operation == "edit":
         return edit_file(request)
+    if operation == "commit_upload":
+        return commit_upload(request)
     if operation == "stat":
         return stat_file(request)
     if operation == "hash":

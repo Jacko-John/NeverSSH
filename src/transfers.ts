@@ -56,9 +56,9 @@ export async function transferPath(config: Config, filename: string, writing: bo
 }
 
 
-/** Resolve a remote path against the connected worker's home or an explicit cwd. */
-function remotePath(value: string, base: string): string {
-  const expanded = value === "~" ? base : value.startsWith("~/") ? posix.join(base, value.slice(2)) : value;
+/** Expand tilde against HOME, while ordinary relative paths resolve against the requested base. */
+function remotePath(value: string, base: string, home = base): string {
+  const expanded = value === "~" ? home : value.startsWith("~/") ? posix.join(home, value.slice(2)) : value;
   return expanded.startsWith("/") ? posix.normalize(expanded) : posix.normalize(posix.join(base, expanded));
 }
 
@@ -101,7 +101,7 @@ export async function upload(ssh: SshTransport, connectionId: string, args: {
   } finally { await handle.close(); }
 
   const digest = createHash("sha256").update(data).digest("hex");
-  const requested = remotePath(args.remotePath, remoteBase(ssh, connectionId, cwd));
+  const requested = remotePath(args.remotePath, remoteBase(ssh, connectionId, cwd), ssh.cwd(connectionId));
   const info = await ssh.run(connectionId, "stat", { path: requested }, undefined, signal) as unknown as RemoteStat;
   if (info.exists) {
     if (args.expectedSha256) {
@@ -122,20 +122,20 @@ export async function upload(ssh: SshTransport, connectionId: string, args: {
   const snapshot = join(snapshotDirectory, "payload");
   try {
     await writeFile(snapshot, data, { mode: 0o600 });
-    await ssh.sftp(connectionId, [
-      `put ${sftpQuote(snapshot)} ${sftpQuote(temporary)}`,
-      `rename ${sftpQuote(temporary)} ${sftpQuote(remote)}`,
-    ], signal);
+    await ssh.sftp(connectionId, [`put ${sftpQuote(snapshot)} ${sftpQuote(temporary)}`], signal);
+    // The worker shares commit admission with text edits and rechecks conflicts after staging.
+    const committed = await ssh.run(connectionId, "commit_upload", {
+      path: remote, temporary, overwrite: args.overwrite, sha256: digest,
+      ...(args.expectedSha256 ? { expectedSha256: args.expectedSha256 } : {}),
+    }, undefined, signal);
+    return { connection_id: connectionId, ...committed, localPath: filename };
   } catch (error) {
-    await ssh.sftp(connectionId, [`rm ${sftpQuote(temporary)}`], signal).catch(() => {});
+    // Cleanup must still run when the request's own cancellation signal has already fired.
+    await ssh.sftp(connectionId, [`rm ${sftpQuote(temporary)}`], undefined, 10000).catch(() => {});
     throw error;
   } finally {
     await rm(snapshotDirectory, { recursive: true, force: true });
   }
-
-  const verified = await ssh.run(connectionId, "hash", { path: remote }, undefined, signal) as unknown as RemoteHash;
-  if (verified.size !== data.length || verified.sha256 !== digest) throw new Error("Upload size or SHA-256 verification failed");
-  return { connection_id: connectionId, path: verified.path, localPath: filename, bytesWritten: data.length, sha256: verified.sha256 };
 }
 
 /** Download over SFTP into a private local temporary file before committing atomically. */
@@ -147,7 +147,7 @@ export async function download(ssh: SshTransport, connectionId: string, args: {
   if (!args.overwrite && await lstat(filename).then(() => true).catch(() => false)) {
     throw new Error("Local destination exists; set overwrite=true explicitly");
   }
-  const remote = remotePath(args.remotePath, remoteBase(ssh, connectionId, cwd));
+  const remote = remotePath(args.remotePath, remoteBase(ssh, connectionId, cwd), ssh.cwd(connectionId));
   // Check existence and size without reading the file; SFTP carries the bytes once.
   const info = await ssh.run(connectionId, "stat", { path: remote }, undefined, signal) as unknown as RemoteStat;
   if (!info.exists) throw new Error("Remote file does not exist: " + remote);

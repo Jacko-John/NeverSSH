@@ -681,7 +681,7 @@ SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 
 `localTransferRoots` 默认空，本地传输关闭。`localPath` 必须是根目录内的绝对路径，打开时拒绝符号链接和非常规文件；本地文件不超过 `maxFileBytes`（默认 4 MiB，可配置到 8 MiB）。
 
-上传通过 SFTP 复用当前连接的 ControlMaster；SFTP 不可用时直接返回 `SFTP_UNAVAILABLE`，不回退 worker 传输。先写远端临时文件，再用 `rename` 提交；父目录自动创建。已有远端文件需要 `expectedSha256` 或 `overwrite=true`，冲突检查由同一连接的 worker 完成。上传后会重新计算远端 sha256 并校验。SFTP 上传不保证保留远端原文件的 mode 和所有者；成功后记录新版本，可在同一连接下用 `ssh_edit_file` 继续编辑文本内容。
+上传通过 SFTP 复用当前连接的 ControlMaster；SFTP 不可用时直接返回 `SFTP_UNAVAILABLE`，不回退 worker 传输。先通过 SFTP 写远端临时文件，再由 worker 校验并提交；父目录自动创建。已有远端文件需要 `expectedSha256` 或 `overwrite=true`。提交时重新校验 `expectedSha256`；未允许覆盖时以原子的创建操作提交，拒绝覆盖上传期间出现的文件。同一 worker 对同一文件的文本写入、编辑和上传提交会串行执行，哈希校验不构成跨进程事务锁。上传内容会校验 sha256。SFTP 上传不保证保留远端原文件的 mode 和所有者；成功后记录新版本，可在同一连接下用 `ssh_edit_file` 继续编辑文本内容。
 
 ## ssh_download
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- Serialize file writes, edits, and upload commits within a worker so concurrent changes cannot silently overwrite each other. Uploads recheck conflicts at commit and atomically refuse an existing destination unless replacement was authorized.
+- Resolve `~/` transfer paths against the remote home directory even when `cwd` is supplied.
+- Send file responses incrementally under backpressure and account for JSON escaping in response limits, preserving connections during concurrent reads.
+- Share file revisions across previously read relative and absolute path spellings.
+- Keep the last usable launcher cache when a new release download fails.
+
 ## 0.2.2
 
 ### Fixes

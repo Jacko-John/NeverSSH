@@ -64,9 +64,13 @@ export class RemoteChannel extends EventEmitter {
       let stdout = "";
       let stderr = "";
       let failure: Error | undefined;
+      // A UTF-8 byte can become six JSON characters (for example, U+0001 -> \\u0001).
+      const responseLimit = maxFileBytes * 6 + 131072;
 
       const interrupt = (message: string) => {
+        if (failure) return;
         failure = new ToolError("OPERATION_INTERRUPTED", message);
+        stdout = "";
         this.cancel();
       };
       const abort = () => interrupt("Operation cancelled; inspect the destination before retrying a mutation");
@@ -78,8 +82,9 @@ export class RemoteChannel extends EventEmitter {
       if (signal?.aborted) abort();
       this.stdout.setEncoding("utf8");
       this.stdout.on("data", (chunk: string) => {
+        if (failure) return;
         stdout += chunk;
-        if (stdout.length > maxFileBytes * 2 + 131072) {
+        if (stdout.length > responseLimit) {
           interrupt("Remote response exceeds its size limit");
         }
       });

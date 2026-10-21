@@ -13,6 +13,11 @@ import types
 from typing import Dict, Optional
 
 
+OUTPUT_HIGH_WATER = 262144
+OUTPUT_LOW_WATER = 131072
+RESPONSE_CHUNK_BYTES = 16384
+
+
 HELPER_BOOTSTRAP = (
     'import json,sys; payload=json.loads(sys.stdin.buffer.readline()); '
     'import types; archive=types.ModuleType("neverssh_archive"); '
@@ -61,6 +66,8 @@ class FileRequest:
         self.result = None
         self.error = None
         self.cancelled = False
+        self.response_data = None
+        self.response_offset = 0
         self.started_at = time.monotonic()
         threading.Thread(target=self.run, daemon=True).start()
 
@@ -98,6 +105,7 @@ class Worker:
         self.requests: Dict[str, ChildRequest] = {}
         self.incoming = bytearray()
         self.outgoing = bytearray()
+        self.paused_output_streams = []
         self.stopping = False
         self.stop_requested = False
         self.peer_gone = False
@@ -195,7 +203,7 @@ class Worker:
             "connectionId": self.connection_id,
             **self.archive_limits,
         }
-        if operation in ("read", "write", "edit", "stat", "hash", "mkdir", "probe"):
+        if operation in ("read", "write", "edit", "stat", "hash", "mkdir", "probe", "commit_upload"):
             self.requests[request_id] = FileRequest(file_ops_module.dispatch, request_payload)
             return
         if operation != "bash":
@@ -244,19 +252,27 @@ class Worker:
                 request.stop()
 
     def emit_file_response(self, request_id, request):
-        """Chunk a file result so every worker protocol record stays below the client line limit."""
-        if request.error is None:
-            response = {"ok": True, "result": request.result}
-        else:
-            response = {"ok": False, "error": {
-                "code": getattr(request.error, "code", type(request.error).__name__),
-                "message": str(request.error),
-            }}
-        data = json.dumps(response, ensure_ascii=True).encode("utf-8") + b"\n"
-        for offset in range(0, len(data), 16384):
-            chunk = data[offset:offset + 16384]
-            self.emit({"type": "stdout", "id": request_id,
-                       "base64": base64.b64encode(chunk).decode("ascii")})
+        """Advance one bounded response chunk, returning true only after its final bytes are queued."""
+        if len(self.outgoing) >= OUTPUT_HIGH_WATER:
+            return False
+        if request.response_data is None:
+            if request.error is None:
+                response = {"ok": True, "result": request.result}
+            else:
+                response = {"ok": False, "error": {
+                    "code": getattr(request.error, "code", type(request.error).__name__),
+                    "message": str(request.error),
+                }}
+            # Preserve UTF-8 text directly; only JSON-required escapes expand the file content.
+            request.response_data = json.dumps(response, ensure_ascii=False).encode("utf-8", "backslashreplace") + b"\n"
+            request.result = None
+
+        end = request.response_offset + RESPONSE_CHUNK_BYTES
+        chunk = request.response_data[request.response_offset:end]
+        self.emit({"type": "stdout", "id": request_id,
+                   "base64": base64.b64encode(chunk).decode("ascii")})
+        request.response_offset += len(chunk)
+        return request.response_offset == len(request.response_data)
 
     def update_requests(self):
         """Escalate slow cleanup and retire helpers only after both output pipes are drained."""
@@ -269,7 +285,8 @@ class Worker:
                 if not request.done:
                     continue
                 if not request.cancelled:
-                    self.emit_file_response(request_id, request)
+                    if not self.emit_file_response(request_id, request):
+                        continue
                 self.emit({"type": "close", "id": request_id,
                            "code": 255 if request.cancelled else (1 if request.error is not None else 0)})
                 del self.requests[request_id]
@@ -313,6 +330,20 @@ class Worker:
         if self.outgoing and not self.stdout_registered:
             self.selector.register(sys.stdout, selectors.EVENT_WRITE, (None, "output"))
             self.stdout_registered = True
+        self.update_output_streams()
+
+    def update_output_streams(self):
+        """Pause helper reads at high water and resume them after the peer drains queued records."""
+        if len(self.outgoing) >= OUTPUT_HIGH_WATER:
+            for key in list(self.selector.get_map().values()):
+                request_id, stream = key.data
+                if request_id is not None and stream in ("stdout", "stderr"):
+                    self.selector.unregister(key.fileobj)
+                    self.paused_output_streams.append(key)
+        elif len(self.outgoing) <= OUTPUT_LOW_WATER:
+            for key in self.paused_output_streams:
+                self.selector.register(key.fileobj, key.events, key.data)
+            self.paused_output_streams.clear()
 
     def cleanup_archives(self):
         """Reclaim expired logs after requests and once an hour while connected."""

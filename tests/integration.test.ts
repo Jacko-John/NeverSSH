@@ -664,3 +664,31 @@ describe("Bash tasks and archives", () => {
     expect(metadata).toHaveProperty("finished_at");
   }, 12000);
 });
+
+/** Clients whose stdio transport subclasses the SDK's (Claude Code's does) probe the protocol era
+ * on the connection itself instead of on a throwaway sibling process. */
+class InPlaceTransport extends StdioClientTransport {}
+
+describe("MCP era negotiation", () => {
+  test("a legacy handshake after the server/discover probe leaves the connection usable", async () => {
+    const transport = new InPlaceTransport({
+      command: process.execPath, args: ["run", resolve(process.env.NEVERSSH_TEST_ENTRYPOINT ?? "src/index.ts"), "--config", fixture.configPath],
+      env: { ...process.env } as Record<string, string>, stderr: "pipe",
+    });
+    let negotiationStderr = "";
+    transport.stderr?.on("data", (chunk: Buffer) => { negotiationStderr = (negotiationStderr + chunk.toString()).slice(-4096); });
+    // A 1ms probe bound expires long before this server answers, so the client probes with
+    // server/discover and then keeps the 2025-era handshake on the same process: the server
+    // discards its probe instance, which must not take the connection's runtime down with it.
+    const client = new Client({ name: "neverssh-negotiation-test", version: "1.0.0" },
+      { versionNegotiation: { mode: "auto", probe: { timeoutMs: 1 } } });
+    await client.connect(transport);
+    try {
+      expect(client.getProtocolEra()).toBe("legacy");
+      const connection = await client.callTool({ name: "ssh_connect", arguments: { host: "fixture" } });
+      expect(connection.isError, JSON.stringify(connection.content)).toBeFalsy();
+      expect(connection.structuredContent).toMatchObject({ connection_id: expect.any(String) });
+    } finally { await client.close(); }
+    expect(negotiationStderr).not.toContain("SyntaxError");
+  }, 20000);
+});

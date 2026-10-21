@@ -82,7 +82,7 @@ bun run src/index.ts doctor my-dev-server
 
 ### 从 GitHub Release 启动
 
-安装一个很小的 launcher，之后每次启动都会解析 GitHub 最新 Release，按标签缓存 `neverssh.js` 并执行：
+安装一个很小的 launcher：启动时直接执行已缓存的 Release，并在后台解析 GitHub 最新 Release、按标签缓存 `neverssh.js`，新版本在下次启动生效：
 
 ```sh
 mkdir -p ~/.local/bin
@@ -115,7 +115,7 @@ MCP 配置只需要指向这个 launcher：
 }
 ```
 
-launcher 需要本机有 `curl`、`bun` 1.3+ 和 OpenSSH 客户端。Release 解析失败时会回退到最近一次成功解析并缓存的版本；首次启动需要网络。GUI 客户端需要可用的 `ssh` 搜索路径和 SSH Agent 环境。
+launcher 需要本机有 `curl`、`bun` 1.3+ 和 OpenSSH 客户端。有缓存时启动不等待网络，解析或下载失败只影响后台刷新，留待下次启动重试；只有缓存为空的首次启动需要网络。GUI 客户端需要可用的 `ssh` 搜索路径和 SSH Agent 环境。
 
 ### 从源码开发
 
@@ -233,4 +233,4 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
-工作流运行检查、测试和构建，并上传 `neverssh.js`、`neverssh` launcher 和 `neverssh.config.example.json` 到对应 Release。launcher 始终从 `releases/latest` 解析标签，因此发布新标签后用户无需修改 MCP 配置。
+工作流运行检查、测试和构建，并上传 `neverssh.js`、`neverssh` launcher 和 `neverssh.config.example.json` 到对应 Release。launcher 在后台解析 `releases/latest`，新标签在用户下一次启动时生效，无需修改 MCP 配置。

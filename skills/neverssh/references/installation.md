@@ -28,7 +28,7 @@ curl -fsSL https://github.com/Jacko-John/NeverSSH/releases/latest/download/never
 chmod +x ~/.local/bin/neverssh
 ```
 
-The launcher resolves the latest GitHub release, caches `neverssh.js` under `${XDG_CACHE_HOME:-$HOME/.cache}/neverssh/<tag>/`, and runs it with Bun. The first start needs network access. Later starts reuse the cache; if release resolution fails, the launcher falls back to the most recently cached tag.
+The launcher runs the cached `neverssh.js` from `${XDG_CACHE_HOME:-$HOME/.cache}/neverssh/<tag>/` with Bun, and refreshes that cache from the latest GitHub release in the background, so a new tag takes effect on the next start. Only the first start, with an empty cache, waits for the network; a failed refresh leaves the cache as it is.
 
 ## Register the MCP server
 

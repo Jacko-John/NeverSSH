@@ -20,7 +20,7 @@
 
 可以直接连接已知地址，无需先发现。默认沿用本机 SSH 能力，开放范围由本地[访问配置](../README.md#开始使用)控制。
 
-所有请求都是 MCP 参数对象，并拒绝未定义字段。所有工具都返回可读的 MCP 文本内容块；连接、文件、搜索和传输工具同时提供 `structuredContent` 供程序消费，任务工具只返回文本。错误文本统一为 `Error: CODE` 加一句说明。
+所有请求都是 MCP 参数对象，并拒绝未定义字段。所有工具仅返回可读的 MCP 文本内容块，不提供 `structuredContent` 或 `outputSchema`，也不把内部结果序列化成 JSON 文本。错误文本统一为 `Error: CODE` 加一句说明。远端命令自身打印的 JSON 保持原样。
 
 连接 ID 是 8 位小写十六进制，如 `7a2c9d4f`。任务 ID 带 `task_` 前缀，如 `task_b8e3a160`，在当前 MCP 实例内唯一，不能与连接 ID 混用。任务工具只需要 `task_id`。两个 ID 都只在当前 MCP 实例中有效；日志保留不延长连接或任务句柄的有效期。
 
@@ -36,12 +36,7 @@
 
 ### 返回
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `servers` | object[] | 所有可枚举、且访问规则允许的 SSH 入口。没有候选时返回空数组。 |
-| `servers[].host` | string | 连接入口，可直接传给 ssh_connect。最长 255 个字符。 |
-
-模型可见文本每行一个入口；上表是 `structuredContent` 的字段。
+每行一个 SSH 入口，可直接传给 `ssh_connect`。没有候选时返回 `No SSH candidates found.`。
 
 ### 示例
 
@@ -86,11 +81,7 @@ build-server
 
 ### 返回
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `connection_id` | string | 连接的短 ID。拿到它后即可调用远端命令和文件工具；任务工具只使用 task_id。 |
-
-模型可见文本为 `Connection: <connection_id>`；上表是 `structuredContent` 的字段。
+返回 `Connection: <connection_id>`。拿到 ID 后即可调用远端命令和文件工具；任务工具只使用 `task_id`。
 
 `connection_id` 是当前 MCP 实例内唯一的 8 位小写十六进制 ID。本实例不重复分配 ID；MCP 重启后需要重新连接。
 
@@ -166,15 +157,7 @@ Connection: 7a2c9d4f
 
 ### 返回
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `sessions` | object[] | 当前 MCP 实例中可用的全部连接。没有可用连接时返回空数组。 |
-| `sessions[].connection_id` | string | 后续操作使用的短 ID。 |
-| `sessions[].host` | string | 建立连接时传入的入口，与 ssh_connect 的 host 相同。 |
-| `sessions[].user` | string | 这条连接实际使用的登录账号。 |
-| `sessions[].port` | integer | 这条连接实际使用的 SSH 端口。取值 1～65535。 |
-
-模型可见文本每行一条连接，格式为 `connection_id  user@host:port`；上表是 `structuredContent` 的字段。
+每行一条连接，格式为 `connection_id  user@host:port`。`host` 是建连时传入的入口，`user` 和 `port` 是实际登录账号和端口。没有可用连接时返回 `No active connections.`。
 
 ### 示例
 
@@ -208,13 +191,7 @@ Connection: 7a2c9d4f
 
 ### 返回
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `connection_id` | string | 本次关闭的连接 ID。 |
-| `closed` | true | 本地连接已关闭。成功时始终为 true。 |
-| `remote_cleanup` | `"confirmed"` / `"unconfirmed"` | confirmed：远端已确认清理完成；unconfirmed：远端清理结果未知。 |
-
-模型可见文本为 `Closed <connection_id> (remote cleanup <status>).`；上表是 `structuredContent` 的字段。
+返回 `Closed <connection_id> (remote cleanup <status>).`。`confirmed` 表示远端已确认清理完成；`unconfirmed` 表示远端清理结果未知。
 
 ### 示例
 
@@ -240,7 +217,7 @@ Closed 7a2c9d4f (remote cleanup confirmed).
 
 已完成的写入不会回滚。已收集的任务输出仍可通过原任务 ID 查询。
 
-`closed: true` 表示本地连接已释放。`remote_cleanup: "confirmed"` 表示远端已确认本连接管理的资源清理完成；断网、清理超时或强制结束远端 helper 时，结果为 `unconfirmed`。
+成功文本表示本地连接已释放。`remote cleanup confirmed` 表示远端已确认本连接管理的资源清理完成；断网、清理超时或强制结束远端 helper 时，结果为 `unconfirmed`。
 
 已关闭且仍有记录的 ID 可以重复关闭。并发关闭同一条连接时，共用一次关闭过程并返回相同结果。
 
@@ -250,7 +227,7 @@ Closed 7a2c9d4f (remote cleanup confirmed).
 
 ## ssh_bash
 
-执行一条远端 Bash 命令。默认最多等待 120 秒，结束后直接返回退出码和输出。等待到期时交还控制权，同一进程继续运行；也可通过 `run_in_background` 在启动确认后立即返回。
+执行一条远端 Bash 命令。默认最多等待 120 秒，成功结束后直接返回程序输出。等待到期时交还控制权，同一进程继续运行；也可通过 `run_in_background` 在启动确认后立即返回。
 
 ### 参数
 
@@ -444,7 +421,7 @@ task_b8e3a160  running  7a2c9d4f  /home/developer/.neverssh/sessions/7a2c9d4f/ta
 
 文件工具使用 `connection_id`；`file_path` 是远端文件路径，推荐传绝对路径，相对路径按远端 HOME 解析。读取返回带行号的文本，并记录文件版本；编辑前必须读取或写入该文件。目录列表、文件查找和内容搜索通过 `ssh_bash` 执行 `ls`、`find`、`rg`，与 Claude Code 在 macOS/Linux 上的默认工作方式一致。
 
-远端写入、上传和下载会自动创建缺失的父目录；本地父目录仍不能通过符号链接逃出传输根目录。`ssh_upload` / `ssh_download` 使用 SFTP，复用当前连接的 ControlMaster；其他工具走 worker。SSH 压缩默认开启（`compression: true`），可通过本地配置关闭。文件工具返回简洁文本，同时提供 `structuredContent`；下文的结构化字段表省略公共的 `connection_id`。
+远端写入、上传和下载会自动创建缺失的父目录；本地父目录仍不能通过符号链接逃出传输根目录。`ssh_upload` / `ssh_download` 使用 SFTP，复用当前连接的 ControlMaster；其他工具走 worker。SSH 压缩默认开启（`compression: true`），可通过本地配置关闭。文件工具直接返回带行号的内容或操作结果；文件版本由服务端内部记录。
 
 ## ssh_read_file
 
@@ -475,20 +452,6 @@ PARTIAL view: showing lines 1-2000 of 5000. Use offset=2001 to continue.
 ```
 
 空文件返回 `File exists but is empty.`；`offset` 超过最后一行时返回 `File has <N> lines; offset <M> is past the end.`
-
-`structuredContent` 字段：
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `path` | string | 解析后的文件绝对路径。 |
-| `content` | string | 本次读取的原始文本，保留原始换行。 |
-| `startLine` | integer | 本次片段起始行。 |
-| `endLine` | integer | 本次片段结束行。 |
-| `totalLines` | integer | 文件总行数。 |
-| `truncated` | boolean | 是否还有后续行。 |
-| `nextLine` | integer / null | 下一次的起始行；没有更多时为 null。 |
-| `size` | integer | 全文件字节数。 |
-| `sha256` | string | 全文件 sha256，服务端用于编辑冲突检查。 |
 
 ### 示例
 
@@ -541,15 +504,6 @@ File created successfully at: /srv/app/notes.txt
 The file /srv/app/notes.txt has been updated successfully.
 ```
 
-`structuredContent` 字段：
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `path` | string | 解析后的文件绝对路径。 |
-| `bytesWritten` | integer | 写入字节数。 |
-| `sha256` | string | 写入后全文件 sha256。 |
-| `created` | boolean | 是否新建了文件。 |
-
 ### 示例
 
 #### 请求
@@ -593,14 +547,6 @@ File created successfully at: /srv/app/notes.txt
 ```text
 The file /srv/app/notes.txt has been updated successfully.
 ```
-
-`structuredContent` 字段：
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `path` | string | 解析后的文件绝对路径。 |
-| `bytesWritten` | integer | 写入后的文件字节数。 |
-| `sha256` | string | 写入后全文件 sha256。 |
 
 ### 示例
 
@@ -649,15 +595,6 @@ Uploaded /Users/me/transfer/logo.png to /srv/app/assets/logo.png (2048 bytes).
 SHA-256: ...
 ```
 
-`structuredContent` 字段：
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `path` | string | 解析后的远端文件绝对路径。 |
-| `localPath` | string | 解析后的本地文件绝对路径。 |
-| `bytesWritten` | integer | 上传字节数。 |
-| `sha256` | string | 上传后远端文件 sha256。 |
-
 ### 示例
 
 #### 请求
@@ -704,15 +641,6 @@ Downloaded /srv/app/build/app.tar.gz to /Users/me/transfer/app.tar.gz (4096 byte
 SHA-256: ...
 ```
 
-`structuredContent` 字段：
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `path` | string | 解析后的远端文件绝对路径。 |
-| `localPath` | string | 解析后的本地文件绝对路径。 |
-| `size` | integer | 下载字节数。 |
-| `sha256` | string | 下载内容的 sha256。 |
-
 ### 示例
 
 #### 请求
@@ -740,7 +668,7 @@ SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 
 ## 文件和传输错误
 
-这些工具和连接工具一样，先返回文本错误并设置 `isError=true`；同时提供 `structuredContent` 错误对象。常见错误码：
+这些工具和连接工具一样，返回文本错误并设置 `isError=true`。常见错误码：
 
 | 错误码 | 原因 | 处理方式 |
 | --- | --- | --- |
@@ -754,7 +682,7 @@ SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 | `SFTP_FAILED` | SFTP 传输或批处理命令失败 | 检查远端路径、权限和 SFTP 配置。 |
 | `SFTP_TIMEOUT` | SFTP 传输超过 120 秒 | 检查网络和目标文件大小。 |
 
-参数校验失败由 MCP SDK 报告，可能只返回文字错误；写入类操作在断线或取消后不要自动重放。
+参数校验失败由 MCP SDK 报告，具体错误文本由 SDK 决定；写入类操作在断线或取消后不要自动重放。
 
 ## 日志归档与清理
 
@@ -812,23 +740,4 @@ Error: TASK_NOT_FOUND
 Task does not exist in this MCP instance
 ```
 
-连接、文件、搜索和传输工具同时提供 `structuredContent` 错误对象：
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `error` | object | 本次调用失败的原因。 |
-| `error.code` | string | 供调用方判断的错误码。 |
-| `error.message` | string | 失败原因的文字说明。 |
-| `error.details` | object | 补充信息，例如 connection_id 或目标主机。 |
-
-```json
-{
-  "error": {
-    "code": "TARGET_DENIED",
-    "message": "Target is outside the configured SSH access policy",
-    "details": { "host": "production" }
-  }
-}
-```
-
-参数校验失败由 MCP SDK 报告，可能只返回文字错误。连接失效后旧 ID 不会自动重连；重新连接不重放命令或写入。断线前操作可能已完成，应先检查远端实际状态。
+参数校验失败由 MCP SDK 报告，具体错误文本由 SDK 决定。连接失效后旧 ID 不会自动重连；重新连接不重放命令或写入。断线前操作可能已完成，应先检查远端实际状态。

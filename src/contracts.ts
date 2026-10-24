@@ -1,4 +1,4 @@
-/** Public connection and command schemas shared by MCP registration, documentation, and tests. */
+/** Public input schemas shared by MCP registration, documentation, and tests; results are text-only. */
 import { z } from "zod";
 import { cleanString, hostField, portField, userField } from "./config";
 
@@ -10,46 +10,18 @@ const taskId = z.string().refine((value) => /^task_[a-f0-9]{8}$/.test(value), "U
 const taskScope = { task_id: taskId };
 const waitSeconds = z.number().min(0).max(300);
 
-export const connectionSummary = z.strictObject({
-  connection_id: connectionId,
-  host: z.string(),
-  user: z.string(),
-  port: portField,
-});
-
-const error = z.strictObject({
-  error: z.strictObject({
-    code: z.string(),
-    message: z.string(),
-    details: z.record(z.string(), z.unknown()),
-  }),
-});
-
-/** Include failures in the output contract as well as MCP's isError flag. */
-function output<T extends z.ZodType>(success: T) {
-  return z.union([success, error]);
-}
-
 export const connectionContracts = {
   ssh_discover: {
     input: z.strictObject({}),
-    output: output(z.strictObject({ servers: z.array(z.strictObject({ host: hostField })) })),
   },
   ssh_connect: {
     input: z.strictObject({ ...target, timeout_seconds: z.number().min(1).max(180).default(60) }),
-    output: output(z.strictObject({ connection_id: connectionId })),
   },
   ssh_sessions: {
     input: z.strictObject({}),
-    output: output(z.strictObject({ sessions: z.array(connectionSummary) })),
   },
   ssh_close: {
     input: z.strictObject({ connection_id: connectionId }),
-    output: output(z.strictObject({
-      connection_id: connectionId,
-      closed: z.literal(true),
-      remote_cleanup: z.enum(["confirmed", "unconfirmed"]),
-    })),
   },
 };
 
@@ -76,4 +48,6 @@ export const commandContracts = {
 };
 
 export const toolContracts = { ...connectionContracts, ...commandContracts };
-export type ConnectionSummary = z.infer<typeof connectionSummary>;
+
+/** Internal connection metadata for lifecycle management and the session-list formatter. */
+export type ConnectionSummary = { connection_id: string; host: string; user: string; port: number };

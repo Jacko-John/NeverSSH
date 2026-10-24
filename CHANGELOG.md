@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- Return readable text from every MCP tool without `structuredContent` or `outputSchema`. Connection, file, and transfer results no longer include a structured copy. Inputs and existing text formats are unchanged; clients that read structured results must read text content instead.
+
 ## 0.2.3
 
 ### Fixes

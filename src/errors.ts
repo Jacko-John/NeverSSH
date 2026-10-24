@@ -13,17 +13,11 @@ export function checkAbort(signal?: AbortSignal): void {
   throw new ToolError("OPERATION_CANCELLED", "Operation cancelled");
 }
 
-/** Normalize unknown failures so text and structured results share one code and message. */
+/** Normalize unknown failures to the same model-readable code and message. */
 function failure(error: unknown): ToolError {
   return error instanceof ToolError
     ? error
     : new ToolError("OPERATION_FAILED", error instanceof Error ? error.message : String(error));
-}
-
-/** Preserve actionable codes without exposing stacks or full SSH configuration. */
-export function errorResult(error: unknown): Record<string, unknown> {
-  const value = failure(error);
-  return { error: { code: value.code, message: value.message, details: value.details } };
 }
 
 /** Give every tool the same model-readable error shape. */

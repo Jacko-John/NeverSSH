@@ -10,7 +10,7 @@ import { z } from "zod";
 import { cleanString, type Config } from "./config";
 import { commandContracts, connectionContracts, connectionId } from "./contracts";
 import { Discovery } from "./discovery";
-import { errorResult, errorText, ToolError } from "./errors";
+import { errorText, ToolError } from "./errors";
 import { FileRevisions } from "./file-state";
 import { TaskManager, type TaskResult } from "./tasks";
 import { taskListText, taskText } from "./task-text";
@@ -49,11 +49,10 @@ export class Runtime {
   }
 }
 
-/** Give the model concise text while preserving structuredContent for programmatic clients. */
-function result(value: RemoteResult, text: string, isError = false): CallToolResult {
+/** Package every tool result as readable text, including operational failures. */
+function textResult(text: string, isError = false): CallToolResult {
   return {
     content: [{ type: "text", text }],
-    structuredContent: value,
     ...(isError ? { isError: true } : {}),
   };
 }
@@ -87,36 +86,35 @@ export function createServer(runtime: Runtime): McpServer {
       const id = "connection_id" in args && typeof args.connection_id === "string" ? args.connection_id : undefined;
       try {
         if (id) runtime.ssh.get(id);
-        const value = { ...(id ? { connection_id: id } : {}), ...await execute(args, context) };
-        return result(value, formatResult(value));
+        const value = await execute(args, context);
+        return textResult(formatResult(value));
       } catch (error) {
-        return result(errorResult(error), errorText(error), true);
+        return textResult(errorText(error), true);
       }
     });
   }
 
-  /** Register documented contracts and preserve command outcomes even when MCP marks them as errors. */
+  /** Register documented inputs while keeping internal operation results behind their text formatter. */
   function registerContractTool<I extends z.ZodObject & StandardSchemaWithJSON>(
     name: string,
     description: string,
-    contract: { input: I; output: z.ZodType & StandardSchemaWithJSON },
+    contract: { input: I },
     readOnly: boolean,
     formatResult: (value: RemoteResult) => string,
     execute: (args: z.output<I>, context: ServerContext) => Promise<RemoteResult> | RemoteResult,
   ): void {
     const handler = async (args: z.output<I>, context: ServerContext): Promise<CallToolResult> => {
       try {
-        const value = contract.output.parse(await execute(args, context)) as RemoteResult;
-        return result(value, formatResult(value));
+        const value = await execute(args, context);
+        return textResult(formatResult(value));
       } catch (error) {
-        return result(errorResult(error), errorText(error), true);
+        return textResult(errorText(error), true);
       }
     };
     // The SDK's conditional callback type cannot reduce a generic schema; both sides use I's validated output.
-    server.registerTool<z.ZodType & StandardSchemaWithJSON, I>(name, {
+    server.registerTool(name, {
       description,
       inputSchema: contract.input,
-      outputSchema: contract.output,
       annotations: { readOnlyHint: readOnly, destructiveHint: !readOnly && name !== "ssh_connect", openWorldHint: true },
     }, handler as ToolCallback<I>);
   }
@@ -150,9 +148,9 @@ export function createServer(runtime: Runtime): McpServer {
       try {
         const task = await execute(args, context);
         const failed = name === "ssh_bash" && task.finished && (task.reason !== undefined || task.exit_code !== 0);
-        return { content: [{ type: "text", text: taskText(task, view) }], ...(failed ? { isError: true } : {}) };
+        return textResult(taskText(task, view), failed);
       } catch (error) {
-        return { content: [{ type: "text", text: errorText(error) }], isError: true };
+        return textResult(errorText(error), true);
       }
     };
     server.registerTool(name, {
@@ -181,9 +179,9 @@ export function createServer(runtime: Runtime): McpServer {
   ): void {
     const handler = async (args: z.output<I>): Promise<CallToolResult> => {
       try {
-        return { content: [{ type: "text", text: execute(args) }] };
+        return textResult(execute(args));
       } catch (error) {
-        return { content: [{ type: "text", text: errorText(error) }], isError: true };
+        return textResult(errorText(error), true);
       }
     };
     server.registerTool(name, {

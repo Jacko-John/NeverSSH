@@ -143,6 +143,8 @@ skill 会在需要远端操作时触发；安装与排错细节见 `skills/never
 
 ## 工具使用
 
+所有工具仅返回可读文本，不提供 `structuredContent` 或 `outputSchema`。请求仍是严格校验的 MCP 参数对象；远端命令打印的内容保持原样。
+
 连接：
 
 ```json

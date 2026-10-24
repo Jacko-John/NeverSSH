@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, lstat, mkdir, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -10,7 +11,6 @@ import { setTimeout as delay } from "node:timers/promises";
 import { SshFixture } from "./fixture";
 import { Runtime } from "../src/server";
 import { ShortIds } from "../src/ids";
-import type { ConnectionSummary } from "../src/contracts";
 import { BUILD_ID } from "../src/version-info";
 
 const fixture = new SshFixture();
@@ -19,33 +19,21 @@ let transport: StdioClientTransport;
 let stderr = "";
 let dev = "";
 
-/** Call through the public MCP protocol, optionally requiring a model-readable tool error. */
-async function call(name: string, args: Record<string, unknown> = {}, error = false): Promise<any> {
-  const response = await client.callTool({ name, arguments: args });
-  const value = response.structuredContent;
-  if (Boolean(response.isError) !== error) {
-    const details = value && typeof value === "object" ? { ...value, output: undefined } : response;
-    throw new Error(`${name}: ${JSON.stringify(details).slice(0, 4096)}`);
-  }
-  expect(value).toBeDefined();
-  return value;
-}
-
-/** Select an available connection locally from the public list result. */
-async function sessionSummary(connectionId: string): Promise<ConnectionSummary> {
-  const { sessions } = await call("ssh_sessions");
-  const summary = (sessions as ConnectionSummary[]).find((session) => session.connection_id === connectionId);
-  expect(summary).toBeDefined();
-  return summary!;
-}
-
-/** Call the public Bash tools and inspect their model-visible text, with no structured copy. */
-async function taskCall(name: string, args: Record<string, unknown>, error = false): Promise<string> {
+/** Inspect every public result as the model sees it, without a structured copy. */
+async function call(name: string, args: Record<string, unknown> = {}, error = false): Promise<string> {
   const response = await client.callTool({ name, arguments: args });
   expect(response.structuredContent).toBeUndefined();
   expect(Boolean(response.isError), JSON.stringify(response.content).slice(0, 4096)).toBe(error);
+  expect(response.content.length).toBeGreaterThan(0);
   expect(response.content.every((item) => item.type === "text")).toBe(true);
   return response.content.map((item) => item.type === "text" ? item.text : "").join("\n");
+}
+
+/** Extract only the connection handle needed by follow-up tool calls. */
+function connectionId(text: string): string {
+  const id = /^Connection: ([a-f0-9]{8})$/.exec(text)?.[1];
+  if (!id) throw new Error("Missing connection handle: " + text.slice(0, 4096));
+  return id;
 }
 
 /** Extract the handle exactly as a client reading a text result would. */
@@ -104,10 +92,7 @@ describe("MCP and connections", () => {
     const listing = await client.listTools();
     expect(listing.tools).toHaveLength(13);
     expect(listing.tools.some((tool) => tool.name === "ssh_disconnect")).toBe(false);
-    expect(listing.tools.find((tool) => tool.name === "ssh_connect")?.outputSchema).toBeDefined();
-    for (const name of ["ssh_bash", "ssh_task_output", "ssh_task_stop", "ssh_task_list"]) {
-      expect(listing.tools.find((tool) => tool.name === name)?.outputSchema).toBeUndefined();
-    }
+    for (const tool of listing.tools) expect(tool.outputSchema, tool.name).toBeUndefined();
     for (const name of ["ssh_exec", "ssh_poll", "ssh_input", "ssh_cancel", "ssh_jobs"]) {
       expect(listing.tools.some((tool) => tool.name === name)).toBe(false);
     }
@@ -136,63 +121,60 @@ describe("MCP and connections", () => {
     }
     expect(properties("ssh_upload")).not.toContain("parents");
     const result = await call("ssh_discover");
-    expect(result).toEqual({ servers: ["fixture", "missing-python", "slow", "slow-cancel", "untrusted"].map((host) => ({ host })) });
-    expect(JSON.stringify(result)).not.toContain("IdentityFile");
-    expect(await call("ssh_sessions")).toEqual({ sessions: [] });
+    expect(result).toBe("fixture\nmissing-python\nslow\nslow-cancel\nuntrusted");
+    expect(result).not.toContain("IdentityFile");
+    expect(await call("ssh_sessions")).toBe("No active connections.");
     expect(fixture.authentications).toBe(0);
-    expect((await call("ssh_read_file", { connection_id: "00000000", file_path: "/" }, true)).error.code).toBe("CONNECTION_NOT_FOUND");
+    expect(await call("ssh_read_file", { connection_id: "00000000", file_path: "/" }, true)).toStartWith("Error: CONNECTION_NOT_FOUND\n");
   });
 
   test("reuses one authenticated SSH connection across concurrent file calls", async () => {
     const before = fixture.authentications;
     const results = await Promise.all(Array.from({ length: 12 }, () => call("ssh_connect", { host: "fixture" })));
-    dev = results[0].connection_id;
+    dev = connectionId(results[0]!);
     expect(dev).toMatch(/^[a-f0-9]{8}$/);
-    expect(results.every((value) => value.connection_id === dev && Object.keys(value).length === 1)).toBe(true);
+    expect(results.every((value) => value === `Connection: ${dev}`)).toBe(true);
     expect(fixture.authentications - before).toBe(1);
     expect(fixture.workerStarts).toBe(1);
-    expect(await sessionSummary(dev)).toEqual({ connection_id: dev, host: "fixture", user: "fixture", port: fixture.port });
+    expect(await call("ssh_sessions")).toBe(`${dev}  fixture@fixture:${fixture.port}`);
   }, 15000);
 
   test("refuses untrusted host keys and diagnoses a missing remote interpreter", async () => {
-    expect((await call("ssh_connect", { host: "untrusted" }, true)).error.code).toBe("SSH_HOST_KEY_ERROR");
-    expect((await call("ssh_connect", { host: "missing-python" }, true)).error.code).toBe("RUNTIME_UNSUPPORTED");
+    expect(await call("ssh_connect", { host: "untrusted" }, true)).toStartWith("Error: SSH_HOST_KEY_ERROR\n");
+    expect(await call("ssh_connect", { host: "missing-python" }, true)).toStartWith("Error: RUNTIME_UNSUPPORTED\n");
   });
 
   test("rejects unrecognized tool fields instead of accepting arbitrary SSH options", async () => {
-    const response = await client.callTool({ name: "ssh_connect", arguments: { host: "fixture", sshOptions: ["-oStrictHostKeyChecking=no"] } });
-    expect(response.isError).toBe(true);
+    await call("ssh_connect", { host: "fixture", sshOptions: ["-oStrictHostKeyChecking=no"] }, true);
     for (const args of [{ query: "fixture" }, { limit: 1 }, { cursor: "unused" }]) {
-      const response = await client.callTool({ name: "ssh_discover", arguments: args });
-      expect(response.isError).toBe(true);
+      await call("ssh_discover", args, true);
     }
     for (const args of [{ connection_id: dev }, { check_alive: true }, { limit: 1 }, { cursor: "unused" }]) {
-      const response = await client.callTool({ name: "ssh_sessions", arguments: args });
-      expect(response.isError).toBe(true);
+      await call("ssh_sessions", args, true);
     }
     for (const options of [{ on_busy: "cancel" }, { timeout_seconds: 1 }]) {
-      const response = await client.callTool({ name: "ssh_close", arguments: { connection_id: dev, ...options } });
-      expect(response.isError).toBe(true);
+      await call("ssh_close", { connection_id: dev, ...options }, true);
     }
   });
 
   test("direct connections accept unlisted addresses and preserve explicit account/port overrides", async () => {
-    const connection = await call("ssh_connect", { host: "127.0.0.1", user: "direct-user", port: fixture.port });
-    expect(connection.connection_id).not.toBe(dev);
-    expect(await sessionSummary(connection.connection_id)).toMatchObject({ host: "127.0.0.1", user: "direct-user", port: fixture.port });
-    expect(await taskCall("ssh_bash", { connection_id: connection.connection_id, command: "pwd" })).toBe(fixture.workspace + "\n");
-    expect((await call("ssh_close", connection)).remote_cleanup).toBe("confirmed");
+    const id = connectionId(await call("ssh_connect", { host: "127.0.0.1", user: "direct-user", port: fixture.port }));
+    expect(id).not.toBe(dev);
+    expect((await call("ssh_sessions")).split("\n")).toContain(`${id}  direct-user@127.0.0.1:${fixture.port}`);
+    expect(await call("ssh_bash", { connection_id: id, command: "pwd" })).toBe(fixture.workspace + "\n");
+    expect(await call("ssh_close", { connection_id: id })).toBe(`Closed ${id} (remote cleanup confirmed).`);
   });
 
   test("one caller timing out does not abort another caller's shared worker startup", async () => {
     const before = fixture.authentications;
     const short = call("ssh_connect", { host: "slow", timeout_seconds: 1 }, true);
     const longer = call("ssh_connect", { host: "slow", timeout_seconds: 5 });
-    expect((await short).error.code).toBe("CONNECT_TIMEOUT");
-    const connection = await longer;
-    expect(fixture.authentications - before).toBe(1);
-    expect((await sessionSummary(connection.connection_id)).connection_id).toBe(connection.connection_id);
-    await call("ssh_close", connection);
+    expect(await short).toStartWith("Error: CONNECT_TIMEOUT\n");
+    const id = connectionId(await longer);
+    try {
+      expect(fixture.authentications - before).toBe(1);
+      expect((await call("ssh_sessions")).split("\n")).toContain(`${id}  slow@slow:${fixture.port}`);
+    } finally { await call("ssh_close", { connection_id: id }); }
   }, 8000);
 
   test("a timed-out final caller retires its pending worker and publishes no handle", async () => {
@@ -218,7 +200,7 @@ describe("MCP and connections", () => {
   test("lists only available connections without opening or changing connections", async () => {
     const before = fixture.authentications;
     const result = await call("ssh_sessions");
-    expect(result).toEqual({ sessions: [{ connection_id: dev, host: "fixture", user: "fixture", port: fixture.port }] });
+    expect(result).toBe(`${dev}  fixture@fixture:${fixture.port}`);
     expect(await call("ssh_sessions")).toEqual(result);
     expect(fixture.authentications).toBe(before);
   });
@@ -242,32 +224,35 @@ describe("remote files", () => {
     const filename = "odd ' $(touch SHOULD_NOT_EXIST) 😀\nname.txt";
     const path = join(fixture.workspace, filename);
     const value = await call("ssh_write_file", { connection_id: dev, file_path: path, content: "hello\r\n世界\r\n" });
+    expect(value).toBe(`File created successfully at: ${path}`);
     const read = await call("ssh_read_file", { connection_id: dev, file_path: path, limit: 1 });
-    expect(read.content).toBe("hello\r\n");
-    expect(read.sha256).toBe(value.sha256);
-    expect(read.nextLine).toBe(2);
-    expect((await call("ssh_read_file", { connection_id: dev, file_path: path, offset: 2 })).content).toBe("世界\r\n");
+    expect(read).toBe("     1\thello\nPARTIAL view: showing lines 1-1 of 2. Use offset=2 to continue.");
+    expect(await call("ssh_read_file", { connection_id: dev, file_path: path, offset: 2 })).toBe("     2\t世界");
+    expect(await readFile(path, "utf8")).toBe("hello\r\n世界\r\n");
     expect(await readdir(fixture.workspace)).not.toContain("SHOULD_NOT_EXIST");
   });
 
   test("applies exact edits atomically and requires a fresh read for stale or ambiguous edits", async () => {
     const created = await call("ssh_write_file", { connection_id: dev, file_path: "edit.txt", content: "one\r\ntwo two\r\n" });
+    expect(created).toBe(`File created successfully at: ${join(fixture.workspace, "edit.txt")}`);
     await chmod(join(fixture.workspace, "edit.txt"), 0o751);
 
     const ambiguous = await call("ssh_edit_file", {
       connection_id: dev, file_path: "edit.txt", old_string: "two", new_string: "second",
     }, true);
-    expect(ambiguous.error.message).toContain("exactly one occurrence");
+    expect(ambiguous).toStartWith("Error: REMOTE_OPERATION_FAILED\n");
+    expect(ambiguous).toContain("exactly one occurrence");
     expect(await readFile(join(fixture.workspace, "edit.txt"), "utf8")).toBe("one\r\ntwo two\r\n");
 
     const first = await call("ssh_edit_file", {
       connection_id: dev, file_path: "edit.txt", old_string: "one", new_string: "first",
     });
-    expect(first.sha256).not.toBe(created.sha256);
+    expect(first).toBe(`The file ${join(fixture.workspace, "edit.txt")} has been updated successfully.`);
+    expect(await readFile(join(fixture.workspace, "edit.txt"), "utf8")).toBe("first\r\ntwo two\r\n");
     const second = await call("ssh_edit_file", {
       connection_id: dev, file_path: "edit.txt", old_string: "two", new_string: "second", replace_all: true,
     });
-    expect(second.sha256).not.toBe(first.sha256);
+    expect(second).toBe(first);
     expect((await lstat(join(fixture.workspace, "edit.txt"))).mode & 0o777).toBe(0o751);
     expect(await readFile(join(fixture.workspace, "edit.txt"), "utf8")).toBe("first\r\nsecond second\r\n");
 
@@ -275,20 +260,22 @@ describe("remote files", () => {
     const stale = await call("ssh_edit_file", {
       connection_id: dev, file_path: "edit.txt", old_string: "changed", new_string: "again",
     }, true);
-    expect(stale.error.message).toContain("conflict");
+    expect(stale).toContain("conflict");
+    expect(await readFile(join(fixture.workspace, "edit.txt"), "utf8")).toBe("changed\r\n");
 
-    await taskCall("ssh_bash", { connection_id: dev, command: "printf 'outside\\n' > outside.txt" });
+    await call("ssh_bash", { connection_id: dev, command: "printf 'outside\\n' > outside.txt" });
     const unread = await call("ssh_edit_file", {
       connection_id: dev, file_path: "outside.txt", old_string: "outside", new_string: "inside",
     }, true);
-    expect(unread.error.code).toBe("FILE_NOT_READ");
+    expect(unread).toBe("Error: FILE_NOT_READ\nRead the file with ssh_read_file before editing it");
     await call("ssh_read_file", { connection_id: dev, file_path: "outside.txt" });
     await call("ssh_edit_file", { connection_id: dev, file_path: "outside.txt", old_string: "outside", new_string: "inside" });
     expect(await readFile(join(fixture.workspace, "outside.txt"), "utf8")).toBe("inside\n");
 
-    await taskCall("ssh_bash", { connection_id: dev, command: "printf 'guard\\n' > guard.txt" });
+    await call("ssh_bash", { connection_id: dev, command: "printf 'guard\\n' > guard.txt" });
     const unreadWrite = await call("ssh_write_file", { connection_id: dev, file_path: "guard.txt", content: "replaced" }, true);
-    expect(unreadWrite.error.message).toContain("read it with ssh_read_file first");
+    expect(unreadWrite).toContain("read it with ssh_read_file first");
+    expect(await readFile(join(fixture.workspace, "guard.txt"), "utf8")).toBe("guard\n");
     await call("ssh_read_file", { connection_id: dev, file_path: "guard.txt" });
     await call("ssh_write_file", { connection_id: dev, file_path: "guard.txt", content: "replaced" });
     expect(await readFile(join(fixture.workspace, "guard.txt"), "utf8")).toBe("replaced");
@@ -318,32 +305,34 @@ describe("remote files", () => {
   test("large file responses cross worker protocol chunks", async () => {
     const content = "x".repeat(200000);
     const written = await call("ssh_write_file", { connection_id: dev, file_path: "large.txt", content });
-    expect(written.bytesWritten).toBe(200000);
+    const path = join(fixture.workspace, "large.txt");
+    expect(written).toBe(`File created successfully at: ${path}`);
+    expect((await stat(path)).size).toBe(200000);
     const read = await call("ssh_read_file", { connection_id: dev, file_path: "large.txt", limit: 2000 });
-    expect(read.totalLines).toBe(1);
-    expect(read.content).toBe(content);
-    expect(read.sha256).toBe(written.sha256);
+    expect(read).toBe(`     1\t${content}`);
+    const localPath = join(fixture.transfers, "large.txt");
     const downloaded = await call("ssh_download", {
-      connection_id: dev, remotePath: "large.txt", localPath: join(fixture.transfers, "large.txt"),
+      connection_id: dev, remotePath: "large.txt", localPath,
     });
-    expect(downloaded.size).toBe(200000);
-    expect(await readFile(downloaded.localPath, "utf8")).toBe(content);
+    const sha256 = createHash("sha256").update(content).digest("hex");
+    expect(downloaded).toBe(`Downloaded ${path} to ${localPath} (200000 bytes).\nSHA-256: ${sha256}`);
+    expect(await readFile(localPath, "utf8")).toBe(content);
   });
 
   test("preserves symlinks and rejects binary and oversized text reads", async () => {
     await symlink("edit.txt", join(fixture.workspace, "link.txt"));
-    expect(await taskCall("ssh_bash", { connection_id: dev, command: "test -L link.txt && printf symlink" })).toBe("symlink");
+    expect(await call("ssh_bash", { connection_id: dev, command: "test -L link.txt && printf symlink" })).toBe("symlink");
     await call("ssh_read_file", { connection_id: dev, file_path: "link.txt" });
     await call("ssh_write_file", { connection_id: dev, file_path: "link.txt", content: "via link" });
     expect((await lstat(join(fixture.workspace, "link.txt"))).isSymbolicLink()).toBe(true);
     expect(await readFile(join(fixture.workspace, "edit.txt"), "utf8")).toBe("via link");
     await writeFile(join(fixture.workspace, "binary"), Buffer.from([0, 1, 255]));
-    expect((await call("ssh_read_file", { connection_id: dev, file_path: "binary" }, true)).error.message).toContain("Binary");
+    expect(await call("ssh_read_file", { connection_id: dev, file_path: "binary" }, true)).toContain("Binary");
     await writeFile(join(fixture.workspace, "huge.txt"), Buffer.alloc(fixture.config.maxFileBytes + 1, 65));
-    expect((await call("ssh_read_file", { connection_id: dev, file_path: "huge.txt" }, true)).error.message).toContain("maxFileBytes");
-    expect((await call("ssh_read_file", {
+    expect(await call("ssh_read_file", { connection_id: dev, file_path: "huge.txt" }, true)).toContain("maxFileBytes");
+    expect(await call("ssh_read_file", {
       connection_id: dev, file_path: join(fixture.workspace, "nested", "edit.txt"),
-    }, true)).error.message).toContain("FileNotFoundError");
+    }, true)).toContain("FileNotFoundError");
   });
 });
 
@@ -353,11 +342,17 @@ describe("binary transfer boundary", () => {
     const localPath = join(fixture.transfers, "source.bin");
     await writeFile(localPath, data);
     const uploaded = await call("ssh_upload", { connection_id: dev, localPath, remotePath: "transfer/data.bin" });
-    const downloaded = await call("ssh_download", { connection_id: dev, remotePath: "transfer/data.bin", localPath: join(fixture.transfers, "nested", "download.bin") });
-    expect(downloaded.sha256).toBe(uploaded.sha256);
-    expect(await readFile(downloaded.localPath)).toEqual(data);
+    const remotePath = join(fixture.workspace, "transfer", "data.bin");
+    const destination = join(fixture.transfers, "nested", "download.bin");
+    const sha256 = createHash("sha256").update(data).digest("hex");
+    expect(uploaded).toBe(`Uploaded ${localPath} to ${remotePath} (256 bytes).\nSHA-256: ${sha256}`);
+    expect(await readFile(remotePath)).toEqual(data);
+    const downloaded = await call("ssh_download", { connection_id: dev, remotePath: "transfer/data.bin", localPath: destination });
+    expect(downloaded).toBe(`Downloaded ${remotePath} to ${destination} (256 bytes).\nSHA-256: ${sha256}`);
+    expect(await readFile(destination)).toEqual(data);
     await call("ssh_upload", { connection_id: dev, localPath, remotePath: "transfer/data.bin" }, true);
-    await call("ssh_download", { connection_id: dev, remotePath: "binary", localPath: downloaded.localPath }, true);
+    await call("ssh_download", { connection_id: dev, remotePath: "binary", localPath: destination }, true);
+    expect(await readFile(destination)).toEqual(data);
   });
 
   test("SFTP transfers paths containing spaces and glob characters", async () => {
@@ -366,11 +361,14 @@ describe("binary transfer boundary", () => {
     await writeFile(local, data);
     const remote = "transfer/space file [1].bin";
     const uploaded = await call("ssh_upload", { connection_id: dev, localPath: local, remotePath: remote });
+    const destination = join(fixture.transfers, "space out [1].bin");
     const downloaded = await call("ssh_download", {
-      connection_id: dev, remotePath: remote, localPath: join(fixture.transfers, "space out [1].bin"),
+      connection_id: dev, remotePath: remote, localPath: destination,
     });
-    expect(downloaded.sha256).toBe(uploaded.sha256);
-    expect(await readFile(downloaded.localPath)).toEqual(data);
+    const sha256 = createHash("sha256").update(data).digest("hex");
+    expect(uploaded).toBe(`Uploaded ${local} to ${join(fixture.workspace, remote)} (128 bytes).\nSHA-256: ${sha256}`);
+    expect(downloaded).toBe(`Downloaded ${join(fixture.workspace, remote)} to ${destination} (128 bytes).\nSHA-256: ${sha256}`);
+    expect(await readFile(destination)).toEqual(data);
   });
 
   test("rejects paths and symlinks that leave explicitly enabled local transfer roots", async () => {
@@ -388,7 +386,7 @@ describe("binary transfer boundary", () => {
 describe("Bash tasks and archives", () => {
   test("short commands return raw multiline text and archive exact bytes", async () => {
     const command = "printf 'ready\\n  indented\\n'; printf 'warning\\n' >&2";
-    const text = await taskCall("ssh_bash", { connection_id: dev, command, wait_seconds: 300 });
+    const text = await call("ssh_bash", { connection_id: dev, command, wait_seconds: 300 });
     expect(text).toBe("ready\n  indented\n\nstderr:\nwarning\n");
     const path = await newestLog(dev);
     const log = await readFile(path);
@@ -401,7 +399,7 @@ describe("Bash tasks and archives", () => {
 
   test("multiline commands retain their exact source while inline output stays separate", async () => {
     const command = "printf '%s\\n' '中文 $literal'\n# preserve trailing whitespace  \n";
-    const text = await taskCall("ssh_bash", { connection_id: dev, command });
+    const text = await call("ssh_bash", { connection_id: dev, command });
     const path = await newestLog(dev);
     const metadata = JSON.parse(await readFile(path.replace(".log", ".meta.json"), "utf8"));
     const log = await readFile(path);
@@ -414,81 +412,80 @@ describe("Bash tasks and archives", () => {
   });
 
   test("wait expiry yields without terminating the command and queries wait for completion", async () => {
-    const text = await taskCall("ssh_bash", {
+    const text = await call("ssh_bash", {
       connection_id: dev, command: "printf begin; sleep 0.3; printf done", wait_seconds: 0.05,
     });
     expect(text).toContain("(running in background)");
     expect(text).toContain("still growing");
-    const complete = await taskCall("ssh_task_output", { ...taskScope(text), wait_seconds: 300 });
+    const complete = await call("ssh_task_output", { ...taskScope(text), wait_seconds: 300 });
     expect(complete).toContain("(completed)");
     expect(complete).toContain("stdout:\nbegindone");
-    expect(await taskCall("ssh_task_output", { ...taskScope(text), wait_seconds: 0 })).toBe(complete);
-    const fractional = await taskCall("ssh_bash", {
+    expect(await call("ssh_task_output", { ...taskScope(text), wait_seconds: 0 })).toBe(complete);
+    const fractional = await call("ssh_bash", {
       connection_id: dev, command: "sleep 0.1; printf completed", wait_seconds: 0.5,
     });
     expect(fractional).toBe("completed");
   });
 
   test("explicit background returns after startup even when a long foreground wait was supplied", async () => {
-    const text = await taskCall("ssh_bash", {
+    const text = await call("ssh_bash", {
       connection_id: dev, command: "sleep 20", run_in_background: true, wait_seconds: 300,
     });
     expect(text).toContain("(running in background)");
-    expect(await taskCall("ssh_task_stop", taskScope(text))).toContain("(stopped)");
+    expect(await call("ssh_task_stop", taskScope(text))).toContain("(stopped)");
   });
 
   test("uses real Bash, EOF stdin, independent cwd, and independent environment", async () => {
     await mkdir(join(fixture.workspace, "nested"));
-    const first = await taskCall("ssh_bash", {
+    const first = await call("ssh_bash", {
       connection_id: dev, cwd: join(fixture.workspace, "nested"),
       command: 'values=(one two); [[ ${values[1]} == two ]] || exit 7; export NEVERSSH_VALUE=first; printf "%s:%s\\n" "$PWD" "$NEVERSSH_VALUE"; cd /',
     });
     expect(first).toContain(join(fixture.workspace, "nested") + ":first\n");
-    const second = await taskCall("ssh_bash", {
+    const second = await call("ssh_bash", {
       connection_id: dev, command: 'read value || printf EOF; printf ":%s:%s" "$PWD" "${NEVERSSH_VALUE-unset}"',
     });
     expect(second).toContain("EOF:" + fixture.workspace + ":unset");
   });
 
   test("validates task handles and reports operational failures as text", async () => {
-    const absentQuery = await taskCall("ssh_task_output", { task_id: "task_00000000", wait_seconds: 0 }, true);
+    const absentQuery = await call("ssh_task_output", { task_id: "task_00000000", wait_seconds: 0 }, true);
     expect(absentQuery).toContain("Error: TASK_NOT_FOUND");
-    const absentStop = await taskCall("ssh_task_stop", { task_id: "task_00000000" }, true);
+    const absentStop = await call("ssh_task_stop", { task_id: "task_00000000" }, true);
     expect(absentStop).toContain("Error: TASK_NOT_FOUND");
-    const invalid = await client.callTool({ name: "ssh_task_stop", arguments: { task_id: dev } });
-    expect(invalid.isError).toBe(true);
-    const badCwd = await taskCall("ssh_bash", {
+    await call("ssh_task_stop", { task_id: dev }, true);
+    const badCwd = await call("ssh_bash", {
       connection_id: dev, cwd: join(fixture.workspace, "absent-directory"), command: "true",
     }, true);
     expect(badCwd).toContain("Error:");
     expect(badCwd).toContain("No such file");
-    const failed = await taskCall("ssh_bash", { connection_id: dev, command: "printf failed; exit 7" }, true);
+    const failed = await call("ssh_bash", { connection_id: dev, command: "printf failed; exit 7" }, true);
     expect(failed).toContain("Exit code: 7");
-    expect(await taskCall("ssh_task_output", { ...taskScope(failed), wait_seconds: 0 })).toContain("Exit code: 7");
+    expect(await call("ssh_task_output", { ...taskScope(failed), wait_seconds: 0 })).toContain("Exit code: 7");
   });
 
   test("lists active and retained tasks, active first", async () => {
-    const running = await taskCall("ssh_bash", {
+    const running = await call("ssh_bash", {
       connection_id: dev, command: "sleep 20", run_in_background: true,
     });
     const id = taskScope(running).task_id;
-    const active = await taskCall("ssh_task_list", { connection_id: dev });
+    const active = await call("ssh_task_list", { connection_id: dev });
     expect(active).toMatch(new RegExp(`^${id}  running  ${dev}  `, "m"));
-    await taskCall("ssh_task_stop", { task_id: id });
-    const stopped = await taskCall("ssh_task_list", { connection_id: dev });
+    await call("ssh_task_stop", { task_id: id });
+    const stopped = await call("ssh_task_list", { connection_id: dev });
     expect(stopped).toMatch(new RegExp(`^${id}  stopped  ${dev}  `, "m"));
-    expect(await taskCall("ssh_task_list", {})).toContain(id);
-    await taskCall("ssh_task_output", { task_id: id, wait_seconds: 0 });
-    expect(await taskCall("ssh_task_list", { connection_id: dev })).not.toContain(id);
-    expect(await taskCall("ssh_task_list", { connection_id: "00000000" })).toBe("No tasks.");
+    expect(await call("ssh_task_list", {})).toContain(id);
+    await call("ssh_task_output", { task_id: id, wait_seconds: 0 });
+    expect(await call("ssh_task_list", { connection_id: dev })).not.toContain(id);
+    expect(await call("ssh_task_list", { connection_id: "00000000" })).toBe("No tasks.");
   });
 
   test("missing Bash is a clear startup error instead of a silent shell fallback", async () => {
-    const connection = await call("ssh_connect", { host: "fixture", user: "missing-bash" });
+    const id = connectionId(await call("ssh_connect", { host: "fixture", user: "missing-bash" }));
     try {
-      expect(await taskCall("ssh_bash", { connection_id: connection.connection_id, command: "true" }, true))
+      expect(await call("ssh_bash", { connection_id: id, command: "true" }, true))
         .toContain("Error: BASH_UNAVAILABLE");
-    } finally { await call("ssh_close", connection); }
+    } finally { await call("ssh_close", { connection_id: id }); }
   });
 
   test("archive ID collisions preserve history and never replay a started command", async () => {
@@ -530,7 +527,7 @@ describe("Bash tasks and archives", () => {
   }, 10000);
 
   test("split UTF-8 and large output are archived fully while inline previews stay bounded", async () => {
-    const split = await taskCall("ssh_bash", {
+    const split = await call("ssh_bash", {
       connection_id: dev, command: "python3 -c 'import os,time; os.write(1, bytes([228])); time.sleep(.1); os.write(1, bytes([184,150,231,149,140]))'",
     });
     expect(split).toBe("世界");
@@ -538,14 +535,14 @@ describe("Bash tasks and archives", () => {
     const splitMetadata = JSON.parse(await readFile(splitPath.replace(".log", ".meta.json"), "utf8"));
     expect((await readFile(splitPath)).subarray(splitMetadata.output_offset).toString()).toBe("世界");
     const largeCommand = 'python3 -c \'import sys; sys.stdout.write("x" * 2097152)\'';
-    const large = await taskCall("ssh_bash", { connection_id: dev, command: largeCommand });
+    const large = await call("ssh_bash", { connection_id: dev, command: largeCommand });
     const logBytes = 2097152 + Buffer.byteLength(`Command:\n${largeCommand}\n\nOutput:\n`);
     expect(large).toContain(`${logBytes} bytes`);
     expect(large).toContain("read selectively");
     expect(large.length).toBeLessThan(70000);
     expect((await lstat(logPath(large))).size).toBe(logBytes);
     expect((await lstat(logPath(large))).mode & 0o777).toBe(0o600);
-    const readTail = await taskCall("ssh_bash", { connection_id: dev, command: "tail -c 16 '" + logPath(large) + "'" });
+    const readTail = await call("ssh_bash", { connection_id: dev, command: "tail -c 16 '" + logPath(large) + "'" });
     expect(readTail).toBe("x".repeat(16));
   }, 15000);
 
@@ -566,33 +563,33 @@ describe("Bash tasks and archives", () => {
   }, 10000);
 
   test("stop escalates for TERM-resistant shells, includes normal descendants, and is repeatable", async () => {
-    const running = await taskCall("ssh_bash", {
+    const running = await call("ssh_bash", {
       connection_id: dev, command: "trap '' TERM; (sleep 3; touch cancel-leak) & printf ready; wait", wait_seconds: 0.25,
     });
     expect(running).toContain("ready");
-    const stopped = await taskCall("ssh_task_stop", taskScope(running));
+    const stopped = await call("ssh_task_stop", taskScope(running));
     expect(stopped).toContain("(stopped)");
     expect(stopped).toContain("Reason: cancelled");
-    expect(await taskCall("ssh_task_stop", taskScope(running))).toBe(stopped);
+    expect(await call("ssh_task_stop", taskScope(running))).toBe(stopped);
     await delay(1100);
     expect(await readdir(fixture.workspace)).not.toContain("cancel-leak");
     expect(await logOutput(stopped)).toBe("ready");
   }, 10000);
 
   test("network loss retains known output without inventing an exit code or replaying the command", async () => {
-    const running = await taskCall("ssh_bash", {
+    const running = await call("ssh_bash", {
       connection_id: dev, command: "printf x >> attempts; printf before; (sleep 2; touch disconnect-leak) & wait", wait_seconds: 0.1,
     });
     fixture.dropConnections();
-    const lost = await taskCall("ssh_task_output", { ...taskScope(running), wait_seconds: 3 });
+    const lost = await call("ssh_task_output", { ...taskScope(running), wait_seconds: 3 });
     expect(lost).toContain("Reason: connection_lost");
     expect(lost).toContain("Exit code: unknown");
     expect(lost).toContain("Last confirmed output size:");
     expect(await readFile(join(fixture.workspace, "attempts"), "utf8")).toBe("x");
-    expect((await call("ssh_read_file", { connection_id: dev, file_path: "attempts" }, true)).error.code).toBe("CONNECTION_LOST");
+    expect(await call("ssh_read_file", { connection_id: dev, file_path: "attempts" }, true)).toStartWith("Error: CONNECTION_LOST\n");
     const previous = dev;
     await call("ssh_close", { connection_id: previous });
-    dev = (await call("ssh_connect", { host: "fixture" })).connection_id;
+    dev = connectionId(await call("ssh_connect", { host: "fixture" }));
     expect(dev).not.toBe(previous);
     await delay(2100);
     expect(await readdir(fixture.workspace)).not.toContain("disconnect-leak");
@@ -600,39 +597,39 @@ describe("Bash tasks and archives", () => {
   });
 
   test("force close cleans up children, retains logs, and a new connection can read old paths", async () => {
-    const running = await taskCall("ssh_bash", {
+    const running = await call("ssh_bash", {
       connection_id: dev, command: "trap '' TERM; (sleep 3; touch close-leak) & printf ready; wait", wait_seconds: 0.25,
     });
     const closed = await call("ssh_close", { connection_id: dev });
-    expect(closed.remote_cleanup).toBe("confirmed");
+    expect(closed).toBe(`Closed ${dev} (remote cleanup confirmed).`);
     expect(await call("ssh_close", { connection_id: dev })).toEqual(closed);
-    const stopped = await taskCall("ssh_task_output", { ...taskScope(running), wait_seconds: 0 });
+    const stopped = await call("ssh_task_output", { ...taskScope(running), wait_seconds: 0 });
     expect(stopped).toContain("Reason: connection_closed");
     expect(await logOutput(running)).toBe("ready");
     const previous = dev;
-    dev = (await call("ssh_connect", { host: "fixture" })).connection_id;
+    dev = connectionId(await call("ssh_connect", { host: "fixture" }));
     expect(dev).not.toBe(previous);
     const oldLog = await call("ssh_read_file", { connection_id: dev, file_path: logPath(running) });
-    expect(oldLog.content).toContain("Command:\ntrap '' TERM;");
-    expect(oldLog.content).toEndWith("\n\nOutput:\nready");
+    expect(oldLog).toStartWith("     1\tCommand:\n     2\ttrap '' TERM;");
+    expect(oldLog).toEndWith("     3\t\n     4\tOutput:\n     5\tready");
     await delay(1100);
     expect(await readdir(fixture.workspace)).not.toContain("close-leak");
   }, 10000);
 
   test("four active tasks leave file operations available and concurrent close shares cleanup", async () => {
-    const running = await Promise.all(Array.from({ length: 4 }, () => taskCall("ssh_bash", {
+    const running = await Promise.all(Array.from({ length: 4 }, () => call("ssh_bash", {
       connection_id: dev, command: "sleep 20", run_in_background: true,
     })));
-    const full = await taskCall("ssh_bash", { connection_id: dev, command: "true" }, true);
+    const full = await call("ssh_bash", { connection_id: dev, command: "true" }, true);
     expect(full).toContain("Error: TASK_LIMIT_REACHED");
-    expect((await call("ssh_read_file", { connection_id: dev, file_path: "edit.txt" })).path).toContain("edit.txt");
+    expect(await call("ssh_read_file", { connection_id: dev, file_path: "edit.txt" })).toBe("     1\tvia link");
     const [first, second] = await Promise.all([call("ssh_close", { connection_id: dev }), call("ssh_close", { connection_id: dev })]);
-    expect(first).toEqual({ connection_id: dev, closed: true, remote_cleanup: "confirmed" });
+    expect(first).toBe(`Closed ${dev} (remote cleanup confirmed).`);
     expect(second).toEqual(first);
     for (const text of running) {
-      expect(await taskCall("ssh_task_output", { ...taskScope(text), wait_seconds: 0 })).toContain("Reason: connection_closed");
+      expect(await call("ssh_task_output", { ...taskScope(text), wait_seconds: 0 })).toContain("Reason: connection_closed");
     }
-    dev = (await call("ssh_connect", { host: "fixture" })).connection_id;
+    dev = connectionId(await call("ssh_connect", { host: "fixture" }));
   });
 
   test("installs and reuses the versioned remote build cache", async () => {
@@ -663,7 +660,7 @@ describe("Bash tasks and archives", () => {
   });
 
   test("MCP stdio closure stops owned processes while preserving logs and metadata", async () => {
-    const running = await taskCall("ssh_bash", {
+    const running = await call("ssh_bash", {
       connection_id: dev, command: "printf retained; (sleep 3; touch eof-leak) & wait", wait_seconds: 0.1,
     });
     await client.close();
@@ -710,7 +707,10 @@ describe("MCP era negotiation", () => {
       expect(client.getProtocolEra()).toBe("legacy");
       const connection = await client.callTool({ name: "ssh_connect", arguments: { host: "fixture" } });
       expect(connection.isError, JSON.stringify(connection.content)).toBeFalsy();
-      expect(connection.structuredContent).toMatchObject({ connection_id: expect.any(String) });
+      expect(connection.structuredContent).toBeUndefined();
+      expect(connection.content.every((item) => item.type === "text")).toBe(true);
+      expect(connectionId(connection.content.map((item) => item.type === "text" ? item.text : "").join("\n")))
+        .toMatch(/^[a-f0-9]{8}$/);
     } finally { await client.close(); }
     expect(negotiationStderr).not.toContain("SyntaxError");
   }, 20000);
@@ -760,13 +760,17 @@ describe("MCP wire lifecycle", () => {
         child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
         const connection = await rpc("tools/call", { name: "ssh_connect", arguments: { host: "fixture" } });
         expect(connection.result.isError).toBeFalsy();
+        expect(connection.result.structuredContent).toBeUndefined();
+        const id = connectionId(connection.result.content.map((item: { type: string; text?: string }) =>
+          item.type === "text" ? item.text : "").join("\n"));
         const started = await rpc("tools/call", {
           name: "ssh_bash", arguments: {
-            connection_id: connection.result.structuredContent.connection_id,
+            connection_id: id,
             command: "printf retained; (sleep 3; touch epipe-leak) & wait", run_in_background: true,
           },
         });
         expect(started.result.isError).toBeFalsy();
+        expect(started.result.structuredContent).toBeUndefined();
         const running = started.result.content.map((item: { text: string }) => item.text).join("\n");
 
         // The next response hits EPIPE; stdin deliberately remains open throughout cleanup.

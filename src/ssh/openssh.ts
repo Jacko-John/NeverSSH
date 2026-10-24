@@ -1,8 +1,20 @@
 /** Native OpenSSH argument construction and configuration resolution, without a local shell. */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import type { Config, Endpoint, SshTarget } from "./config";
-import { bounded, ToolError } from "./errors";
+import type { Config, Endpoint, SshTarget } from "../config";
+import { bounded, ToolError } from "../errors";
+
+/** Apply the same non-interactive security and connection policy to SSH and SFTP. */
+function connectionOptions(config: Config): string[] {
+  return [
+    "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+    "-o", "UpdateHostKeys=no", "-o", "CheckHostIP=no", "-o", "ForwardAgent=no",
+    "-o", "ForwardX11=no", "-o", "ClearAllForwardings=yes", "-o", "PermitLocalCommand=no",
+    "-o", "ConnectTimeout=15", "-o", "ConnectionAttempts=1", "-o", "ServerAliveInterval=15",
+    "-o", "ServerAliveCountMax=2", "-o", "LogLevel=ERROR",
+    ...(config.compression ? ["-o", "Compression=yes"] : []),
+  ];
+}
 
 /** Pin transport behavior while inheriting trusted identity, proxy, and host matching configuration. */
 export function sshOptions(config: Config, target: SshTarget, socket: string, master: boolean): string[] {
@@ -10,13 +22,8 @@ export function sshOptions(config: Config, target: SshTarget, socket: string, ma
     ...(config.sshConfig ? ["-F", config.sshConfig] : []),
     ...(target.user ? ["-l", target.user] : []), ...(target.port ? ["-p", String(target.port)] : []),
     "-T", "-S", socket, "-o", `ControlMaster=${master ? "yes" : "no"}`,
-    "-o", "ControlPersist=no", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-    "-o", "UpdateHostKeys=no", "-o", "CheckHostIP=no", "-o", "ForwardAgent=no", "-o", "ForwardX11=no",
-    "-o", "ClearAllForwardings=yes", "-o", "PermitLocalCommand=no", "-o", "RemoteCommand=none",
+    "-o", "ControlPersist=no", ...connectionOptions(config), "-o", "RemoteCommand=none",
     "-o", `SessionType=${master ? "none" : "default"}`, "-o", "ForkAfterAuthentication=no", "-o", "StdinNull=no",
-    "-o", "ConnectTimeout=15", "-o", "ConnectionAttempts=1", "-o", "ServerAliveInterval=15",
-    "-o", "ServerAliveCountMax=2", "-o", "LogLevel=ERROR",
-    ...(config.compression ? ["-o", "Compression=yes"] : []),
   ];
 }
 
@@ -25,12 +32,7 @@ export function sftpOptions(config: Config, target: SshTarget, socket: string): 
   return [
     ...(config.sshConfig ? ["-F", config.sshConfig] : []),
     "-o", `ControlPath=${socket}`, "-o", "ControlMaster=no",
-    "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-    "-o", "UpdateHostKeys=no", "-o", "CheckHostIP=no", "-o", "ForwardAgent=no",
-    "-o", "ForwardX11=no", "-o", "ClearAllForwardings=yes", "-o", "PermitLocalCommand=no",
-    "-o", "ConnectTimeout=15", "-o", "ConnectionAttempts=1", "-o", "ServerAliveInterval=15",
-    "-o", "ServerAliveCountMax=2", "-o", "LogLevel=ERROR",
-    ...(config.compression ? ["-o", "Compression=yes"] : []),
+    ...connectionOptions(config),
     ...(target.port ? ["-P", String(target.port)] : []),
     ...(target.user ? ["-o", `User=${target.user}`] : []),
   ];
@@ -39,11 +41,11 @@ export function sftpOptions(config: Config, target: SshTarget, socket: string): 
 export const sshEnvironment = () => ({ ...process.env, SSH_ASKPASS_REQUIRE: "never", LC_ALL: "C" });
 
 /** Classify known OpenSSH diagnostics, retaining a fallback for versions with different wording. */
-export function sshFailure(message: string, details: Record<string, unknown> = {}): ToolError {
+export function sshFailure(message: string): ToolError {
   const code = /host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED/i.test(message) ? "SSH_HOST_KEY_ERROR"
     : /permission denied|authentication failed/i.test(message) ? "SSH_AUTH_FAILED"
     : /timed out/i.test(message) ? "SSH_TIMEOUT" : "SSH_FAILED";
-  return new ToolError(code, message || "SSH connection failed", details);
+  return new ToolError(code, message || "SSH connection failed");
 }
 
 /** Ask OpenSSH to resolve a specific target, including Include/Match and command-line overrides. */

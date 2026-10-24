@@ -3,8 +3,8 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { configSchema, hostField, loadConfig, targetAllowed } from "../src/config";
-import { sftpOptions, sshOptions } from "../src/openssh";
-import { transferPath } from "../src/transfers";
+import { sftpOptions, sshOptions } from "../src/ssh/openssh";
+import { transferPath } from "../src/files/transfers";
 
 let root: string;
 beforeAll(async () => { root = await realpath(await mkdtemp("/tmp/neverssh-config-test-")); });

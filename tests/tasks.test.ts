@@ -1,8 +1,8 @@
 /** Exercise foreground waits, output bounds, and lifecycle races without remote processes. */
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { RemoteChannel, type RemoteResult } from "../src/channel";
-import { TaskManager } from "../src/tasks";
-import { taskText } from "../src/task-text";
+import { RemoteChannel, type RemoteResult } from "../src/ssh/request-channel";
+import { TaskManager } from "../src/tasks/manager";
+import { taskText } from "../src/tasks/text";
 
 const CONNECTION = "1234abcd";
 const HEADER_BYTES = Buffer.byteLength("Command:\nfixture\n\nOutput:\n");

@@ -1,6 +1,6 @@
 /** Exercise stream framing boundaries shared by worker messages, command output, and stdin. */
 import { expect, test } from "bun:test";
-import { JsonLines } from "../src/json-lines";
+import { JsonLines } from "../src/ssh/json-lines";
 
 test("delivers complete records in order across arbitrary chunk boundaries", () => {
   const records = new JsonLines(32);

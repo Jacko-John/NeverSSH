@@ -1,4 +1,5 @@
 """Exercise same-worker revision conflicts with real files and deterministic commit gates."""
+import base64
 from pathlib import Path
 import sys
 import tempfile
@@ -37,7 +38,8 @@ class FileCommitTests(unittest.TestCase):
                 if operation == "edit":
                     second = self.request("edit", path=str(alias), oldText="right", newText="second", expectedSha256=revision)
                 elif operation == "write":
-                    second = self.request("write", path=str(alias), content="second", expectedSha256=revision)
+                    second = self.request("write", path=str(alias), base64=base64.b64encode(b"second").decode("ascii"),
+                                          expectedSha256=revision)
                 else:
                     staged = self.root / (operation + ".staged")
                     staged.write_bytes(b"second")

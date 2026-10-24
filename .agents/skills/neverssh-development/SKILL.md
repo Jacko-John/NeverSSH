@@ -10,6 +10,7 @@ Before changing this repository, read [references/development.md](references/dev
 ## Interface requirements
 
 - MCP inputs remain strict, schema-validated parameter objects. Reuse shared validators and defaults; published schemas must not introduce the JSON Schema `pattern` keyword.
+- Define every input in `src/mcp/contracts.ts`; use `createToolContracts(maxFileBytes)` so file limits follow the active configuration. MCP registration, generated field tables, and contract tests share these definitions.
 - Every tool result uses concise readable text, without JSON rendering, `structuredContent`, or `outputSchema`. Internal protocols and a remote program's original output retain their own formats.
 - Keep execution, lifecycle state, and presentation in their existing modules. Follow the task text formatters for output design and the shared error formatter for failures.
 - Preserve program whitespace, actionable handles, continuation hints, and explicit uncertainty. A successful short Bash command needs only its program output.
@@ -17,6 +18,8 @@ Before changing this repository, read [references/development.md](references/dev
 ## Development workflow
 
 Inspect the nearest registered tool, formatter, contract, and public integration test before extending an interface. Preserve revision checks, atomic commits, bounded resources, cancellation semantics, and local/remote path boundaries. The reference explains these invariants and how to test them.
+
+Keep interface adapters in `src/mcp/`, connections and request protocols in `src/ssh/`, Bash state and text in `src/tasks/`, and revisions and transfers in `src/files/`. `src/remote/` contains Python sources and the local bundle definition. `src/runtime.ts` owns shared state; `src/index.ts` owns CLI and stdio lifetime.
 
 Use local development tools for a local checkout. Use Bun/Bunx for JavaScript/TypeScript, uv for local Python operations, and `rg -uu` for searches. The shipped remote runtime stays Python 3.8-compatible and standard-library only.
 

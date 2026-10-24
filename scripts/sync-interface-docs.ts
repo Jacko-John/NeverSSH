@@ -1,6 +1,9 @@
 /** Update input field tables while preserving handwritten text results and examples. */
 import { z } from "zod";
-import { toolContracts } from "../src/contracts";
+import { configSchema } from "../src/config";
+import { createToolContracts } from "../src/mcp/contracts";
+
+const toolContracts = createToolContracts(configSchema.parse({}).maxFileBytes);
 
 type Schema = {
   type?: string | string[];
@@ -44,6 +47,39 @@ const descriptions: Record<string, Record<string, string>> = {
   "ssh_task_stop.input": taskScope,
   "ssh_task_list.input": {
     connection_id: "只列出该连接的任务；省略时列出全部连接。",
+  },
+  "ssh_read_file.input": {
+    connection_id: "连接 ID。",
+    file_path: "远端文件路径；推荐绝对路径，相对路径按远端 HOME 解析。",
+    offset: "起始行号，从 1 开始。",
+    limit: "最多读取多少行。",
+  },
+  "ssh_write_file.input": {
+    connection_id: "连接 ID。",
+    file_path: "目标远端文件；推荐绝对路径，相对路径按远端 HOME 解析。",
+    content: "完整文件内容；字符数上限随 maxFileBytes 配置，远端另按 UTF-8 字节数校验。",
+  },
+  "ssh_edit_file.input": {
+    connection_id: "连接 ID。",
+    file_path: "要编辑的远端文件；推荐绝对路径，相对路径按远端 HOME 解析。",
+    old_string: "要替换的原文；不能为空，且不能含 NUL。字符数上限随 maxFileBytes 配置。",
+    new_string: "替换后的文本；字符数上限随 maxFileBytes 配置，结果另受远端文件字节上限约束。",
+    replace_all: "为 true 时替换所有匹配；否则必须恰好匹配一次。",
+  },
+  "ssh_upload.input": {
+    connection_id: "连接 ID。",
+    cwd: "远端工作目录；省略时使用远端 HOME。",
+    localPath: "本地绝对路径，必须位于 localTransferRoots 内。",
+    remotePath: "目标远端路径；支持绝对路径、~/ 和相对于 cwd 的路径。",
+    overwrite: "显式允许覆盖已存在的远端文件。",
+    expectedSha256: "期望的远端文件 SHA-256，小写十六进制；用于冲突检查。",
+  },
+  "ssh_download.input": {
+    connection_id: "连接 ID。",
+    cwd: "远端工作目录；省略时使用远端 HOME。",
+    remotePath: "要下载的远端路径；支持绝对路径、~/ 和相对于 cwd 的路径。",
+    localPath: "本地绝对路径，必须位于 localTransferRoots 内。",
+    overwrite: "显式允许覆盖已存在的本地文件。",
   },
 };
 

@@ -3,8 +3,8 @@ import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
-import { SshTransport } from "../src/ssh";
-import { download, upload } from "../src/transfers";
+import { SshTransport } from "../src/ssh/transport";
+import { download, upload } from "../src/files/transfers";
 import { SshFixture } from "./fixture";
 
 const fixture = new SshFixture();

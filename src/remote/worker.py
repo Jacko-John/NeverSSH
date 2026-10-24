@@ -39,7 +39,7 @@ class ChildRequest:
 
     process: subprocess.Popen
     input_buffer: bytearray
-    close_input: bool
+    close_input: bool = False
     stdin_registered: bool = False
     open_output_streams: int = 2
     stopping_at: Optional[float] = None
@@ -100,7 +100,7 @@ class Worker:
                                "maxArchiveBytes": bootstrap_payload["maxArchiveBytes"]}
         self.archive = None
         self.session_lock = None
-        self.next_archive_cleanup = time.monotonic() + 3600
+        self.next_archive_cleanup = 0
         self.selector = selectors.DefaultSelector()
         self.requests: Dict[str, ChildRequest] = {}
         self.incoming = bytearray()
@@ -153,12 +153,7 @@ class Worker:
         try:
             self.archive = archive_module.ArchiveStore(self.archive_limits["maxTaskOutputBytes"],
                                                         self.archive_limits["maxArchiveBytes"])
-            try:
-                if self.archive.cleanup_due():
-                    self.archive.cleanup()
-                    self.archive.mark_cleanup()
-            except Exception as error:
-                print("NeverSSH archive cleanup failed: " + str(error), file=sys.stderr, flush=True)
+            self.cleanup_archives()
             self.session_lock = self.archive.new_session(self.connection_id)
         except Exception as error:
             self.emit({"type": "startup_error", "code": getattr(error, "code", "ARCHIVE_UNAVAILABLE"),
@@ -226,7 +221,7 @@ class Worker:
             "request": request_payload,
         }
         data = json.dumps(request_payload, ensure_ascii=True).encode("utf-8") + b"\n"
-        self.requests[request_id] = ChildRequest(process, bytearray(data), operation != "bash")
+        self.requests[request_id] = ChildRequest(process, bytearray(data))
         for pipe, stream in ((process.stdout, "stdout"), (process.stderr, "stderr")):
             os.set_blocking(pipe.fileno(), False)
             self.selector.register(pipe, selectors.EVENT_READ, (request_id, stream))

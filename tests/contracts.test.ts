@@ -3,12 +3,15 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Client, InMemoryTransport, type Tool } from "@modelcontextprotocol/client";
 import { z } from "zod";
 import { configSchema } from "../src/config";
-import { commandContracts, connectionContracts, toolContracts } from "../src/contracts";
+import { commandContracts, connectionContracts, createToolContracts } from "../src/mcp/contracts";
 import { errorText, ToolError } from "../src/errors";
-import * as format from "../src/operation-text";
-import { createServer, Runtime } from "../src/server";
+import * as format from "../src/mcp/operation-text";
+import { createServer } from "../src/mcp/server";
+import { Runtime } from "../src/runtime";
 
-const runtime = new Runtime(configSchema.parse({}));
+const config = configSchema.parse({});
+const toolContracts = createToolContracts(config.maxFileBytes);
+const runtime = new Runtime(config);
 const client = new Client({ name: "neverssh-contract-test", version: "1.0.0" });
 let tools: Tool[];
 
@@ -32,6 +35,8 @@ test("documentation field tables are generated from the registered MCP contracts
 test("interface document covers every registered tool", async () => {
   const source = await Bun.file(new URL("../docs/interfaces.md", import.meta.url)).text();
   const headings = source.split(/^## /m).slice(1).map((section) => section.slice(0, section.indexOf("\n")));
+  expect(Object.keys(toolContracts).sort()).toEqual(tools.map(({ name }) => name).sort());
+  expect(Object.keys(toolContracts)).toHaveLength(13);
   for (const { name, outputSchema } of tools) {
     expect(headings.filter((heading) => heading === name), name).toHaveLength(1);
     expect(outputSchema, name).toBeUndefined();
@@ -59,7 +64,7 @@ test("all documented requests validate against registered inputs and results use
         expect(json, name).not.toBeNull();
         const args = JSON.parse(json![1]!);
         expect(input.safeParse(args).success, name).toBe(true);
-        if (contract) expect(contract.input.safeParse(args).success, name).toBe(true);
+        expect(contract.input.safeParse(args).success, name).toBe(true);
         inputs++;
       } else if (heading.startsWith("返回")) {
         expect(example, name).not.toMatch(/^\x60\x60\x60json$/m);
@@ -82,6 +87,50 @@ test("all documented requests validate against registered inputs and results use
   expect(errors).not.toMatch(/^\x60\x60\x60json$/m);
   const text = /^\x60\x60\x60text\n([\s\S]*?)\x60\x60\x60/m.exec(errors)?.[1];
   expect(text?.trimEnd()).toBe(errorText(new ToolError("TASK_NOT_FOUND", "Task does not exist in this MCP instance")));
+});
+
+test("file input limits follow the configured byte budget without weakening strict contracts", () => {
+  const contracts = createToolContracts(1024);
+  const file = { connection_id: "1234abcd", file_path: "/srv/app/file.txt" };
+  expect(contracts.ssh_write_file.input.safeParse({ ...file, content: "x".repeat(1024) }).success).toBe(true);
+  expect(contracts.ssh_write_file.input.safeParse({ ...file, content: "x".repeat(1025) }).success).toBe(false);
+  const edit = { ...file, old_string: "x", new_string: "y" };
+  for (const field of ["old_string", "new_string"]) {
+    expect(contracts.ssh_edit_file.input.safeParse({ ...edit, [field]: "x".repeat(1024) }).success).toBe(true);
+    expect(contracts.ssh_edit_file.input.safeParse({ ...edit, [field]: "x".repeat(1025) }).success).toBe(false);
+  }
+  expect(contracts.ssh_write_file.input.safeParse({ ...file, content: "", overwrite: true }).success).toBe(false);
+  expect(contracts.ssh_edit_file.input.safeParse({ ...edit, old_string: "" }).success).toBe(false);
+  expect(contracts.ssh_edit_file.input.safeParse({ ...edit, old_string: "\0" }).success).toBe(false);
+  expect(contracts.ssh_upload.input.safeParse({
+    connection_id: file.connection_id, localPath: "/tmp/in", remotePath: "/srv/out", expectedSha256: "a".repeat(64),
+  }).success).toBe(true);
+  expect(contracts.ssh_upload.input.safeParse({
+    connection_id: file.connection_id, localPath: "/tmp/in", remotePath: "/srv/out", expectedSha256: "A".repeat(64),
+  }).success).toBe(false);
+});
+
+test("registered file inputs honor a non-default maxFileBytes budget", async () => {
+  const runtime = new Runtime(configSchema.parse({ maxFileBytes: 1024 }));
+  const client = new Client({ name: "neverssh-file-limit-test", version: "1.0.0" });
+  try {
+    const [local, remote] = InMemoryTransport.createLinkedPair();
+    await createServer(runtime).connect(remote);
+    await client.connect(local);
+    const tools = (await client.listTools()).tools;
+    for (const [name, field] of [
+      ["ssh_write_file", "content"], ["ssh_edit_file", "old_string"], ["ssh_edit_file", "new_string"],
+    ] as const) {
+      const tool = tools.find((tool) => tool.name === name)!;
+      const input = z.fromJSONSchema(tool.inputSchema as Parameters<typeof z.fromJSONSchema>[0]);
+      const args = { connection_id: "1234abcd", file_path: "/srv/file.txt", ...(name === "ssh_edit_file" ? { old_string: "x", new_string: "y" } : {}) };
+      expect(input.safeParse({ ...args, [field]: "x".repeat(1024) }).success, `${name}.${field}`).toBe(true);
+      expect(input.safeParse({ ...args, [field]: "x".repeat(1025) }).success, `${name}.${field}`).toBe(false);
+    }
+  } finally {
+    await client.close();
+    await runtime.close();
+  }
 });
 
 test("connection, file, and transfer return examples match their text formatters", async () => {

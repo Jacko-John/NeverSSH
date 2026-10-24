@@ -213,6 +213,8 @@ NeverSSH 不调用模型 API。远端命令自身的网络请求仍来自远端�
 
 ## 开发验证
 
+源码按职责组织：`src/mcp/` 管理工具接口和通用结果文本，`src/ssh/` 管理连接与 worker 请求协议，`src/tasks/` 管理 Bash 任务和预览，`src/files/` 管理文件修订与传输。`src/remote/` 保存 Python 远端运行时及本地 bundle 定义；`src/runtime.ts` 统一持有状态，`src/index.ts` 负责 CLI 和 stdio 生命周期。开发规范和正反示例见[项目开发 skill](.agents/skills/neverssh-development/SKILL.md)。
+
 ```sh
 bun run check
 bun run docs:check
@@ -220,7 +222,7 @@ bun test
 bun run build
 ```
 
-修改已文档化的 schema 后运行 `bun run docs:sync` 更新字段表，并同步行为说明和示例。测试会检查字段表同步情况及示例是否通过实际 schema 校验。
+全部 13 个工具的输入 schema 集中在 `src/mcp/contracts.ts`，按当前 `maxFileBytes` 构建。修改 schema 后运行 `bun run docs:sync` 更新字段表，并同步行为说明和示例。字段表使用默认配置；测试会检查全部工具的覆盖、字段表同步及示例是否通过实际 schema 校验。
 
 JavaScript/TypeScript 使用 Bun。本地 Python 检查和测试解释器由 uv 执行。集成测试创建临时 SSH 密钥和仅监听回环地址的 SSH 测试服务，使用系统 OpenSSH 和 MCP stdio 验证工具，不修改用户 SSH 配置。
 

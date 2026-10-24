@@ -25,6 +25,7 @@ NeverSSH 不安装远端服务。远端 Python 源码由本地包提供，首次
 │   ├── .lock
 │   ├── <buildId>/
 │   │   ├── manifest.json
+│   │   ├── build_cache.py
 │   │   ├── worker.py
 │   │   ├── file_ops.py
 │   │   ├── helper.py

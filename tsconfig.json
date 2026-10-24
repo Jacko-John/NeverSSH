@@ -4,6 +4,8 @@
     "module": "Preserve",
     "moduleResolution": "Bundler",
     "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "noEmit": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,

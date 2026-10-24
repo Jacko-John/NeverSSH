@@ -1,7 +1,7 @@
 /** One request's input, output, and result within a shared SSH worker connection. */
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
-import { ToolError } from "./errors";
+import { ToolError } from "../errors";
 import { JsonLines } from "./json-lines";
 
 export type RemoteResult = Record<string, unknown>;
@@ -59,7 +59,7 @@ export class RemoteChannel extends EventEmitter {
   }
 
   /** Collect a one-shot file or transfer result; cancellation leaves a mutation's outcome uncertain. */
-  collect(connectionId: string, maxFileBytes: number, signal?: AbortSignal, timeoutMs = 30000): Promise<RemoteResult> {
+  collect(maxFileBytes: number, signal?: AbortSignal, timeoutMs = 30000): Promise<RemoteResult> {
     return new Promise((resolve, reject) => {
       let stdout = "";
       let stderr = "";
@@ -110,7 +110,6 @@ export class RemoteChannel extends EventEmitter {
         reject(new ToolError(
           code === 255 ? "CONNECTION_LOST" : "REMOTE_OPERATION_FAILED",
           stderr.trim() || "Invalid remote operation response",
-          { connection_id: connectionId },
         ));
       });
       this.stdin.end();

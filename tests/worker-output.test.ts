@@ -2,8 +2,8 @@
 import { expect, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { RemoteChannel } from "../src/channel";
-import { Runtime } from "../src/server";
+import { RemoteChannel } from "../src/ssh/request-channel";
+import { Runtime } from "../src/runtime";
 import { SshFixture } from "./fixture";
 
 const readArgs = { path: "escaped.txt", startLine: 1, lineCount: 2000, maxBytes: 262144 };
@@ -46,7 +46,7 @@ test("cancelling a partially delivered response preserves subsequent operations"
     const controller = new AbortController();
     const channel = await runtime.ssh.open(id, "read", readArgs);
     channel.stdout.once("data", () => controller.abort());
-    await expect(channel.collect(id, 262144, controller.signal)).rejects.toMatchObject({ code: "OPERATION_INTERRUPTED" });
+    await expect(channel.collect(262144, controller.signal)).rejects.toMatchObject({ code: "OPERATION_INTERRUPTED" });
     expect(await runtime.ssh.run(id, "stat", { path: readArgs.path })).toMatchObject({ exists: true });
   });
 }, 20000);
@@ -56,17 +56,17 @@ test("closing while a response is in flight cancels delivery and confirms worker
     const channel = await runtime.ssh.open(id, "read", readArgs);
     let closing: ReturnType<Runtime["ssh"]["closeConnection"]> | undefined;
     channel.stdout.once("data", () => { closing = runtime.ssh.closeConnection(id); });
-    const result = await Promise.allSettled([channel.collect(id, 262144)]);
+    const result = await Promise.allSettled([channel.collect(262144)]);
     expect(result[0]?.status).toBe("rejected");
     expect(closing).toBeDefined();
-    expect(await closing).toMatchObject({ closed: true, remote_cleanup: "confirmed" });
+    expect(await closing).toMatchObject({ connection_id: id, remote_cleanup: "confirmed" });
   });
 }, 20000);
 
 test("oversized responses are cancelled once and subsequent chunks stay discarded", async () => {
   const sent: Record<string, unknown>[] = [];
   const channel = new RemoteChannel((message) => sent.push(message));
-  const response = channel.collect("1234abcd", 1024);
+  const response = channel.collect(1024);
   channel.stdout.write("x".repeat(6 * 1024 + 131073));
   channel.stdout.write("x".repeat(16384));
   channel.finish(0);

@@ -2,7 +2,9 @@
 /** CLI entry point: stdio MCP by default, or an explicit connection diagnostic. */
 import { serveStdio, StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { loadConfig } from "./config";
-import { createServer, Runtime, VERSION } from "./server";
+import { createServer } from "./mcp/server";
+import { Runtime } from "./runtime";
+import { SERVER_VERSION } from "./remote/bundle";
 
 /** Parse the intentionally small CLI without forwarding arbitrary flags to SSH. */
 async function main(): Promise<void> {
@@ -11,7 +13,7 @@ async function main(): Promise<void> {
     console.log("NeverSSH: local MCP tools for remote Linux development\n\nUsage:\n  bun run src/index.ts [--config /absolute/path/config.json]\n  bun run src/index.ts doctor [host] [--config /absolute/path/config.json]\n\nEnvironment: NEVERSSH_CONFIG selects a configuration file.\nThe implicit ./neverssh.config.json is optional. Requires local OpenSSH and remote Python 3.8+.\nWithout a host, doctor lists candidates without connecting.\n");
     return;
   }
-  if (argv.length === 1 && argv[0] === "--version") { console.log(VERSION); return; }
+  if (argv.length === 1 && argv[0] === "--version") { console.log(SERVER_VERSION); return; }
   let filename = process.env.NEVERSSH_CONFIG ?? "neverssh.config.json";
   let optionalConfig = process.env.NEVERSSH_CONFIG === undefined;
   const positional: string[] = [];

@@ -26,6 +26,8 @@
 
 本文覆盖连接、Bash/任务、文件与传输工具。远端构建、版本校验和 A/B 说明见[版本与兼容](compatibility.md)。
 
+参数表由全部工具的输入 schema 按默认配置生成。文件写入和编辑的文本长度上限随 `maxFileBytes` 配置变化；字符数校验与远端文件的 UTF-8 字节数上限分别生效。
+
 ## ssh_discover
 
 一次返回本机 SSH 配置中所有可枚举、且访问规则允许的入口。这个调用不尝试登录，也不保证候选当前可连。
@@ -432,9 +434,9 @@ task_b8e3a160  running  7a2c9d4f  /home/developer/.neverssh/sessions/7a2c9d4f/ta
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
 | `connection_id` | string | 是 | 无 | 连接 ID。 |
-| `file_path` | string | 是 | 无 | 远端文件路径；推荐绝对路径。 |
-| `offset` | integer | 否 | `1` | 起始行号，从 1 开始。 |
-| `limit` | integer | 否 | `2000` | 最多读取多少行。 |
+| `file_path` | string | 是 | 无 | 远端文件路径；推荐绝对路径，相对路径按远端 HOME 解析。最长 4096 个字符。 |
+| `offset` | integer | 否 | `1` | 起始行号，从 1 开始。不小于 1。 |
+| `limit` | integer | 否 | `2000` | 最多读取多少行。不小于 1。 |
 
 ### 返回
 
@@ -487,8 +489,8 @@ PARTIAL view: showing lines 1-2000 of 5000. Use offset=2001 to continue.
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
 | `connection_id` | string | 是 | 无 | 连接 ID。 |
-| `file_path` | string | 是 | 无 | 目标远端文件；推荐绝对路径。 |
-| `content` | string | 是 | 无 | 完整文件内容；受 `maxFileBytes` 限制。 |
+| `file_path` | string | 是 | 无 | 目标远端文件；推荐绝对路径，相对路径按远端 HOME 解析。最长 4096 个字符。 |
+| `content` | string | 是 | 无 | 完整文件内容；字符数上限随 maxFileBytes 配置，远端另按 UTF-8 字节数校验。最长 4194304 个字符。 |
 
 ### 返回
 
@@ -537,9 +539,9 @@ File created successfully at: /srv/app/notes.txt
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
 | `connection_id` | string | 是 | 无 | 连接 ID。 |
-| `file_path` | string | 是 | 无 | 要编辑的远端文件；推荐绝对路径。 |
-| `old_string` | string | 是 | 无 | 要替换的原文；不能为空，且不能含 NUL。 |
-| `new_string` | string | 是 | 无 | 替换后的文本。 |
+| `file_path` | string | 是 | 无 | 要编辑的远端文件；推荐绝对路径，相对路径按远端 HOME 解析。最长 4096 个字符。 |
+| `old_string` | string | 是 | 无 | 要替换的原文；不能为空，且不能含 NUL。字符数上限随 maxFileBytes 配置。最长 4194304 个字符。 |
+| `new_string` | string | 是 | 无 | 替换后的文本；字符数上限随 maxFileBytes 配置，结果另受远端文件字节上限约束。最长 4194304 个字符。 |
 | `replace_all` | boolean | 否 | `false` | 为 true 时替换所有匹配；否则必须恰好匹配一次。 |
 
 ### 返回
@@ -582,11 +584,11 @@ The file /srv/app/notes.txt has been updated successfully.
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
 | `connection_id` | string | 是 | 无 | 连接 ID。 |
-| `cwd` | string | 否 | 无 | 远端工作目录；省略时使用远端 HOME。 |
-| `localPath` | string | 是 | 无 | 本地绝对路径，必须位于 `localTransferRoots` 内。 |
-| `remotePath` | string | 是 | 无 | 目标远端路径。 |
+| `cwd` | string | 否 | 无 | 远端工作目录；省略时使用远端 HOME。最长 4096 个字符。 |
+| `localPath` | string | 是 | 无 | 本地绝对路径，必须位于 localTransferRoots 内。最长 4096 个字符。 |
+| `remotePath` | string | 是 | 无 | 目标远端路径；支持绝对路径、~/ 和相对于 cwd 的路径。最长 4096 个字符。 |
 | `overwrite` | boolean | 否 | `false` | 显式允许覆盖已存在的远端文件。 |
-| `expectedSha256` | string | 否 | 无 | 期望的远端文件 sha256；用于冲突检查。 |
+| `expectedSha256` | string | 否 | 无 | 期望的远端文件 SHA-256，小写十六进制；用于冲突检查。 |
 
 ### 返回
 
@@ -629,9 +631,9 @@ SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
 | `connection_id` | string | 是 | 无 | 连接 ID。 |
-| `cwd` | string | 否 | 无 | 远端工作目录；省略时使用远端 HOME。 |
-| `remotePath` | string | 是 | 无 | 要下载的远端路径。 |
-| `localPath` | string | 是 | 无 | 本地绝对路径，必须位于 `localTransferRoots` 内。 |
+| `cwd` | string | 否 | 无 | 远端工作目录；省略时使用远端 HOME。最长 4096 个字符。 |
+| `remotePath` | string | 是 | 无 | 要下载的远端路径；支持绝对路径、~/ 和相对于 cwd 的路径。最长 4096 个字符。 |
+| `localPath` | string | 是 | 无 | 本地绝对路径，必须位于 localTransferRoots 内。最长 4096 个字符。 |
 | `overwrite` | boolean | 否 | `false` | 显式允许覆盖已存在的本地文件。 |
 
 ### 返回

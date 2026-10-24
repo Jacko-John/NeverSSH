@@ -1,10 +1,10 @@
-/** Version and compatibility constants shared by the local MCP server and remote bundle. */
+/** Embed remote sources locally and bind their manifest to the server and protocol versions. */
 import { createHash } from "node:crypto";
-import archiveSource from "./remote/archive.py" with { type: "text" };
-import buildCacheSource from "./remote/build_cache.py" with { type: "text" };
-import fileOpsSource from "./remote/file_ops.py" with { type: "text" };
-import helperSource from "./remote/helper.py" with { type: "text" };
-import workerSource from "./remote/worker.py" with { type: "text" };
+import archiveSource from "./archive.py" with { type: "text" };
+import buildCacheSource from "./build_cache.py" with { type: "text" };
+import fileOpsSource from "./file_ops.py" with { type: "text" };
+import helperSource from "./helper.py" with { type: "text" };
+import workerSource from "./worker.py" with { type: "text" };
 
 export const SERVER_VERSION = "0.2.3";
 export const PROTOCOL_VERSION = 1;

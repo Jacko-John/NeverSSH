@@ -2,15 +2,17 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
-import { targetAllowed, type Config, type Endpoint, type SshTarget } from "./config";
-import { connectionContracts, type ConnectionSummary } from "./contracts";
-import type { RemoteChannel, RemoteResult } from "./channel";
-import { bounded, checkAbort, ToolError } from "./errors";
-import { ShortIds } from "./ids";
+import { connectSchema, targetAllowed, type Config, type Endpoint, type SshTarget } from "../config";
+import type { RemoteChannel, RemoteResult } from "./request-channel";
+import { bounded, checkAbort, ToolError } from "../errors";
+import { ShortIds } from "../ids";
 import { resolveTarget, sftpOptions, sshEnvironment, sshFailure, sshOptions } from "./openssh";
 import { WorkerClient, WORKER_BOOTSTRAP, type CleanupStatus } from "./worker-client";
 
-export type { RemoteResult } from "./channel";
+export type { RemoteResult } from "./request-channel";
+
+/** Internal connection metadata for lifecycle management and the session-list formatter. */
+type ConnectionSummary = { connection_id: string; host: string; user: string; port: number };
 
 const MAX_CONNECTIONS = 64;
 const CLOSE_TIMEOUT_MS = 10_000;
@@ -58,7 +60,7 @@ export class SshTransport {
   get(id: string): Connection {
     const connection = this.connections.get(id);
     if (!connection) {
-      throw new ToolError("CONNECTION_NOT_FOUND", "Connection does not exist in this MCP instance", { connection_id: id });
+      throw new ToolError("CONNECTION_NOT_FOUND", "Connection does not exist in this MCP instance");
     }
     return connection;
   }
@@ -67,17 +69,17 @@ export class SshTransport {
   private ready(id: string): Connection {
     const connection = this.get(id);
     if (this.closed) {
-      throw new ToolError("CONNECTION_LOST", "SSH transport is shutting down", { connection_id: id });
+      throw new ToolError("CONNECTION_LOST", "SSH transport is shutting down");
     }
     if (connection.state !== "ready") {
-      throw new ToolError("CONNECTION_LOST", `Connection is ${connection.state}; call ssh_connect to obtain a ready handle`, { connection_id: id });
+      throw new ToolError("CONNECTION_LOST", `Connection is ${connection.state}; call ssh_connect to obtain a ready handle`);
     }
     return connection;
   }
 
   /** Give each caller its own total deadline, including configuration resolution and shared startup. */
   async connect(target: SshTarget, timeoutSeconds = 60, signal?: AbortSignal): Promise<RemoteResult> {
-    connectionContracts.ssh_connect.input.parse({ ...target, timeout_seconds: timeoutSeconds });
+    connectSchema.parse({ ...target, timeout_seconds: timeoutSeconds });
     const timeout = timeoutSeconds * 1000;
     const controller = new AbortController();
     const timer = setTimeout(() => {
@@ -100,7 +102,7 @@ export class SshTransport {
 
     const resolved = await resolveTarget(this.config, target, signal);
     if (!targetAllowed(this.config, target, resolved.endpoint)) {
-      throw new ToolError("TARGET_DENIED", "Target is outside the configured SSH access policy", { host: target.host });
+      throw new ToolError("TARGET_DENIED", "Target is outside the configured SSH access policy");
     }
     const existing = this.reusable.get(resolved.key);
     if (existing?.state === "ready") return { connection_id: existing.id };
@@ -226,7 +228,7 @@ export class SshTransport {
         if (socketReady) return child;
         await delay(20);
       }
-      throw failure ?? sshFailure(diagnostic.trim() || "SSH connection timed out", { host: target.host });
+      throw failure ?? sshFailure(diagnostic.trim() || "SSH connection timed out");
     } catch (error) {
       child.kill("SIGTERM");
       throw error;
@@ -259,7 +261,7 @@ export class SshTransport {
   /** One-shot requests return one result; command callers consume their channel directly. */
   async run(id: string, operation: string, args: RemoteResult = {}, cwd?: string, signal?: AbortSignal, timeoutMs = 30000): Promise<RemoteResult> {
     const channel = await this.open(id, operation, args, cwd, signal);
-    return channel.collect(id, this.config.maxFileBytes, signal, timeoutMs);
+    return channel.collect(this.config.maxFileBytes, signal, timeoutMs);
   }
 
   /** Return the default directory captured during the worker handshake. */
@@ -278,7 +280,7 @@ export class SshTransport {
         throw error;
       }
       throw new ToolError("SFTP_UNAVAILABLE",
-        "SFTP is unavailable on this connection; enable the remote SFTP subsystem", { connection_id: id });
+        "SFTP is unavailable on this connection; enable the remote SFTP subsystem");
     });
     this.sftpChecks.set(id, check);
     return check;
@@ -347,7 +349,7 @@ export class SshTransport {
   async closeConnection(id: string): Promise<RemoteResult> {
     const connection = this.get(id);
     await this.beginClose(connection, CLOSE_TIMEOUT_MS);
-    return { connection_id: id, closed: true, remote_cleanup: connection.cleanup };
+    return { connection_id: id, remote_cleanup: connection.cleanup };
   }
 
   /** Stop admission once and share the cleanup operation with explicit close and process shutdown. */

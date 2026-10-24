@@ -4,9 +4,9 @@ import { constants } from "node:fs";
 import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import type { Config } from "./config";
-import { type RemoteResult, SshTransport } from "./ssh";
-import { checkAbort } from "./errors";
+import type { Config } from "../config";
+import { type RemoteResult, SshTransport } from "../ssh/transport";
+import { checkAbort } from "../errors";
 
 /** Keep one wording for every transfer-root rejection. */
 function outsideTransferRoot(): Error {
@@ -128,7 +128,7 @@ export async function upload(ssh: SshTransport, connectionId: string, args: {
       path: remote, temporary, overwrite: args.overwrite, sha256: digest,
       ...(args.expectedSha256 ? { expectedSha256: args.expectedSha256 } : {}),
     }, undefined, signal);
-    return { connection_id: connectionId, ...committed, localPath: filename };
+    return { ...committed, localPath: filename };
   } catch (error) {
     // Cleanup must still run when the request's own cancellation signal has already fired.
     await ssh.sftp(connectionId, [`rm ${sftpQuote(temporary)}`], undefined, 10000).catch(() => {});
@@ -164,6 +164,6 @@ export async function download(ssh: SshTransport, connectionId: string, args: {
     await transferPath(ssh.config, filename, true);
     if (args.overwrite) await rename(temporary, filename);
     else await link(temporary, filename);
-    return { connection_id: connectionId, path: info.path ?? remote, localPath: filename, size: data.length, sha256 };
+    return { path: info.path ?? remote, localPath: filename, size: data.length, sha256 };
   } finally { await rm(temporary, { force: true }); }
 }

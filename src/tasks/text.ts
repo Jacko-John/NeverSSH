@@ -1,5 +1,5 @@
 /** Present command results as readable MCP text while preserving program whitespace. */
-import type { TaskResult, TaskSummary } from "./tasks";
+import type { TaskResult, TaskSummary } from "./manager";
 
 type View = "bash" | "query" | "stop";
 

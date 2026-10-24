@@ -2,11 +2,11 @@
 import { EventEmitter } from "node:events";
 import { StringDecoder } from "node:string_decoder";
 import { z } from "zod";
-import type { RemoteChannel } from "./channel";
-import { checkAbort, ToolError } from "./errors";
-import { ShortIds } from "./ids";
-import { JsonLines } from "./json-lines";
-import type { SshTransport } from "./ssh";
+import type { RemoteChannel } from "../ssh/request-channel";
+import { checkAbort, ToolError } from "../errors";
+import { ShortIds } from "../ids";
+import { JsonLines } from "../ssh/json-lines";
+import type { SshTransport } from "../ssh/transport";
 
 const PREVIEW_BYTES = 65536;
 const PREVIEW_CHUNKS = 4096;

@@ -143,9 +143,7 @@ def write_file(request):
                 raise ValueError("File exists: read it with ssh_read_file first")
             if digest(current) != expected:
                 raise ValueError("Content conflict: file changed since it was read; read it again")
-            expected = digest(current)
-        data = (base64.b64decode(args["base64"], validate=True) if "base64" in args
-                else args["content"].encode("utf-8"))
+        data = base64.b64decode(args["base64"], validate=True)
         result = atomic_write(filename, data, original, expected, limit)
         result["created"] = original is None
         return result

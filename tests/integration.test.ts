@@ -9,9 +9,9 @@ import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import { SshFixture } from "./fixture";
-import { Runtime } from "../src/server";
+import { Runtime } from "../src/runtime";
 import { ShortIds } from "../src/ids";
-import { BUILD_ID } from "../src/version-info";
+import { BUILD_ID } from "../src/remote/bundle";
 
 const fixture = new SshFixture();
 let client: Client;

@@ -2,8 +2,8 @@
 import { readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { hostField, targetAllowed, type Config } from "./config";
-import { ToolError } from "./errors";
+import { hostField, targetAllowed, type Config } from "../config";
+import { ToolError } from "../errors";
 import { resolveTarget } from "./openssh";
 
 /** Tokenize configuration words with quoted values, comments, escapes, and keyword=value syntax. */

@@ -1,5 +1,5 @@
 /** Concise model-facing text for connection, file, and transfer results. */
-import type { RemoteResult } from "./channel";
+import type { RemoteResult } from "../ssh/request-channel";
 
 type Item = Record<string, unknown>;
 const text = (value: unknown): string => typeof value === "string" ? value : "";

@@ -1,6 +1,6 @@
 /** Verify canonical revisions stay synchronized across remembered remote path aliases. */
 import { expect, test } from "bun:test";
-import { FileRevisions } from "../src/file-state";
+import { FileRevisions } from "../src/files/revisions";
 
 test("relative and absolute aliases follow the latest canonical revision", () => {
   const files = new FileRevisions();

@@ -6,6 +6,10 @@
 
 - Return readable text from every MCP tool without `structuredContent` or `outputSchema`. Connection, file, and transfer results no longer include a structured copy. Inputs and existing text formats are unchanged; clients that read structured results must read text content instead.
 
+### Maintenance
+
+- Organize local code by MCP, SSH, task, and file responsibilities, with runtime ownership separate from MCP registration and remote bundle metadata beside its sources. Consolidate registration and all 13 input contracts, including configuration-dependent file limits, without changing public inputs or text formats.
+
 ## 0.2.3
 
 ### Fixes

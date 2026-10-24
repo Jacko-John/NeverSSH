@@ -3,7 +3,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { configSchema } from "../src/config";
-import { configuredHosts, Discovery } from "../src/discovery";
+import { configuredHosts, Discovery } from "../src/ssh/discovery";
 
 let root: string;
 beforeAll(async () => { root = await mkdtemp("/tmp/neverssh-discovery-test-"); });

@@ -16,6 +16,15 @@ export const hostField = shaped(cleanString.max(255), /^[a-zA-Z0-9_:[\]][a-zA-Z0
   "Use an SSH alias, hostname, or IP; pass user separately");
 export const userField = shaped(cleanString.max(255), /^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$/, "Use an SSH login name");
 export const portField = z.number().int().min(1).max(65535);
+
+/** Share connection validation between MCP calls and direct CLI diagnostics. */
+export const connectSchema = z.strictObject({
+  host: hostField,
+  user: userField.optional(),
+  port: portField.optional(),
+  timeout_seconds: z.number().min(1).max(180).default(60),
+});
+
 const accessRule = z.strictObject({
   host: shaped(cleanString.max(255), /^[a-zA-Z0-9_*?.:[\]%-]+$/, "Use a host pattern with optional * and ?"),
   user: cleanString.max(255).optional(),

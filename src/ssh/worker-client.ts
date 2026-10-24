@@ -1,11 +1,10 @@
 /** Multiplex requests and shutdown over one remote worker process. */
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { RemoteChannel, type RemoteResult } from "./channel";
-import type { Config } from "./config";
-import { bounded, checkAbort, ToolError } from "./errors";
+import { RemoteChannel, type RemoteResult } from "./request-channel";
+import type { Config } from "../config";
+import { bounded, checkAbort, ToolError } from "../errors";
 import { JsonLines } from "./json-lines";
-import fileOpsSource from "./remote/file_ops.py" with { type: "text" };
-import { ARCHIVE_FORMAT, BUILD_ID, BUILD_MANIFEST, BUILD_SOURCES, MIN_PYTHON, PROTOCOL_VERSION, SERVER_VERSION } from "./version-info";
+import { ARCHIVE_FORMAT, BUILD_ID, BUILD_MANIFEST, BUILD_SOURCES, PROTOCOL_VERSION, SERVER_VERSION } from "../remote/bundle";
 
 export const WORKER_BOOTSTRAP = 'import json,sys; payload=json.loads(sys.stdin.buffer.readline()); exec(compile(payload["sources"]["build_cache.py"],"<neverssh-build-cache>","exec"))';
 export type CleanupStatus = "confirmed" | "unconfirmed";
@@ -112,7 +111,7 @@ export class WorkerClient {
     this.child.stdin.write(JSON.stringify({
       buildId: BUILD_ID, manifest: BUILD_MANIFEST, sources: BUILD_SOURCES,
       serverVersion: SERVER_VERSION, protocol: PROTOCOL_VERSION, archiveFormat: ARCHIVE_FORMAT,
-      minPython: MIN_PYTHON, connectionId: this.connectionId,
+      connectionId: this.connectionId,
       maxFileBytes, maxTaskOutputBytes, maxArchiveBytes,
     }) + "\n");
     await bounded(this.hello.promise, 30000, "CONNECT_TIMEOUT", "Remote worker handshake timed out", signal);
@@ -194,7 +193,7 @@ export class WorkerClient {
   /** Send data through stdin; destination selection belongs to the owning SSH connection. */
   private send(message: RemoteResult): void {
     if (this.child.stdin.destroyed || this.child.exitCode !== null) {
-      throw new ToolError("CONNECTION_LOST", "Remote worker is unavailable", { connection_id: this.connectionId });
+      throw new ToolError("CONNECTION_LOST", "Remote worker is unavailable");
     }
     this.child.stdin.write(JSON.stringify(message) + "\n");
   }
@@ -227,7 +226,7 @@ export class WorkerClient {
   /** Closing workers never admit queued work after their active requests finish. */
   private assertAccepting(): void {
     if (!this.accepting) {
-      throw new ToolError("CONNECTION_LOST", "Connection is closing or lost", { connection_id: this.connectionId });
+      throw new ToolError("CONNECTION_LOST", "Connection is closing or lost");
     }
   }
 

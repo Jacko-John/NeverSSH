@@ -52,8 +52,21 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def image_mime_type(data):
+    """Recognize common image encodings by signature without decoding their pixels."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 def text_from(data):
-    """Require UTF-8 text for editing; binary data travels through the transfer tools."""
+    """Require UTF-8 for text reads and edits; read_file handles recognized images separately."""
     if b"\x00" in data:
         raise ValueError("Binary file: use download instead of text tools")
     return data.decode("utf-8")
@@ -111,10 +124,15 @@ def atomic_write(filename, data, original, expected, limit):
 
 
 def read_file(request):
-    """Return complete UTF-8 lines within a byte budget, plus the full-file revision."""
+    """Return a recognized image or bounded UTF-8 lines, with the full-file revision."""
     args = request.get("args", {})
     filename = os.path.realpath(path_for(args["path"], request["cwd"]))
     data, _ = load_bytes(filename, request["maxFileBytes"])
+    mime_type = image_mime_type(data)
+    if mime_type is not None:
+        return {"kind": "image", "mimeType": mime_type,
+                "base64": base64.b64encode(data).decode("ascii"),
+                "path": filename, "size": len(data), "sha256": digest(data)}
     lines = text_from(data).splitlines(keepends=True)
     start = args.get("startLine", 1) - 1
     selected = []

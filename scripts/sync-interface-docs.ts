@@ -66,9 +66,9 @@ const descriptions: Record<string, Record<string, string>> = {
   },
   "ssh_read_file.input": {
     ...operationScope,
-    file_path: "远端文件路径；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。",
-    offset: "起始行号，从 1 开始。",
-    limit: "最多读取多少行。",
+    file_path: "远端文本或图片文件路径；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。",
+    offset: "文本起始行号，从 1 开始；读取图片时忽略。",
+    limit: "最多读取的文本行数；图片始终完整返回。",
   },
   "ssh_write_file.input": {
     ...operationScope,
@@ -85,7 +85,7 @@ const descriptions: Record<string, Record<string, string>> = {
   "ssh_upload.input": {
     ...operationScope,
     cwd: "远端工作目录；默认使用工作区根目录或连接的远端 HOME。",
-    localPath: "本地绝对路径，必须位于 localTransferRoots 内。",
+    localPath: "本地文件的绝对路径；localTransferRoots 非空时，必须位于其中一个目录内。",
     remotePath: "目标远端路径；支持绝对路径、~/ 和相对于 cwd 的路径。",
     overwrite: "显式允许覆盖已存在的远端文件。",
     expectedSha256: "期望的远端文件 SHA-256，小写十六进制；用于冲突检查。",
@@ -94,7 +94,7 @@ const descriptions: Record<string, Record<string, string>> = {
     ...operationScope,
     cwd: "远端工作目录；默认使用工作区根目录或连接的远端 HOME。",
     remotePath: "要下载的远端路径；支持绝对路径、~/ 和相对于 cwd 的路径。",
-    localPath: "本地绝对路径，必须位于 localTransferRoots 内。",
+    localPath: "本地文件的绝对路径；localTransferRoots 非空时，必须位于其中一个目录内。",
     overwrite: "显式允许覆盖已存在的本地文件。",
   },
 };

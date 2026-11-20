@@ -118,7 +118,7 @@ The server reads `./neverssh.config.json` by default. `--config <path>` or `NEVE
 ```
 
 - `access.allow` and `access.deny`: each rule requires `host` and may include `user` and `port`. Fields within one rule must all match. `deny` wins. Omitting `allow` opens all targets; an empty array closes everything. `host` matching is case-insensitive and `user` matching is case-sensitive; both accept `*` and `?`. Rules match names, not DNS equivalence.
-- `localTransferRoots`: empty disables uploads and downloads. Each entry must be an existing dedicated directory; local paths must stay inside it, including through symlinks.
+- `localTransferRoots`: omitted or `[]` leaves local directories unrestricted. Uploads and downloads use each call's absolute `localPath` on the machine running MCP, independently of the remote workspace and `cwd`. A nonempty list restricts canonical local paths to those directories, including through symlinks. Each entry must be an existing directory; relative entries resolve from the configuration file's directory. File type, size, overwrite, atomic commit, and cancellation checks apply in both modes.
 - `compression` defaults to `true` and covers worker and SFTP traffic.
 - `maxFileBytes` defaults to 4 MiB with a maximum of 8 MiB. `maxTaskOutputBytes` defaults to 64 MiB and `maxArchiveBytes` to 1 GiB.
 

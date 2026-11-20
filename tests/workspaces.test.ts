@@ -1,4 +1,4 @@
-/** Exercise remote project development through text-only MCP and an isolated real SSH fixture. */
+/** Exercise remote project development through MCP content and an isolated real SSH fixture. */
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
@@ -175,6 +175,29 @@ describe("workspace context and instruction delivery", () => {
     expect(await call("ssh_write_file", write)).not.toContain("Nested rule.");
   });
 
+  test("image reads return the image before new guidance and do not repeat delivered rules", async () => {
+    const base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    const root = await project({ "AGENTS.md": "Root image rule.\n", "src/AGENTS.md": "Source image rule.\n" });
+    await writeFile(join(root, "src/preview.bin"), Buffer.from(base64, "base64"));
+    const { id } = await open(root);
+    const args = { workspace_id: id, file_path: "src/preview.bin" };
+    const first = await client.callTool({ name: "ssh_read_file", arguments: args });
+    expect(Boolean(first.isError)).toBe(false);
+    expect(first.structuredContent).toBeUndefined();
+    expect(first.content).toHaveLength(2);
+    expect(first.content[0]).toEqual({ type: "image", data: base64, mimeType: "image/png" });
+    const guidance = first.content[1];
+    expect(guidance?.type).toBe("text");
+    const text = guidance?.type === "text" ? guidance.text : "";
+    expect(text).toContain(`Project instructions: ${root}/src/AGENTS.md\nScope: ${root}/src\nSource image rule.\n`);
+    expect(text).not.toContain("Root image rule.");
+    expect(text).not.toContain(base64);
+    const second = await client.callTool({ name: "ssh_read_file", arguments: args });
+    expect(Boolean(second.isError)).toBe(false);
+    expect(second.structuredContent).toBeUndefined();
+    expect(second.content).toEqual([{ type: "image", data: base64, mimeType: "image/png" }]);
+  });
+
   test("ordinary reads omit catalogs and report only changed or removed rules", async () => {
     const root = await project({ "AGENTS.md": "Root rule.\n", "src/AGENTS.md": "Nested rule.\n", "src/value.txt": "before\n",
       ".agents/skills/check/SKILL.md": "---\nname: check\ndescription: Catalog must not repeat on reads.\n---\nBody.\n" });
@@ -238,6 +261,41 @@ describe("workspace context and instruction delivery", () => {
       const written = await textCall(peer, "ssh_write_file", { workspace_id: id, file_path: "src/new.txt", content: "written" });
       expect(written).toContain("Formatter delivery rule.\n");
       expect(await readFile(join(root, "src/new.txt"), "utf8")).toBe("written");
+    } finally {
+      await peer.close();
+      await runtime.close();
+    }
+  }, 15000);
+
+  test("image response budget includes guidance and leaves failed delivery pending", async () => {
+    const root = await project({ "src/AGENTS.md": "图片规则仍需交付。\n", "src/value.txt": "before\n" });
+    const runtime = new Runtime(fixture.config);
+    const peer = new Client({ name: "image-guidance-budget-test", version: "1" });
+    try {
+      const [local, remote] = InMemoryTransport.createLinkedPair();
+      await createServer(runtime).connect(remote);
+      await peer.connect(local);
+      const connected = await textCall(peer, "ssh_connect", { host: "fixture" });
+      const opened = await textCall(peer, "ssh_workspace_open", { connection_id: connected.slice("Connection: ".length), path: root });
+      const args = { workspace_id: workspaceId(opened), file_path: "src/value.txt" };
+      const image = { type: "image" as const, mimeType: "image/png", data: "" };
+      const emptyBytes = Buffer.byteLength(JSON.stringify({ content: [image] }), "utf8");
+      image.data = "A".repeat(Math.floor((9 * 1024 * 1024 - emptyBytes) / 4) * 4);
+      expect(Buffer.byteLength(JSON.stringify({ content: [image] }), "utf8")).toBeLessThanOrEqual(9 * 1024 * 1024);
+      const originalRun = runtime.ssh.run.bind(runtime.ssh);
+      const hook = spyOn(runtime.ssh, "run").mockImplementation(async (...request) => {
+        if (request[1] !== "read") return originalRun(...request);
+        return { kind: "image", base64: image.data, mimeType: image.mimeType, path: join(root, "src/value.txt"),
+          size: image.data.length / 4 * 3, sha256: "a".repeat(64) };
+      });
+      try {
+        const rejected = await textCall(peer, "ssh_read_file", args, true);
+        expect(rejected).toStartWith("Error: OPERATION_FAILED\n");
+        expect(rejected).toContain("9 MiB MCP response budget");
+        expect(rejected).not.toContain("图片规则仍需交付。");
+      } finally { hook.mockRestore(); }
+      expect(await textCall(peer, "ssh_read_file", args)).toContain("图片规则仍需交付。\n");
+      expect(await textCall(peer, "ssh_read_file", args)).toBe("     1\tbefore");
     } finally {
       await peer.close();
       await runtime.close();

@@ -1,4 +1,4 @@
-/** Public input schemas shared by MCP registration, documentation, and tests; results are text-only. */
+/** Public input schemas shared by MCP registration, documentation, and tests. */
 import { z } from "zod";
 import { cleanString, connectSchema } from "../config";
 
@@ -76,6 +76,7 @@ export const workspaceContracts = {
 };
 
 const remotePath = cleanString.max(4096).describe("Remote path: absolute, ~/..., or relative to cwd.");
+const localPath = cleanString.max(4096).describe("Absolute file path on the NeverSSH client host; restricted to localTransferRoots only when that list is nonempty.");
 const filePath = cleanString.max(4096).describe("Remote file path; relative to the workspace root or, with connection_id, remote HOME.");
 const transferScope = {
   ...operationScope,
@@ -91,9 +92,10 @@ export function createToolContracts(maxFileBytes: number) {
     ...workspaceContracts,
     ssh_read_file: {
       input: z.strictObject({
-        ...operationScope, file_path: filePath,
-        offset: z.number().int().min(1).default(1),
-        limit: z.number().int().min(1).default(2000),
+        ...operationScope,
+        file_path: filePath.describe("Remote text or image file path; relative to the workspace root or, with connection_id, remote HOME."),
+        offset: z.number().int().min(1).default(1).describe("Starting text line, counted from 1; ignored for images."),
+        limit: z.number().int().min(1).default(2000).describe("Maximum text lines to return; images are always returned whole."),
       }).refine(validOperationScope, scopeMessage),
     },
     ssh_write_file: {
@@ -112,13 +114,13 @@ export function createToolContracts(maxFileBytes: number) {
     },
     ssh_upload: {
       input: z.strictObject({
-        ...transferScope, localPath: cleanString.max(4096), remotePath,
+        ...transferScope, localPath, remotePath,
         overwrite: z.boolean().default(false), expectedSha256: hash,
       }).refine(validOperationScope, scopeMessage),
     },
     ssh_download: {
       input: z.strictObject({
-        ...transferScope, remotePath, localPath: cleanString.max(4096), overwrite: z.boolean().default(false),
+        ...transferScope, remotePath, localPath, overwrite: z.boolean().default(false),
       }).refine(validOperationScope, scopeMessage),
     },
   };

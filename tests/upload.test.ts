@@ -1,6 +1,6 @@
 /** Exercise upload snapshots and SFTP path handling in an isolated real SSH fixture. */
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
-import { lstat, mkdir, readFile, rename, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { download, upload } from "../src/files/transfers";
 import { SshTransport } from "../src/ssh/transport";
@@ -9,15 +9,22 @@ import { SshFixture } from "./fixture";
 const fixture = new SshFixture();
 let ssh: SshTransport;
 let connectionId: string;
+let unrestricted: SshTransport;
+let unrestrictedId: string;
 
 beforeAll(async () => {
   await fixture.start();
   ssh = new SshTransport(fixture.config);
   connectionId = (await ssh.connect({ host: "fixture" })).connection_id as string;
+  unrestricted = new SshTransport({ ...fixture.config, localTransferRoots: [] });
+  const connected = (await unrestricted.connect({ host: "fixture" })).connection_id;
+  if (typeof connected !== "string") throw new Error("Missing unrestricted fixture connection handle");
+  unrestrictedId = connected;
 }, 20000);
 
 afterAll(async () => {
   await ssh?.close();
+  await unrestricted?.close();
   await fixture.close();
 }, 15000);
 
@@ -28,6 +35,36 @@ test("upload supports destination names near the filesystem component limit", as
   const result = await upload(ssh, connectionId, { localPath, remotePath, overwrite: false });
   expect(result.path).toBe(remotePath);
   expect(await readFile(remotePath, "utf8")).toBe("long name payload");
+});
+
+test("empty transfer roots upload an absolute source outside the fixture allowlist through its symlink", async () => {
+  const source = join(fixture.root, "unrestricted-source.bin");
+  const alias = join(fixture.root, "unrestricted-source-alias");
+  const remotePath = join(fixture.workspace, "unrestricted-upload.bin");
+  const payload = Buffer.from([0, 1, 2, 128, 255]);
+  await writeFile(source, payload);
+  await symlink(source, alias);
+  const result = await upload(unrestricted, unrestrictedId, { localPath: alias, remotePath, overwrite: false });
+  expect(result.localPath).toBe(source);
+  expect(await readFile(remotePath)).toEqual(payload);
+  expect((await lstat(alias)).isSymbolicLink()).toBe(true);
+});
+
+test("unrestricted uploads still require absolute regular files and respect cancellation", async () => {
+  const directory = join(fixture.root, "unrestricted-source-directory");
+  const source = join(fixture.root, "cancelled-unrestricted-source");
+  const remotePath = join(fixture.workspace, "must-not-upload-unrestricted");
+  await mkdir(directory);
+  await writeFile(source, "cancelled payload");
+  await expect(upload(unrestricted, unrestrictedId, { localPath: "relative-source", remotePath, overwrite: false }))
+    .rejects.toThrow("localPath must be absolute");
+  await expect(upload(unrestricted, unrestrictedId, { localPath: directory, remotePath, overwrite: false }))
+    .rejects.toThrow("regular file");
+  const controller = new AbortController();
+  controller.abort();
+  await expect(upload(unrestricted, unrestrictedId, { localPath: source, remotePath, overwrite: false }, undefined, controller.signal))
+    .rejects.toMatchObject({ code: "OPERATION_CANCELLED" });
+  expect(await stat(remotePath).catch(() => null)).toBeNull();
 });
 
 test("transfers preserve literal quotes, backslashes, and wildcard characters", async () => {

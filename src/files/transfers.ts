@@ -10,7 +10,7 @@ import { checkAbort } from "../errors";
 
 /** Keep one wording for every transfer-root rejection. */
 function outsideTransferRoot(): Error {
-  return new Error("Local path is outside localTransferRoots; configure a dedicated transfer directory locally");
+  return new Error("Local path is outside localTransferRoots; use a path inside a configured transfer directory");
 }
 
 /** Check a resolved path is inside one configured transfer root. */
@@ -19,24 +19,25 @@ function inside(root: string, path: string): boolean {
   return tail === "" || (tail !== ".." && !tail.startsWith("../") && !isAbsolute(tail));
 }
 
-/** Create missing local parents after proving the deepest existing ancestor is inside a transfer root. */
+/** Create local parents after checking existing ancestors against any configured boundary. */
 async function ensureParent(config: Config, parent: string): Promise<void> {
-  const root = config.localTransferRoots.find((candidate) => inside(candidate, parent));
-  if (!root) throw outsideTransferRoot();
+  if (config.localTransferRoots.length) {
+    const root = config.localTransferRoots.find((candidate) => inside(candidate, parent));
+    if (!root) throw outsideTransferRoot();
 
-  let existing = parent;
-  while (!(await stat(existing).then((info) => info.isDirectory()).catch(() => false))) {
-    const next = dirname(existing);
-    if (next === existing) throw outsideTransferRoot();
-    existing = next;
+    let existing = parent;
+    while (!(await stat(existing).then((info) => info.isDirectory()).catch(() => false))) {
+      const next = dirname(existing);
+      if (next === existing) throw outsideTransferRoot();
+      existing = next;
+    }
+    if (!inside(root, await realpath(existing))) throw outsideTransferRoot();
   }
-  if (!inside(root, await realpath(existing))) throw outsideTransferRoot();
   await mkdir(parent, { recursive: true });
 }
 
-/** Check canonical paths, including symlinked parents, against explicitly enabled transfer roots. */
+/** Resolve absolute local paths, enforcing a transfer-root boundary only when configured. */
 export async function transferPath(config: Config, filename: string, writing: boolean): Promise<string> {
-  if (!config.localTransferRoots.length) throw new Error("Local transfers are disabled; configure localTransferRoots locally");
   if (!isAbsolute(filename)) throw new Error("localPath must be absolute");
   const normalized = resolve(filename);
   let canonical: string;
@@ -51,7 +52,9 @@ export async function transferPath(config: Config, filename: string, writing: bo
   } else {
     canonical = await realpath(normalized);
   }
-  if (!config.localTransferRoots.some((root) => inside(root, canonical))) throw outsideTransferRoot();
+  if (config.localTransferRoots.length && !config.localTransferRoots.some((root) => inside(root, canonical))) {
+    throw outsideTransferRoot();
+  }
   return canonical;
 }
 
@@ -175,7 +178,7 @@ export async function download(ssh: SshTransport, connectionId: string, args: {
       await handle.chmod(0o600);
     } finally { await handle.close(); }
     const sha256 = createHash("sha256").update(data).digest("hex");
-    // Revalidate immediately before committing; localTransferRoots is a boundary, not an OS sandbox.
+    // Revalidate the destination type and any configured root boundary before committing.
     await transferPath(ssh.config, filename, true);
     checkAbort(signal);
     if (args.overwrite) await rename(temporary, filename);

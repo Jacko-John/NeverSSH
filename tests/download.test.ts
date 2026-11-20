@@ -9,6 +9,8 @@ import { SshFixture } from "./fixture";
 const fixture = new SshFixture();
 let ssh: SshTransport;
 let connectionId: string;
+let unrestricted: SshTransport;
+let unrestrictedId: string;
 
 beforeAll(async () => {
   await fixture.start();
@@ -17,10 +19,15 @@ beforeAll(async () => {
   if (typeof connected !== "string") throw new Error("Missing fixture connection handle");
   connectionId = connected;
   await ssh.prepareSftp(connectionId);
+  unrestricted = new SshTransport({ ...fixture.config, localTransferRoots: [] });
+  const unrestrictedConnection = (await unrestricted.connect({ host: "fixture" })).connection_id;
+  if (typeof unrestrictedConnection !== "string") throw new Error("Missing unrestricted fixture connection handle");
+  unrestrictedId = unrestrictedConnection;
 }, 20000);
 
 afterAll(async () => {
   await ssh?.close();
+  await unrestricted?.close();
   await fixture.close();
 }, 15000);
 
@@ -28,6 +35,46 @@ afterAll(async () => {
 function getDestination(commands: string[]): string | undefined {
   return commands.find((command) => command.startsWith("get "))?.split(" ").at(-1);
 }
+
+test("empty transfer roots download outside the fixture allowlist and retain explicit overwrite checks", async () => {
+  const remotePath = join(fixture.workspace, "unrestricted-download-source");
+  const localPath = join(fixture.root, "unrestricted-parent", "nested/destination.bin");
+  const original = Buffer.from([0, 1, 2, 128, 255]);
+  await files.writeFile(remotePath, original);
+  const result = await download(unrestricted, unrestrictedId, { remotePath, localPath, overwrite: false });
+  expect(result.localPath).toBe(localPath);
+  expect(await files.readFile(localPath)).toEqual(original);
+  expect((await files.stat(localPath)).mode & 0o777).toBe(0o600);
+  await files.writeFile(remotePath, "replacement payload\n");
+  await expect(download(unrestricted, unrestrictedId, { remotePath, localPath, overwrite: false }))
+    .rejects.toThrow("set overwrite=true explicitly");
+  expect(await files.readFile(localPath)).toEqual(original);
+  await download(unrestricted, unrestrictedId, { remotePath, localPath, overwrite: true });
+  expect(await files.readFile(localPath, "utf8")).toBe("replacement payload\n");
+});
+
+test("unrestricted downloads still reject final destination symlinks", async () => {
+  const remotePath = join(fixture.workspace, "unrestricted-link-source");
+  const target = join(fixture.root, "unrestricted-link-target");
+  const localPath = join(fixture.root, "unrestricted-download-alias");
+  await files.writeFile(remotePath, "must not overwrite through link\n");
+  await files.writeFile(target, "original local content\n");
+  await files.symlink(target, localPath);
+  await expect(download(unrestricted, unrestrictedId, { remotePath, localPath, overwrite: true }))
+    .rejects.toThrow("never a symlink");
+  expect((await files.lstat(localPath)).isSymbolicLink()).toBe(true);
+  expect(await files.readFile(target, "utf8")).toBe("original local content\n");
+});
+
+test("an unrestricted cancelled download creates no destination parents", async () => {
+  const parent = join(fixture.root, "unrestricted-cancelled-parent");
+  const controller = new AbortController();
+  controller.abort();
+  await expect(download(unrestricted, unrestrictedId, {
+    remotePath: "never-read", localPath: join(parent, "nested/destination"), overwrite: false,
+  }, undefined, controller.signal)).rejects.toMatchObject({ code: "OPERATION_CANCELLED" });
+  expect(await files.stat(parent).catch(() => null)).toBeNull();
+});
 
 test("downloaded bytes stay private before local validation and commit", async () => {
   const remotePath = join(fixture.workspace, "public-source");

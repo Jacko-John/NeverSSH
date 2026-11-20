@@ -152,9 +152,11 @@ cp -R skills/neverssh ~/.claude/skills/
 
 返回工作区 ID（例如 `ws_b8e3a160`）、远端项目根目录、Git 状态、项目入口文件，以及根目录的 `AGENTS.md` 正文和可用 skill 目录。先检查规则和已有改动，再通过这个工作区操作项目。相对文件路径和 `cwd` 基于项目根目录，命令默认在根目录执行。
 
+项目文件默认直接在远端处理：用 `ssh_read_file` 读取，`ssh_write_file` 创建或整体写入，`ssh_edit_file` 做局部修改。批量变更和代码生成通过远端 `ssh_bash` 完成，再在远端测试和检查 diff。不要把“本地临时文件加上传”或“下载、本地编辑、再上传”当成默认开发流程。
+
 普通工作区操作从根目录向目标收集适用的 `AGENTS.md`，保留来源、适用目录和完整正文。文件读取、写入、编辑、上传、下载和 Bash 的结果会自动附上新增、变更或删除的适用规则，不因规则尚未返回或已经变化而拒绝操作。返回这些规则时，本次文件操作已经执行，Bash 命令已经启动；规则用于指导后续操作，服务器不保证 Agent 在本次操作前已理解它们。文件路径限制、读取后编辑和版本冲突检查仍然生效。
 
-操作结果保持在第一个 MCP 文本块中，规则增量另放第二个文本块；规则无变化时只有操作结果。Bash 即使以非零状态退出，也可能附上规则提示，命令已经运行，不要因此重新执行。真正失败的文件或传输操作不附带规则；规则采集、路径校验和资源限制仍可能在执行前报错。
+操作结果保持在第一个 MCP 内容块中，通常是文本，读取图片时是原生 `image`；规则增量另放第二个文本块，规则无变化时只有操作结果。Bash 即使以非零状态退出，也可能附上规则提示，命令已经运行，不要因此重新执行。真正失败的文件或传输操作不附带规则；规则采集、路径校验和资源限制仍可能在执行前报错。
 
 普通操作不重复返回未变化的规则、Skill 目录和 Git 状态。需要恢复根目录上下文、刷新 Git 状态或重新发现 skill 时，再次调用 `ssh_workspace_open`。相同连接、根目录和 skill 配置可以复用工作区 ID，但会重置已返回规则的记录并重建 skill 目录。打开时只返回根目录规则，子目录规则会随后随目标操作自动返回。Bash 的规则发现只覆盖 `cwd`；涉及其他目录时，可以在对应 `cwd` 操作或主动读取该目录的 `AGENTS.md`。连接模式不加载项目上下文。
 
@@ -176,7 +178,7 @@ skill 目录列出可调用名称和描述；使用时通过 `ssh_skill_read({wo
 
 ## 工具使用
 
-所有工具仅返回可读文本，不提供 `structuredContent` 或 `outputSchema`。请求仍是严格校验的 MCP 参数对象；远端命令打印的内容保持原样。
+工具返回可读文本，`ssh_read_file` 读取受支持的图片时返回原生 MCP `image` 内容块；其他工具仍只返回文本。所有工具都不提供 `structuredContent` 或 `outputSchema`。请求仍是严格校验的 MCP 参数对象；远端命令打印的内容保持原样。
 
 连接：
 
@@ -210,9 +212,13 @@ Connection: 7a2c9d4f
 | 文件 | `ssh_read_file`、`ssh_write_file`、`ssh_edit_file` |
 | 二进制传输 | `ssh_upload`、`ssh_download` |
 
-文件工具对齐 Claude Code 的 Read / Write / Edit：`file_path` 是远端文件路径，读取使用 `offset` / `limit`，编辑使用 `old_string` / `new_string` / `replace_all`。目录列表、文件查找和内容搜索通过 `ssh_bash` 执行 `ls`、`find`、`rg`。
+文件工具对齐 Claude Code 的 Read / Write / Edit：`file_path` 是远端文件路径，文本读取使用 `offset` / `limit`，编辑使用 `old_string` / `new_string` / `replace_all`。目录列表、文件查找和内容搜索通过 `ssh_bash` 执行 `ls`、`find`、`rg`。
 
-编辑前先用 `ssh_read_file` 读取文件；`ssh_read_file` 和 `ssh_write_file` 会记录文件版本，`ssh_edit_file` 自动用它拒绝过期修改。`old_string` 默认必须唯一匹配；设置 `replace_all=true` 替换全部匹配。读取结果带行号，默认最多 2000 行。写入和上传会自动创建远端父目录。
+编辑前先用 `ssh_read_file` 读取文件；`ssh_read_file` 和 `ssh_write_file` 会记录文件版本，`ssh_edit_file` 自动用它拒绝过期修改。`old_string` 默认必须唯一匹配；设置 `replace_all=true` 替换全部匹配。文本读取结果带行号，默认最多 2000 行。写入和上传会自动创建远端父目录。
+
+查看远端图片也直接调用 `ssh_read_file`，无需先下载到本地。工具按文件内容识别 PNG、JPEG、GIF 和 WebP，并完整返回图片，不写成本地文件，不依赖 SFTP；客户端需要支持 MCP 图片显示。`offset` / `limit` 只用于文本，图片不分页，仍受 `maxFileBytes` 限制（默认 4 MiB，最高 8 MiB）。SVG 继续作为 UTF-8 文本读取，其他二进制文件返回文本错误。
+
+图片及附带规则的 MCP 结果序列化后另有 9 MiB 上限，不能按原始图片大小理解。超过该上限会返回文本错误，需缩小图片后重试；不会截断图片或自动下载到本地。
 
 `ssh_bash` 的短命令成功完成时，操作结果只有程序输出；后台运行、等待到期、输出截断或失败时再给出 `task_...` 任务 ID、状态、远端日志路径和字节数。工作区规则有变化时，在独立的第二个文本块中附上提示。后台任务只需 `task_id` 调用 `ssh_task_output` 查询或等待，使用 `ssh_task_stop` 停止，不再需要 `connection_id`。`ssh_task_list` 列出尚未被 `ssh_task_output` 读取输出的任务；读取后移除，新输出会让它重新出现。
 
@@ -224,7 +230,13 @@ Connection: 7a2c9d4f
 
 ## 传输与资源
 
-`localTransferRoots: []` 默认禁用本地文件传输。启用时添加一个已存在的专用目录；配置中的相对路径基于配置文件目录解析。调用时 `localPath` 必须是目录内的绝对路径，不能通过符号链接逃离范围；下载会在根目录内创建缺失的本地父目录。`ssh_upload` / `ssh_download` 使用 SFTP，复用已认证的 ControlMaster；`compression: true`（默认）同时压缩 worker 和 SFTP 的 SSH 流量。
+`ssh_upload` 用于把用户已有的本地文件传到远端，或完成明确的传输需求；`ssh_download` 用于把需要的文件取回本地。具体任务确实依赖本地专用工具时，可以传输相关文件；日常项目开发仍按前述远端流程进行。
+
+`ssh_upload` / `ssh_download` 每次通过 `localPath` 指定本地文件，无需预先配置传输目录。`localPath` 必须是运行 MCP 服务的本机上的绝对路径；`remotePath` 和 `cwd` 是远端路径，工作区根目录不会用来解析本地路径。
+
+省略 `localTransferRoots` 或设置为 `[]` 时，不限制本地目录。需要限定范围时，配置非空目录列表；每项必须是已存在的目录，配置中的相对路径基于配置文件目录解析。本地真实路径必须位于其中一个目录内，不能通过符号链接逃离范围。下载会自动创建缺失的本地父目录；配置目录限制时，创建前也会检查范围。
+
+传输仍检查普通文件、大小、覆盖权限和取消状态，下载先暂存再原子提交。两种工具使用 SFTP，复用已认证的 ControlMaster；`compression: true`（默认）同时压缩 worker 和 SFTP 的 SSH 流量。
 
 - 每条连接最多 4 个活动命令、8 个并行请求和 64 个排队请求；SSH 只为 worker 保留一个 session channel。
 - 连接注册表最多保留 64 项；容量紧张时移除已关闭记录。ID 在当前实例中不重复分配。
@@ -267,8 +279,8 @@ JavaScript/TypeScript 使用 Bun。本地 Python 检查和测试解释器由 uv 
 推送 `v*` 标签会触发 GitHub Actions：
 
 ```sh
-git tag v0.3.1
-git push origin v0.3.1
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 工作流运行检查、测试和构建，并上传 `neverssh.js`、`neverssh` launcher 和 `neverssh.config.example.json` 到对应 Release。launcher 在后台解析 `releases/latest`，新标签在用户下一次启动时生效，无需修改 MCP 配置。

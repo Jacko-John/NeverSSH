@@ -19,7 +19,7 @@ let transport: StdioClientTransport;
 let stderr = "";
 let dev = "";
 
-/** Inspect every public result as the model sees it, without a structured copy. */
+/** Inspect text results as the model sees them, without a structured copy. */
 async function call(name: string, args: Record<string, unknown> = {}, error = false): Promise<string> {
   const response = await client.callTool({ name, arguments: args });
   expect(response.structuredContent).toBeUndefined();
@@ -34,6 +34,17 @@ function connectionId(text: string): string {
   const id = /^Connection: ([a-f0-9]{8})$/.exec(text)?.[1];
   if (!id) throw new Error("Missing connection handle: " + text.slice(0, 4096));
   return id;
+}
+
+/** Add a valid ancillary text chunk to a one-pixel PNG without inflating its decoded pixels. */
+function paddedPng(size: number): Buffer {
+  const image = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==", "base64");
+  const chunk = Buffer.alloc(size - image.length, 65);
+  chunk.writeUInt32BE(chunk.length - 12, 0);
+  chunk.write("tEXt", 4);
+  chunk.write("Comment\0", 8);
+  chunk.writeUInt32BE(Bun.hash.crc32(chunk.subarray(4, -4)), chunk.length - 4);
+  return Buffer.concat([image.subarray(0, -12), chunk, image.subarray(-12)]);
 }
 
 /** Extract the handle exactly as a client reading a text result would. */
@@ -355,6 +366,62 @@ describe("remote files", () => {
     expect(await readFile(localPath, "utf8")).toBe(content);
   });
 
+  test("reads remote image bytes as native MCP content and remembers their file revision", async () => {
+    const base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    const path = join(fixture.workspace, "read-image.bin");
+    await writeFile(path, Buffer.from(base64, "base64"));
+    const response = await client.callTool({ name: "ssh_read_file", arguments: {
+      connection_id: dev, file_path: path, offset: 99, limit: 1,
+    } });
+    expect(Boolean(response.isError)).toBe(false);
+    expect(response.structuredContent).toBeUndefined();
+    expect(response.content).toEqual([{ type: "image", data: base64, mimeType: "image/png" }]);
+    expect(await call("ssh_write_file", { connection_id: dev, file_path: path, content: "image was read\n" }))
+      .toBe(`The file ${path} has been updated successfully.`);
+    expect(await readFile(path, "utf8")).toBe("image was read\n");
+  });
+
+  test("image response budget keeps default stdio clients usable and failed reads unremembered", async () => {
+    const configPath = join(fixture.root, "image-budget-config.json");
+    await writeFile(configPath, JSON.stringify({ ...fixture.config, maxFileBytes: 8 * 1024 * 1024 }));
+    const peer = new Client({ name: "image-budget-test", version: "1" });
+    const wire = new StdioClientTransport({
+      command: process.execPath,
+      args: ["run", resolve(process.env.NEVERSSH_TEST_ENTRYPOINT ?? "src/index.ts"), "--config", configPath],
+      env: { ...process.env } as Record<string, string>, stderr: "pipe",
+    });
+    try {
+      await peer.connect(wire);
+      const connected = await peer.callTool({ name: "ssh_connect", arguments: { host: "fixture" } });
+      const text = connected.content[0];
+      const connection_id = connectionId(text?.type === "text" ? text.text : "");
+      const smallPath = join(fixture.workspace, "image-budget-accepted.bin");
+      const small = paddedPng(6 * 1024 * 1024);
+      await writeFile(smallPath, small);
+      const accepted = await peer.callTool({ name: "ssh_read_file", arguments: { connection_id, file_path: smallPath } });
+      expect(Boolean(accepted.isError)).toBe(false);
+      expect(accepted.structuredContent).toBeUndefined();
+      expect(accepted.content).toEqual([{ type: "image", data: small.toString("base64"), mimeType: "image/png" }]);
+
+      const largePath = join(fixture.workspace, "image-budget-rejected.bin");
+      const large = paddedPng(8 * 1024 * 1024);
+      await writeFile(largePath, large);
+      const rejected = await peer.callTool({ name: "ssh_read_file", arguments: { connection_id, file_path: largePath } });
+      expect(rejected.isError).toBe(true);
+      expect(rejected.structuredContent).toBeUndefined();
+      expect(rejected.content).toEqual([{ type: "text", text: expect.stringContaining("9 MiB MCP response budget") }]);
+      const overwrite = await peer.callTool({ name: "ssh_write_file", arguments: {
+        connection_id, file_path: largePath, content: "must remain unread\n",
+      } });
+      expect(overwrite.isError).toBe(true);
+      expect(overwrite.content).toEqual([{ type: "text", text: expect.stringContaining("read it with ssh_read_file first") }]);
+      expect(await readFile(largePath)).toEqual(large);
+      const sessions = await peer.callTool({ name: "ssh_sessions", arguments: {} });
+      expect(Boolean(sessions.isError)).toBe(false);
+      expect(sessions.content).toEqual([{ type: "text", text: expect.stringContaining(connection_id) }]);
+    } finally { await peer.close(); }
+  }, 20000);
+
   test("preserves symlinks and rejects binary and oversized text reads", async () => {
     await symlink("edit.txt", join(fixture.workspace, "link.txt"));
     expect(await call("ssh_bash", { connection_id: dev, command: "test -L link.txt && printf symlink" })).toBe("symlink");
@@ -373,6 +440,46 @@ describe("remote files", () => {
 });
 
 describe("binary transfer boundary", () => {
+  test("omitted transfer roots allow absolute local paths through the public MCP tools", async () => {
+    const configPath = join(fixture.root, "unrestricted.config.json");
+    const sshConfig = fixture.config.sshConfig;
+    if (!sshConfig) throw new Error("Missing fixture SSH configuration");
+    await writeFile(configPath, JSON.stringify({ sshConfig }));
+    const local = join(fixture.root, "unrestricted-source.bin");
+    const destination = join(fixture.root, "unrestricted-download", "nested", "received.bin");
+    const remote = join(fixture.workspace, "unrestricted", "payload.bin");
+    const data = Buffer.from(Array.from({ length: 256 }, (_, value) => value));
+    const sha256 = createHash("sha256").update(data).digest("hex");
+    await writeFile(local, data);
+    const peer = new Client({ name: "neverssh-unrestricted-transfers-test", version: "1" });
+    const isolated = new StdioClientTransport({
+      command: process.execPath,
+      args: ["run", resolve(process.env.NEVERSSH_TEST_ENTRYPOINT ?? "src/index.ts"), "--config", configPath],
+      env: { ...process.env } as Record<string, string>, stderr: "pipe",
+    });
+    let diagnostic = "";
+    isolated.stderr?.on("data", (chunk: Buffer) => { diagnostic = (diagnostic + chunk.toString()).slice(-4096); });
+    const invoke = async (name: string, args: Record<string, unknown>): Promise<string> => {
+      const response = await peer.callTool({ name, arguments: args });
+      expect(Boolean(response.isError), JSON.stringify(response.content)).toBe(false);
+      expect(response.structuredContent).toBeUndefined();
+      expect(response.content.every((item) => item.type === "text")).toBe(true);
+      return response.content.map((item) => item.type === "text" ? item.text : "").join("\n");
+    };
+    try {
+      await peer.connect(isolated);
+      const connection_id = connectionId(await invoke("ssh_connect", { host: "fixture" }));
+      expect(await invoke("ssh_upload", { connection_id, localPath: local, remotePath: remote }))
+        .toBe(`Uploaded ${local} to ${remote} (256 bytes).\nSHA-256: ${sha256}`);
+      expect(await readFile(remote)).toEqual(data);
+      expect(await invoke("ssh_download", { connection_id, remotePath: remote, localPath: destination }))
+        .toBe(`Downloaded ${remote} to ${destination} (256 bytes).\nSHA-256: ${sha256}`);
+      expect(await readFile(destination)).toEqual(data);
+    } finally { await peer.close(); }
+    expect(diagnostic).not.toContain("SyntaxError");
+    expect(diagnostic).not.toContain("Unhandled");
+  }, 15000);
+
   test("round-trips binary bytes, verifies SHA-256, and refuses implicit overwrite", async () => {
     const data = Buffer.from(Array.from({ length: 256 }, (_, value) => value));
     const localPath = join(fixture.transfers, "source.bin");

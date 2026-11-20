@@ -38,6 +38,7 @@ export const configSchema = z.strictObject({
     allow: z.array(accessRule).max(1000).optional(),
     deny: z.array(accessRule).max(1000).default([]),
   }).default({ deny: [] }),
+  // Empty roots allow any absolute transfer path; nonempty roots restrict local access.
   localTransferRoots: z.array(cleanString).default([]),
   compression: z.boolean().default(true),
   maxFileBytes: z.number().int().min(1024).max(8 * 1024 * 1024).default(4 * 1024 * 1024),

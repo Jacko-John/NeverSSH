@@ -27,6 +27,77 @@ class FileCommitTests(unittest.TestCase):
         """Build a worker request without bypassing the real dispatch boundary."""
         return {"op": operation, "cwd": str(self.root), "maxFileBytes": 1024 * 1024, "args": args}
 
+    def test_read_recognizes_common_image_signatures_without_filename_hints(self):
+        # These short signature samples exercise classification, not pixel decoding.
+        signatures = (
+            ("png", "image/png", b"\x89PNG\r\n\x1a\n"),
+            ("jpeg", "image/jpeg", b"\xff\xd8\xff\xe0"),
+            ("gif87", "image/gif", b"GIF87a"),
+            ("gif89", "image/gif", b"GIF89a"),
+            ("webp", "image/webp", b"RIFF\x10\x00\x00\x00WEBP"),
+        )
+        for name, mime_type, signature in signatures:
+            with self.subTest(format=name):
+                data = signature + b"\x00signature fixture"
+                target = self.root / (name + ".txt")
+                target.write_bytes(data)
+                result = file_ops.dispatch(self.request("read", path=target.name))
+                self.assertEqual(result, {
+                    "kind": "image", "mimeType": mime_type,
+                    "base64": base64.b64encode(data).decode("ascii"),
+                    "path": str(target.resolve()), "size": len(data), "sha256": file_ops.digest(data),
+                })
+
+    def test_image_read_keeps_canonical_revision_and_ignores_text_pagination(self):
+        data = b"\x89PNG\r\n\x1a\n\x00signature fixture"
+        target = self.root / "image.data"
+        alias = self.root / "image-alias"
+        target.write_bytes(data)
+        alias.symlink_to(target)
+        result = file_ops.dispatch(self.request("read", path=alias.name, startLine=999,
+                                               lineCount=1, maxBytes=1))
+        self.assertEqual(result["kind"], "image")
+        self.assertEqual(result["path"], str(target.resolve()))
+        self.assertEqual(result["sha256"], file_ops.digest(data))
+        self.assertEqual(base64.b64decode(result["base64"], validate=True), data)
+
+    def test_image_reads_apply_the_full_file_byte_limit_before_encoding(self):
+        target = self.root / "image"
+        data = b"GIF89a" + b"\x00" * (1024 - 6)
+        target.write_bytes(data)
+        request = self.request("read", path=target.name)
+        request["maxFileBytes"] = 1024
+        self.assertEqual(file_ops.dispatch(request)["size"], 1024)
+        target.write_bytes(data + b"x")
+        with self.assertRaisesRegex(ValueError, "maxFileBytes"):
+            file_ops.dispatch(request)
+
+    def test_image_extensions_do_not_change_text_paging_or_accept_other_binary_formats(self):
+        target = self.root / "actually-text.png"
+        data = b"first\r\nsecond\r\nthird\r\n"
+        target.write_bytes(data)
+        result = file_ops.dispatch(self.request("read", path=target.name, startLine=2, lineCount=1))
+        self.assertEqual(result["content"], "second\r\n")
+        self.assertEqual((result["startLine"], result["endLine"], result["totalLines"]), (2, 2, 3))
+        self.assertEqual(result["nextLine"], 3)
+        self.assertTrue(result["truncated"])
+        self.assertNotIn("kind", result)
+        for name, content in (("other.jpg", b"\x00not an image"),
+                              ("riff.webp", b"RIFF\x10\x00\x00\x00AVI \x00"),
+                              ("short.png", b"\x89PNG\x00")):
+            with self.subTest(path=name), self.assertRaisesRegex(ValueError, "Binary file"):
+                (self.root / name).write_bytes(content)
+                file_ops.dispatch(self.request("read", path=name))
+
+    def test_image_reads_still_require_regular_files(self):
+        directory = self.root / "directory.png"
+        directory.mkdir()
+        fifo = self.root / "fifo.jpg"
+        os.mkfifo(fifo)
+        for target in (directory, fifo):
+            with self.subTest(path=target.name), self.assertRaises((ValueError, IsADirectoryError)):
+                file_ops.dispatch(self.request("read", path=target.name))
+
     def test_concurrent_edit_write_and_upload_recheck_the_revision_after_admission(self):
         # Pause the first writer after its final hash check, exposing the original lost-update window.
         for operation in ("edit", "write", "commit_upload"):

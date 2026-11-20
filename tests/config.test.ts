@@ -1,6 +1,6 @@
 /** Verify trusted local configuration boundaries before SSH or transfers are possible. */
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { configSchema, hostField, loadConfig, targetAllowed } from "../src/config";
 import { sftpOptions, sshOptions } from "../src/ssh/openssh";
@@ -16,6 +16,7 @@ test("empty configuration inherits SSH access and rejects credentials and legacy
   expect(config.maxTaskOutputBytes).toBe(64 * 1024 * 1024);
   expect(config.maxArchiveBytes).toBe(1024 * 1024 * 1024);
   expect(config.compression).toBe(true);
+  expect(config.localTransferRoots).toEqual([]);
   expect(configSchema.safeParse({ compression: "yes" }).success).toBe(false);
   expect(configSchema.safeParse({ maxTaskOutputBytes: 0 }).success).toBe(false);
   expect(configSchema.safeParse({ maxArchiveBytes: -1 }).success).toBe(false);
@@ -47,16 +48,30 @@ test("local paths are resolved relative to the config file and canonicalized", a
 
 test("optional default config works but explicit missing files and transfer roots fail", async () => {
   const filename = join(root, "invalid.json");
-  expect((await loadConfig(filename, true)).access.allow).toBeUndefined();
+  const defaults = await loadConfig(filename, true);
+  expect(defaults.access.allow).toBeUndefined();
+  expect(defaults.localTransferRoots).toEqual([]);
   await expect(loadConfig(filename)).rejects.toThrow();
   await writeFile(filename, JSON.stringify({ localTransferRoots: ["absent"] }));
   await expect(loadConfig(filename)).rejects.toThrow();
 });
 
-test("disabled transfers fail before resolving or inspecting local user paths", async () => {
-  const config = configSchema.parse({});
-  await expect(transferPath(config, join(root, "does-not-exist"), false)).rejects.toThrow("Local transfers are disabled");
-  await expect(transferPath(config, root, true)).rejects.toThrow("Local transfers are disabled");
+test("omitted or empty transfer roots allow absolute local paths while retaining path checks", async () => {
+  for (const [index, settings] of [{}, { localTransferRoots: [] }].entries()) {
+    const config = configSchema.parse(settings);
+    const source = join(root, `unrestricted-source-${index}`);
+    const alias = join(root, `unrestricted-alias-${index}`);
+    await writeFile(source, "local payload");
+    await symlink(source, alias);
+    expect(await transferPath(config, alias, false)).toBe(source);
+    const destination = join(root, `unrestricted-parent-${index}`, "nested/destination");
+    expect(await transferPath(config, destination, true)).toBe(destination);
+    for (const writing of [false, true]) {
+      await expect(transferPath(config, "relative-path", writing)).rejects.toThrow("localPath must be absolute");
+    }
+    await expect(transferPath(config, root, true)).rejects.toThrow("regular file");
+    await expect(transferPath(config, alias, true)).rejects.toThrow("never a symlink");
+  }
 });
 
 test("access rules restrict requested aliases and effective hosts with deny taking precedence", () => {

@@ -14,7 +14,7 @@
 | [ssh_task_output](#ssh_task_output) | 查询任务，或等待结束 |
 | [ssh_task_stop](#ssh_task_stop) | 停止任务及其普通子进程 |
 | [ssh_task_list](#ssh_task_list) | 列出尚未读取输出的任务 |
-| [ssh_read_file](#ssh_read_file) | 读取远端 UTF-8 文本 |
+| [ssh_read_file](#ssh_read_file) | 读取远端 UTF-8 文本或图片 |
 | [ssh_write_file](#ssh_write_file) | 创建或覆盖远端文本文件 |
 | [ssh_edit_file](#ssh_edit_file) | 精确替换远端文本 |
 | [ssh_upload](#ssh_upload) | 上传本地二进制文件 |
@@ -22,7 +22,7 @@
 
 可以直接连接已知地址，无需先发现。默认沿用本机 SSH 能力，开放范围由本地[访问配置](../README.md#开始使用)控制。
 
-所有请求都是 MCP 参数对象，并拒绝未定义字段。所有工具仅返回可读的 MCP 文本内容块，不提供 `structuredContent` 或 `outputSchema`，也不把内部结果序列化成 JSON 文本。错误文本统一为 `Error: CODE` 加一句说明。远端命令自身打印的 JSON 保持原样。
+所有请求都是 MCP 参数对象，并拒绝未定义字段。工具返回可读的 MCP 文本内容块，`ssh_read_file` 读取受支持的图片时返回原生 `image` 内容块；其他工具仍只返回文本。所有工具都不提供 `structuredContent` 或 `outputSchema`，也不把内部结果序列化成 JSON 文本。错误文本统一为 `Error: CODE` 加一句说明。远端命令自身打印的 JSON 保持原样。
 
 连接 ID 是 8 位小写十六进制，如 `7a2c9d4f`。工作区 ID 带 `ws_` 前缀，如 `ws_b8e3a160`，绑定连接和远端项目根目录。任务 ID 带 `task_` 前缀，如 `task_b8e3a160`。这些 ID 不能混用，只在当前 MCP 实例中有效；工作区还要求所属连接可用。日志保留不延长任何句柄的有效期。
 
@@ -281,7 +281,7 @@ No AGENTS.md instructions apply to these paths.
 
 工作区文件读取、写入、编辑、上传、下载和 Bash 的结果自动附上新增、变更或删除的适用规则，不因规则尚未返回或已经变化而拒绝操作。规则提示返回时，本次文件操作已经执行，Bash 命令已经启动；提示用于后续操作，不代表服务器已确认 Agent 在执行前理解了规则。路径范围、读取后编辑和文件版本检查继续生效。
 
-第一个 MCP 文本块保留原操作结果，包括任务首行和程序输出的空白；规则有变化时，第二个文本块单独返回规则增量。没有规则变化时只有第一个文本块。已启动或转入后台的 Bash 在首次返回结果时交付规则，程序非零退出的结果也可附规则；命令已经运行，不要因为收到规则提示而重放。文件读取、编辑或传输等操作抛错时，不附规则，也不将本次采集的规则记为已返回。
+第一个 MCP 内容块保留原操作结果：普通结果为文本，保留任务首行和程序输出的空白；图片读取结果为原生 `image`。规则有变化时，第二个文本块单独返回规则增量，没有变化时不重复返回。已启动或转入后台的 Bash 在首次返回结果时交付规则，程序非零退出的结果也可附规则；命令已经运行，不要因为收到规则提示而重放。文件读取、编辑或传输等操作抛错时，不附规则，也不将本次采集的规则记为已返回。
 
 如果操作执行期间工作区被重新打开或连接失效，保留原操作结果，但不再附带属于旧工作区状态的规则。
 
@@ -556,13 +556,13 @@ task_b8e3a160  running  7a2c9d4f  /home/developer/.neverssh/sessions/7a2c9d4f/ta
 
 ## 文件与传输
 
-文件工具必须且只能选择 `connection_id` 或 `workspace_id`。`file_path` 是远端路径：连接模式相对远端 HOME 解析，工作区模式相对项目根目录解析。读取返回带行号的文本，并按真实目标路径记录文件版本；符号链接与已读取的其他路径拼写共享该版本，编辑前必须读取或写入该文件。工作区文件和传输操作在结果中附加新增、变更或删除的适用规则，规则变化不阻止操作；恢复根目录上下文使用再次 `ssh_workspace_open`。连接模式不加载项目上下文。目录列表、文件查找和内容搜索通过 `ssh_bash` 执行 `ls`、`find`、`rg`。
+文件工具必须且只能选择 `connection_id` 或 `workspace_id`。`file_path` 是远端路径：连接模式相对远端 HOME 解析，工作区模式相对项目根目录解析。读取返回带行号的文本或受支持的图片，并按真实目标路径记录文件版本；符号链接与已读取的其他路径拼写共享该版本，编辑前必须读取或写入该文件。工作区文件和传输操作在结果中附加新增、变更或删除的适用规则，规则变化不阻止操作；恢复根目录上下文使用再次 `ssh_workspace_open`。连接模式不加载项目上下文。目录列表、文件查找和内容搜索通过 `ssh_bash` 执行 `ls`、`find`、`rg`。
 
-远端写入、上传和下载会自动创建缺失的父目录；本地父目录仍不能通过符号链接逃出传输根目录。`ssh_upload` / `ssh_download` 使用 SFTP，复用当前连接的 ControlMaster；其他工具走 worker。SSH 压缩默认开启（`compression: true`），可通过本地配置关闭。文件工具直接返回带行号的内容或操作结果；文件版本由服务端内部记录。
+远端写入、上传和下载会自动创建缺失的父目录；配置了非空 `localTransferRoots` 时，本地父目录不能通过符号链接逃出该范围。`ssh_upload` / `ssh_download` 使用 SFTP，复用当前连接的 ControlMaster；其他工具走 worker，包括图片读取。SSH 压缩默认开启（`compression: true`），可通过本地配置关闭。文件版本由服务端内部记录。项目开发默认直接使用远端文件工具，批量修改和代码生成使用远端 `ssh_bash`；上传下载用于具体的文件传输需求。
 
 ## ssh_read_file
 
-读取远端文本文件，返回带行号的内容。读取会记录文件版本，供后续 `ssh_edit_file` 使用。
+读取远端 UTF-8 文本或图片，不增加必填参数。文本返回带行号的内容，受支持的图片返回原生 MCP `image` 内容块。读取会记录文件版本，供后续文件版本检查使用。
 
 ### 参数
 
@@ -570,13 +570,13 @@ task_b8e3a160  running  7a2c9d4f  /home/developer/.neverssh/sessions/7a2c9d4f/ta
 | --- | --- | --- | --- | --- |
 | `connection_id` | string | 否 | 无 | 远端连接 ID；与 workspace_id 必须且只能填写一个。 |
 | `workspace_id` | string | 否 | 无 | 远端工作区 ID；与 connection_id 必须且只能填写一个。 |
-| `file_path` | string | 是 | 无 | 远端文件路径；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。最长 4096 个字符。 |
-| `offset` | integer | 否 | `1` | 起始行号，从 1 开始。不小于 1。 |
-| `limit` | integer | 否 | `2000` | 最多读取多少行。不小于 1。 |
+| `file_path` | string | 是 | 无 | 远端文本或图片文件路径；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。最长 4096 个字符。 |
+| `offset` | integer | 否 | `1` | 文本起始行号，从 1 开始；读取图片时忽略。不小于 1。 |
+| `limit` | integer | 否 | `2000` | 最多读取的文本行数；图片始终完整返回。不小于 1。 |
 
 ### 返回
 
-读取正文返回带行号的文本，使用 `cat -n` 风格；工作区规则增量另放第二个文本块：
+文本正文返回带行号的内容，使用 `cat -n` 风格；工作区规则增量另放第二个文本块：
 
 ```text
      1	import { createServer } from "node:http";
@@ -590,6 +590,8 @@ PARTIAL view: showing lines 1-2000 of 5000. Use offset=2001 to continue.
 ```
 
 空文件返回 `File exists but is empty.`；`offset` 超过最后一行时返回 `File has <N> lines; offset <M> is past the end.`
+
+图片完整返回为原生 MCP `image` 内容块，不把图片数据写入文本，也不在本地保存文件。客户端需要支持 MCP 图片显示。工作区规则有变化时，仍在图片后附加独立的文本块；未变化的规则不重复返回。
 
 ### 示例
 
@@ -612,7 +614,11 @@ PARTIAL view: showing lines 1-2000 of 5000. Use offset=2001 to continue.
 
 ### 行为和失败情况
 
-默认从第 1 行读取最多 2000 行；大文件用 `offset` 和 `limit` 分页。只接受 UTF-8 文本，二进制文件使用 `ssh_download`。全文件必须不超过 `maxFileBytes`（默认 4 MiB，可配置到 8 MiB）；单次读取还有约 256 KiB 的字节预算，长行较多时会提前截断并返回 `PARTIAL view`。
+按文件内容的标识识别 PNG、JPEG、GIF 和 WebP，不依赖扩展名。查看远端图片直接传入其 `file_path`，无需通过 SFTP 下载到本地。图片完整返回，`offset` 和 `limit` 只适用于文本。SVG 仍作为 UTF-8 文本读取，其他二进制文件返回文本错误。
+
+文本默认从第 1 行读取最多 2000 行，用 `offset` 和 `limit` 分页。文本和图片的全文件都必须不超过 `maxFileBytes`（默认 4 MiB，可配置到 8 MiB）；文本单次读取还有约 256 KiB 的字节预算，长行较多时会提前截断并返回 `PARTIAL view`。
+
+图片及附带规则的完整 MCP 结果序列化后另有 9 MiB 上限，独立于原始文件的 `maxFileBytes` 限制。超限时返回文本错误，需缩小图片后重试；不会截断图片或自动下载。本次未交付的工作区规则不会被记为已返回。
 
 读取不会延长日志保留期。读取结果会记录文件版本；`ssh_edit_file` 需要同一连接下先读取或写入该文件。
 
@@ -724,7 +730,7 @@ The file /srv/app/notes.txt has been updated successfully.
 | `connection_id` | string | 否 | 无 | 远端连接 ID；与 workspace_id 必须且只能填写一个。 |
 | `workspace_id` | string | 否 | 无 | 远端工作区 ID；与 connection_id 必须且只能填写一个。 |
 | `cwd` | string | 否 | 无 | 远端工作目录；默认使用工作区根目录或连接的远端 HOME。最长 4096 个字符。 |
-| `localPath` | string | 是 | 无 | 本地绝对路径，必须位于 localTransferRoots 内。最长 4096 个字符。 |
+| `localPath` | string | 是 | 无 | 本地文件的绝对路径；localTransferRoots 非空时，必须位于其中一个目录内。最长 4096 个字符。 |
 | `remotePath` | string | 是 | 无 | 目标远端路径；支持绝对路径、~/ 和相对于 cwd 的路径。最长 4096 个字符。 |
 | `overwrite` | boolean | 否 | `false` | 显式允许覆盖已存在的远端文件。 |
 | `expectedSha256` | string | 否 | 无 | 期望的远端文件 SHA-256，小写十六进制；用于冲突检查。 |
@@ -757,9 +763,9 @@ SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 
 ### 行为和失败情况
 
-`localTransferRoots` 默认空，本地传输关闭。`localPath` 必须是根目录内的绝对路径，打开时拒绝符号链接和非常规文件；本地文件不超过 `maxFileBytes`（默认 4 MiB，可配置到 8 MiB）。
+每次调用通过 `localPath` 指定运行 MCP 服务的本机上的绝对路径，无需预先配置传输目录。省略 `localTransferRoots` 或设置为 `[]` 时不限制本地目录；只有非空列表才要求本地真实路径位于其中一个配置目录内，符号链接不能逃离该范围。`workspace_id` 和 `cwd` 只影响远端路径，不用于解析 `localPath`。本地源必须是普通文件，且不超过 `maxFileBytes`（默认 4 MiB，可配置到 8 MiB）。
 
-上传通过 SFTP 复用当前连接的 ControlMaster；SFTP 不可用时直接返回 `SFTP_UNAVAILABLE`，不回退 worker 传输。本地源必须是传输根目录内的普通文件，SFTP 准备完成后会再次校验本地边界，再读取有大小上限的内容快照。远端目标固定使用检查时解析的真实路径；最终符号链接指向尚不存在的文件时，也按该真实目标创建并保留链接。
+上传通过 SFTP 复用当前连接的 ControlMaster；SFTP 不可用时直接返回 `SFTP_UNAVAILABLE`，不回退 worker 传输。SFTP 准备完成后会再次解析本地源路径，按非空的 `localTransferRoots` 检查范围，再通过文件描述符检查普通文件类型并读取有大小上限的内容快照。远端目标固定使用检查时解析的真实路径；最终符号链接指向尚不存在的文件时，也按该真实目标创建并保留链接。
 
 先通过 SFTP 写同目录的短名称临时文件，再由 worker 校验并提交；父目录自动创建。已有远端文件需要 `expectedSha256` 或 `overwrite=true`，覆盖也不能替换目录或 FIFO 等特殊文件。暂存文件必须是普通文件，不能是符号链接；提交时校验 sha256 并重新校验 `expectedSha256`。未允许覆盖时以原子的创建操作提交，拒绝覆盖上传期间出现的文件。同一 worker 对同一文件的文本写入、编辑和上传提交会串行执行，哈希校验不构成跨进程事务锁。SFTP 上传不保证保留远端原文件的 mode 和所有者；成功后记录新版本，可在同一连接下用 `ssh_edit_file` 继续编辑文本内容。
 
@@ -775,7 +781,7 @@ SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 | `workspace_id` | string | 否 | 无 | 远端工作区 ID；与 connection_id 必须且只能填写一个。 |
 | `cwd` | string | 否 | 无 | 远端工作目录；默认使用工作区根目录或连接的远端 HOME。最长 4096 个字符。 |
 | `remotePath` | string | 是 | 无 | 要下载的远端路径；支持绝对路径、~/ 和相对于 cwd 的路径。最长 4096 个字符。 |
-| `localPath` | string | 是 | 无 | 本地绝对路径，必须位于 localTransferRoots 内。最长 4096 个字符。 |
+| `localPath` | string | 是 | 无 | 本地文件的绝对路径；localTransferRoots 非空时，必须位于其中一个目录内。最长 4096 个字符。 |
 | `overwrite` | boolean | 否 | `false` | 显式允许覆盖已存在的本地文件。 |
 
 ### 返回
@@ -806,11 +812,11 @@ SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 
 ### 行为和失败情况
 
-`localTransferRoots` 默认空，本地传输关闭。`localPath` 必须是根目录内的绝对路径；缺失的本地父目录会在根目录内创建，创建前会解析最深的已存在祖先，符号链接不能逃出根目录。目标是符号链接、非常规文件或已存在且未设置 `overwrite=true` 时拒绝写入。
+每次调用通过 `localPath` 指定运行 MCP 服务的本机上的绝对路径，无需预先配置传输目录。省略 `localTransferRoots` 或设置为 `[]` 时不限制本地目录；只有非空列表才要求本地真实路径位于其中一个配置目录内。`workspace_id` 和 `cwd` 只影响远端路径，不用于解析 `localPath`。缺失的本地父目录会自动创建；配置目录限制时，创建前会解析最深的已存在祖先，符号链接不能逃出该范围。目标是符号链接、非常规文件或已存在且未设置 `overwrite=true` 时拒绝写入。
 
 远端文件必须是普通文件且不超过 `maxFileBytes`；先用 worker `stat` 检查存在性和大小，并固定真实目标，再通过 SFTP 下载。本地接收内容始终位于同父目录下的 0700 私有临时目录中。传输后按文件描述符复查类型与大小，以有上限的读取计算实际收到内容的 sha256，并将文件权限设为 0600 后原子提交。源文件在检查后增长超限时拒绝提交；失败时保留原目标并清理临时目录。SFTP 不可用时直接返回 `SFTP_UNAVAILABLE`，不回退 worker 传输。
 
-提交前会再次校验传输根目录，并在最后一次路径检查后复核取消状态。已取消的调用在入口就退出，不创建下载目录。并发禁止覆盖的下载以原子创建保证只有一个成功；`overwrite=true` 才允许替换已有普通文件。
+提交前会再次校验本地目标路径，按非空的 `localTransferRoots` 检查范围，并在最后一次路径检查后复核取消状态。已取消的调用在入口就退出，不创建下载目录。并发禁止覆盖的下载以原子创建保证只有一个成功；`overwrite=true` 才允许替换已有普通文件。
 
 共享的 SFTP 可用性探测独立处理每个调用者的取消。传输取消或超时后，工具会停止并回收 SFTP 进程组再返回；连接关闭也等待其活动传输收尾。连接已经丢失或清理请求失败时，远端上传暂存文件的清理可能无法确认，应检查实际远端状态，避免直接重传。
 
@@ -826,7 +832,7 @@ SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 | `FILE_NOT_READ` | 编辑前没有读取或写入该文件 | 先调用 `ssh_read_file` 或 `ssh_write_file`。 |
 | `WORKSPACE_NOT_FOUND` | 工作区 ID 无效或不再可用 | 确认连接可用后重新打开项目。 |
 | `WORKSPACE_REOPEN_REQUIRED` | 准备操作期间工作区被重新打开、规则历史达到上限，或 skill 读取结果所属的目录已失效 | 按具体错误指引重新打开工作区；准备阶段失败时操作未执行，过期 skill 的结果会被丢弃。 |
-| `OPERATION_FAILED` | 本地传输边界、本地文件或参数处理失败 | 检查 `localTransferRoots`、路径和本地权限。 |
+| `OPERATION_FAILED` | 本地文件、参数处理失败或图片响应超限 | 按消息检查目录限制、路径和权限；图片响应过大时缩小图片后重试。 |
 | `OPERATION_CANCELLED` / `OPERATION_INTERRUPTED` | 调用被取消，或远端操作超时 | 写入结果可能未知，先检查目标再重试。 |
 | `SFTP_UNAVAILABLE` | 本地 `sftp` 或远端 SFTP 子系统不可用 | 安装 OpenSSH `sftp` 客户端，或在远端启用 SFTP 子系统。 |
 | `SFTP_FAILED` | SFTP 传输或批处理命令失败 | 检查远端路径、权限和 SFTP 配置。 |

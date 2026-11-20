@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0
+
+### Breaking changes
+
+- Omitted or empty `localTransferRoots` now allows absolute local transfer paths; `[]` no longer disables transfers. Nonempty lists retain canonical directory restrictions.
+- `ssh_read_file` may return native MCP image content. Consumers must accept image blocks as well as text; other tools remain text-only, without `structuredContent` or `outputSchema`.
+
+### Changed
+
+- Make direct remote reads, writes, edits, and code generation the default development workflow. Reserve transfers for concrete needs instead of local temporary files or download-edit-upload round trips.
+
+### Added
+
+- Inspect remote PNG, JPEG, GIF, and WebP files directly with `ssh_read_file`, without SFTP or local downloads. Images retain file and response size checks, with changed workspace rules appended as text. Text pagination remains unchanged.
+
 ## 0.3.1
 
 ### Breaking changes

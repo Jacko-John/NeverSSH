@@ -1,7 +1,7 @@
-/** Exercise remote mutation admission and commit checks through the project's Python launcher. */
+/** Exercise remote image/text reads and mutation checks through the project's Python launcher. */
 import { expect, test } from "bun:test";
 
-test("remote file mutations serialize revision checks and staged upload commits", async () => {
+test("remote file reads recognize images and mutations retain revision and commit checks", async () => {
   const child = Bun.spawn(["uv", "run", "--no-project", "python", "-B", "tests/file_commit_test.py"], {
     stdout: "pipe", stderr: "pipe",
   });

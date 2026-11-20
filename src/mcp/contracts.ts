@@ -7,7 +7,6 @@ export const connectionId = shortId.describe("Short connection_id returned by ss
 const taskId = z.string().refine((value) => /^task_[a-f0-9]{8}$/.test(value), "Use the task_id returned by ssh_bash")
   .describe("Prefixed task_id returned by ssh_bash; unique within this MCP instance.");
 const taskScope = { task_id: taskId };
-const waitSeconds = z.number().min(0).max(300);
 const workspaceId = z.string().refine((value) => /^ws_[a-f0-9]{8}$/.test(value), "Use the workspace_id returned by ssh_workspace_open")
   .describe("Workspace handle returned by ssh_workspace_open in this MCP instance.");
 const operationScope = { connection_id: connectionId.optional(), workspace_id: workspaceId.optional() };
@@ -41,11 +40,11 @@ export const commandContracts = {
       command: cleanString.max(131072),
       cwd: cleanString.max(4096).optional().describe("Remote working directory, relative to the workspace root or remote HOME; defaults to that root."),
       run_in_background: z.boolean().default(false),
-      wait_seconds: waitSeconds.default(120),
+      wait_seconds: z.number().min(0).max(600).default(120),
     }).refine(validOperationScope, scopeMessage),
   },
   ssh_task_output: {
-    input: z.strictObject({ ...taskScope, wait_seconds: waitSeconds.default(30) }),
+    input: z.strictObject({ ...taskScope, wait_seconds: z.number().min(0).max(300).default(30) }),
   },
   ssh_task_stop: {
     input: z.strictObject(taskScope),
@@ -93,9 +92,12 @@ export function createToolContracts(maxFileBytes: number) {
     ssh_read_file: {
       input: z.strictObject({
         ...operationScope,
-        file_path: filePath.describe("Remote text or image file path; relative to the workspace root or, with connection_id, remote HOME."),
-        offset: z.number().int().min(1).default(1).describe("Starting text line, counted from 1; ignored for images."),
-        limit: z.number().int().min(1).default(2000).describe("Maximum text lines to return; images are always returned whole."),
+        file_path: filePath,
+        offset: z.number().int().min(1).optional().describe("Starting text line, counted from 1; defaults to 1."),
+        limit: z.number().int().min(1).optional().describe("Maximum text lines to return; defaults to 2000."),
+        pages: z.string().max(32).refine((value) => /^[1-9]\d*(?:-[1-9]\d*)?$/.test(value),
+          "Use a PDF page number or an inclusive range such as 2-5").optional()
+          .describe("PDF page or inclusive range, at most 20 pages. Required for PDFs over 10 pages."),
       }).refine(validOperationScope, scopeMessage),
     },
     ssh_write_file: {

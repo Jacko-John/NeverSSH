@@ -15,7 +15,7 @@ test("remote workspace guidance, skills, bounded discovery, and Git inspection",
   expect(code, stdout + stderr).toBe(0);
 }, 20000);
 
-test("small file budgets report oversize opening details and operation rules without losing the connection", async () => {
+test("small file budgets admit bounded Git previews and reject oversized rule sets without losing the connection", async () => {
   const fixture = new SshFixture();
   let runtime: Runtime | undefined;
   try {
@@ -37,9 +37,9 @@ test("small file budgets report oversize opening details and operation rules wit
     const id = String(connection.connection_id);
     const withoutSkills = await runtime.ssh.run(id, "workspace_open", { path: fixture.workspace, skillDirectories: [] });
     expect(withoutSkills.instructions).toHaveLength(1);
-    await expect(runtime.ssh.run(id, "workspace_open", { path: fixture.workspace })).rejects.toMatchObject({
-      code: "REMOTE_OPERATION_FAILED", message: expect.stringContaining("transport byte budget"),
-    });
+    const opened = await runtime.ssh.run(id, "workspace_open", { path: fixture.workspace });
+    expect(opened.skill_files).toHaveLength(100);
+    expect(opened.git).toMatchObject({ omitted: expect.any(Number) });
 
     let directory = fixture.workspace;
     for (let index = 0; index < 25; index++) {

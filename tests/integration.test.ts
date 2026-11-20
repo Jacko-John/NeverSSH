@@ -21,7 +21,7 @@ let dev = "";
 
 /** Inspect text results as the model sees them, without a structured copy. */
 async function call(name: string, args: Record<string, unknown> = {}, error = false): Promise<string> {
-  const response = await client.callTool({ name, arguments: args });
+  const response = await client.callTool({ name, arguments: args }, { timeout: 660_000 });
   expect(response.structuredContent).toBeUndefined();
   expect(Boolean(response.isError), JSON.stringify(response.content).slice(0, 4096)).toBe(error);
   expect(response.content.length).toBeGreaterThan(0);
@@ -140,7 +140,7 @@ describe("MCP and connections", () => {
     }
     expect(listing.tools.find((tool) => tool.name === "ssh_read_file")?.annotations?.readOnlyHint).toBe(true);
     const properties = (name: string) => Object.keys(listing.tools.find((tool) => tool.name === name)?.inputSchema.properties ?? {});
-    expect(properties("ssh_read_file")).toEqual(["connection_id", "workspace_id", "file_path", "offset", "limit"]);
+    expect(properties("ssh_read_file")).toEqual(["connection_id", "workspace_id", "file_path", "offset", "limit", "pages"]);
     expect(properties("ssh_write_file")).toEqual(["connection_id", "workspace_id", "file_path", "content"]);
     expect(properties("ssh_edit_file")).toEqual(["connection_id", "workspace_id", "file_path", "old_string", "new_string", "replace_all"]);
     expect(properties("ssh_task_list")).toEqual(["connection_id"]);
@@ -276,12 +276,12 @@ describe("remote files", () => {
     const first = await call("ssh_edit_file", {
       connection_id: dev, file_path: "edit.txt", old_string: "one", new_string: "first",
     });
-    expect(first).toBe(`The file ${join(fixture.workspace, "edit.txt")} has been updated successfully.`);
+    expect(first).toBe(`The file ${join(fixture.workspace, "edit.txt")} has been updated successfully.\n     1\tfirst\n     2\ttwo two`);
     expect(await readFile(join(fixture.workspace, "edit.txt"), "utf8")).toBe("first\r\ntwo two\r\n");
     const second = await call("ssh_edit_file", {
       connection_id: dev, file_path: "edit.txt", old_string: "two", new_string: "second", replace_all: true,
     });
-    expect(second).toBe(first);
+    expect(second).toContain("Replaced 2 occurrences. Showing the first changed region.\n     1\tfirst\n     2\tsecond second");
     expect((await lstat(join(fixture.workspace, "edit.txt"))).mode & 0o777).toBe(0o751);
     expect(await readFile(join(fixture.workspace, "edit.txt"), "utf8")).toBe("first\r\nsecond second\r\n");
 
@@ -296,7 +296,7 @@ describe("remote files", () => {
     const unread = await call("ssh_edit_file", {
       connection_id: dev, file_path: "outside.txt", old_string: "outside", new_string: "inside",
     }, true);
-    expect(unread).toBe("Error: FILE_NOT_READ\nRead the file with ssh_read_file before editing it");
+    expect(unread).toBe("Error: FILE_NOT_READ\nRead the entire current file with ssh_read_file before editing it. Follow any paging hints.");
     await call("ssh_read_file", { connection_id: dev, file_path: "outside.txt" });
     await call("ssh_edit_file", { connection_id: dev, file_path: "outside.txt", old_string: "outside", new_string: "inside" });
     expect(await readFile(join(fixture.workspace, "outside.txt"), "utf8")).toBe("inside\n");
@@ -308,6 +308,111 @@ describe("remote files", () => {
     await call("ssh_read_file", { connection_id: dev, file_path: "guard.txt" });
     await call("ssh_write_file", { connection_id: dev, file_path: "guard.txt", content: "replaced" });
     expect(await readFile(join(fixture.workspace, "guard.txt"), "utf8")).toBe("replaced");
+  });
+
+  test("declines no-op edits without replacing the inode, changing mtime, or refreshing a stale read", async () => {
+    const file_path = join(fixture.workspace, "noop.txt");
+    const args = { connection_id: dev, file_path };
+    await call("ssh_write_file", { ...args, content: "first" });
+    const before = await stat(file_path, { bigint: true });
+    expect(await call("ssh_edit_file", { ...args, old_string: "first", new_string: "first" }, true)).toContain("No changes to make");
+    const after = await stat(file_path, { bigint: true });
+    expect([after.ino, after.mtimeNs]).toEqual([before.ino, before.mtimeNs]);
+    await writeFile(file_path, "external");
+    await call("ssh_edit_file", { ...args, old_string: "external", new_string: "external" }, true);
+    expect(await call("ssh_edit_file", { ...args, old_string: "external", new_string: "new" }, true)).toContain("conflict");
+  });
+
+  test("read pages and edit previews number CR, CRLF and Unicode line boundaries consistently", async () => {
+    const args = { connection_id: connectionId(await call("ssh_connect", { host: "fixture" })), file_path: "line-breaks.txt" };
+    const content = "one\rtwo\r\nthree\u0085four\u2028five\u2029six\u000bseven\u000ceight\u001cnine\u001dten\u001eeleven\n";
+    await writeFile(join(fixture.workspace, args.file_path), content);
+    const first = await call("ssh_read_file", { ...args, limit: 4 });
+    expect(first).toBe("     1\tone\n     2\ttwo\n     3\tthree\n     4\tfour\nPARTIAL view: showing lines 1-4 of 11. Use offset=5 to continue.");
+    expect(await call("ssh_read_file", { ...args, offset: 5 })).toContain("    11\televen");
+    const edited = await call("ssh_edit_file", { ...args, old_string: "seven", new_string: "SEVEN" });
+    expect(edited).toContain("     5\tfive\n     6\tsix\n     7\tSEVEN\n     8\teight\n     9\tnine");
+    expect(await readFile(join(fixture.workspace, args.file_path), "utf8")).toBe(content.replace("seven", "SEVEN"));
+  });
+
+  test("only full page coverage of the same revision unlocks edits and overwrites", async () => {
+    const file_path = join(fixture.workspace, "paged-guard.txt");
+    const args = { connection_id: dev, file_path };
+    await writeFile(file_path, "one\ntwo\nthree\n");
+    await call("ssh_read_file", { ...args, limit: 1 });
+    await call("ssh_read_file", { ...args, offset: 3 });
+    expect(await call("ssh_edit_file", { ...args, old_string: "one", new_string: "ONE" }, true)).toContain("FILE_NOT_READ");
+    expect(await call("ssh_write_file", { ...args, content: "oops" }, true)).toContain("read it with ssh_read_file first");
+    await writeFile(file_path, "one\ntwo\nexternal\n");
+    expect(await call("ssh_read_file", { ...args, offset: 2 })).toContain("modified since it was last read");
+    await call("ssh_write_file", { ...args, content: "oops" }, true);
+    await call("ssh_read_file", { ...args, limit: 1 });
+    expect(await call("ssh_read_file", { ...args, offset: 2 })).not.toContain("modified since");
+    expect(await call("ssh_edit_file", { ...args, old_string: "two", new_string: "TWO" })).toContain("     2\tTWO");
+  });
+
+  test("only a delivered single-file Bash view records the revision under the command's cwd", async () => {
+    const directory = join(fixture.workspace, "viewing");
+    const cwd = join(fixture.workspace, "viewing-alias");
+    await mkdir(directory);
+    await symlink(directory, cwd);
+    const name = "two words.txt";
+    const args = { connection_id: dev, file_path: "~/viewing-alias/" + name };
+    await writeFile(join(cwd, name), "one\ntwo\n");
+    for (const command of ["cat 'two words.txt' | head -1", "cat 'two words.txt' >/dev/null", "cat 'two words.txt' 'two words.txt'"]) {
+      await call("ssh_bash", { connection_id: dev, command, cwd });
+      expect(await call("ssh_edit_file", { ...args, old_string: "one", new_string: "ONE" }, true)).toContain("FILE_NOT_READ");
+    }
+    await call("ssh_bash", { connection_id: dev, command: "sed -n '1,2p' 'two words.txt'", cwd });
+    await call("ssh_edit_file", { ...args, old_string: "one", new_string: "ONE" });
+    const background = await call("ssh_bash", { connection_id: dev, command: "cat 'two words.txt'", cwd, run_in_background: true });
+    await call("ssh_task_output", { ...taskScope(background), wait_seconds: 3 });
+    await call("ssh_write_file", { ...args, content: "last" });
+    await call("ssh_task_output", taskScope(background));
+    await call("ssh_edit_file", { ...args, old_string: "last", new_string: "latest" });
+    expect(await readFile(join(cwd, name), "utf8")).toBe("latest");
+
+    // A retained log may be delivered for the first time after a newer read or write.
+    const delayed = taskScope(await call("ssh_bash", { connection_id: dev, command: "cat 'two words.txt'", cwd, run_in_background: true }));
+    const completed = delayed.task_id + "  completed";
+    const deadline = Date.now() + 3000;
+    while (!(await call("ssh_task_list", { connection_id: dev })).includes(completed)) {
+      if (Date.now() > deadline) throw new Error("Background view did not finish");
+      await delay(10);
+    }
+    await call("ssh_write_file", { ...args, content: "new version" });
+    expect(await call("ssh_task_output", delayed)).toContain("latest");
+    await call("ssh_edit_file", { ...args, old_string: "new version", new_string: "edited new version" });
+
+    const homeFile = "home source#1.txt";
+    await writeFile(join(fixture.workspace, homeFile), "home\n");
+    expect(await call("ssh_bash", { connection_id: dev, command: "cat ~/'home source#1.txt'\n", cwd })).toBe("home\n");
+    await call("ssh_edit_file", { connection_id: dev, file_path: "~/" + homeFile, old_string: "home", new_string: "edited" });
+    await mkdir(join(cwd, "~"));
+    const literal = join(cwd, "~", homeFile);
+    await writeFile(literal, "local\n");
+    expect(await call("ssh_bash", { connection_id: dev, command: "cat '~/home source#1.txt'", cwd })).toBe("local\n");
+    await call("ssh_edit_file", { connection_id: dev, file_path: literal, old_string: "local", new_string: "edited local" });
+  });
+
+  test("reads non-UTF-8 text and permits clean rewrites while guarding exact edits and replacement characters", async () => {
+    const file_path = join(fixture.workspace, "sjis.txt");
+    const args = { connection_id: dev, file_path };
+    const original = Buffer.from([0x82, 0xa0, 0x0a]);
+    await writeFile(file_path, original);
+    expect(await call("ssh_read_file", args)).toContain("�");
+    expect(await call("ssh_edit_file", { ...args, old_string: "�", new_string: "あ" }, true)).toContain("Cannot edit non-UTF-8");
+    expect(await call("ssh_write_file", { ...args, content: "�" }, true)).toContain("U+FFFD");
+    expect(await readFile(file_path)).toEqual(original);
+    await call("ssh_write_file", { ...args, content: "あ\n" });
+    expect(await readFile(file_path, "utf8")).toBe("あ\n");
+    await call("ssh_write_file", { ...args, content: "literal � in valid UTF-8" });
+
+    await writeFile(file_path, Buffer.from("\uFEFFhello", "utf16le"));
+    expect(await call("ssh_read_file", args)).toContain("hello");
+    expect(await call("ssh_edit_file", { ...args, old_string: "hello", new_string: "world" }, true)).toContain("Cannot edit UTF-16");
+    await call("ssh_write_file", { ...args, content: "world" });
+    expect(await readFile(file_path, "utf8")).toBe("world");
   });
 
   test("fresh revisions remain usable across relative, absolute, and home-relative paths", async () => {
@@ -364,6 +469,48 @@ describe("remote files", () => {
     const sha256 = createHash("sha256").update(content).digest("hex");
     expect(downloaded).toBe(`Downloaded ${path} to ${localPath} (200000 bytes).\nSHA-256: ${sha256}`);
     expect(await readFile(localPath, "utf8")).toBe(content);
+  });
+
+  test("requires explicit pages for large text and refuses known binary extensions", async () => {
+    const connection_id = connectionId(await call("ssh_connect", { host: "fixture" }));
+    const file_path = "long-source.txt";
+    await writeFile(join(fixture.workspace, file_path), "a".repeat(99).concat("\n").repeat(3000));
+    for (const paging of [{}, { offset: 1 }, { offset: 1, limit: 3000 }]) {
+      expect(await call("ssh_read_file", { connection_id, file_path, ...paging }, true)).toContain("offset and limit");
+    }
+    const page = await call("ssh_read_file", { connection_id, file_path, limit: 2 });
+    expect(page).toContain("PARTIAL view: showing lines 1-2 of 3000.");
+    for (const ext of ["xlsx", "PARQUET", "heic", "zip"]) {
+      const binary = "binary-data." + ext;
+      await writeFile(join(fixture.workspace, binary), "pk");
+      expect(await call("ssh_read_file", { connection_id, file_path: binary }, true)).toContain("ssh_bash");
+    }
+    await symlink(file_path, join(fixture.workspace, "snapshot.xlsx"));
+    expect(await call("ssh_read_file", { connection_id, file_path: "snapshot.xlsx" }, true)).toContain("Binary file (.xlsx)");
+  });
+
+  test("renders notebook sources, streams and visualizations in cell order", async () => {
+    const connection_id = connectionId(await call("ssh_connect", { host: "fixture" }));
+    const file_path = "example.ipynb";
+    const image = paddedPng(300 * 1024).toString("base64");
+    await symlink("notebook-snapshot", join(fixture.workspace, file_path));
+    await writeFile(join(fixture.workspace, "notebook-snapshot"), JSON.stringify({ nbformat: 4, cells: [
+      { cell_type: "markdown", source: ["Plot\n", "example"] },
+      { cell_type: "code", source: "display(figure)", outputs: [
+        { output_type: "stream", name: "stdout", text: ["done\n"] },
+        { output_type: "display_data", data: { "image/png": image, "text/plain": "<Figure>" } },
+        { output_type: "execute_result", data: { "text/plain": ["42"] } },
+      ] },
+    ] }));
+    const result = await client.callTool({ name: "ssh_read_file", arguments: { connection_id, file_path } });
+    expect(Boolean(result.isError)).toBe(false);
+    expect(result.content).toEqual([
+      { type: "text", text: "Cell 1 (markdown)\nPlot\nexample" },
+      { type: "text", text: "Cell 2 (code)\ndisplay(figure)" },
+      { type: "text", text: "stdout:\ndone\n" },
+      { type: "image", mimeType: "image/png", data: image },
+      { type: "text", text: "42" },
+    ]);
   });
 
   test("reads remote image bytes as native MCP content and remembers their file revision", async () => {
@@ -529,7 +676,7 @@ describe("binary transfer boundary", () => {
 describe("Bash tasks and archives", () => {
   test("short commands return raw multiline text and archive exact bytes", async () => {
     const command = "printf 'ready\\n  indented\\n'; printf 'warning\\n' >&2";
-    const text = await call("ssh_bash", { connection_id: dev, command, wait_seconds: 300 });
+    const text = await call("ssh_bash", { connection_id: dev, command, wait_seconds: 600 });
     expect(text).toBe("ready\n  indented\n\nstderr:\nwarning\n");
     const path = await newestLog(dev);
     const log = await readFile(path);
@@ -568,6 +715,16 @@ describe("Bash tasks and archives", () => {
       connection_id: dev, command: "sleep 0.1; printf completed", wait_seconds: 0.5,
     });
     expect(fractional).toBe("completed");
+  });
+
+  test("expected exit 1 is accepted on the initial call while queries report the process exit", async () => {
+    const benign = await call("ssh_bash", { connection_id: dev, command: "grep 'not found' /dev/null" });
+    expect(benign).toContain("(completed)");
+    expect(benign).toContain("Exit code: 1");
+    const query = await call("ssh_task_output", { ...taskScope(benign), wait_seconds: 0 });
+    expect(query).toContain("(failed)");
+    expect(query).toContain("Exit code: 1");
+    expect(await call("ssh_bash", { connection_id: dev, command: "false" }, true)).toContain("Exit code: 1");
   });
 
   test("explicit background returns after startup even when a long foreground wait was supplied", async () => {
@@ -780,7 +937,7 @@ describe("Bash tasks and archives", () => {
     const manifest = JSON.parse(await readFile(join(build, "manifest.json"), "utf8"));
     expect(manifest.build_id).toBe(BUILD_ID);
     expect(manifest.protocol).toBe(1);
-    for (const name of ["worker.py", "file_ops.py", "helper.py", "archive.py", "build_cache.py", "workspace.py"]) {
+    for (const name of ["worker.py", "file_ops.py", "helper.py", "archive.py", "build_cache.py", "workspace.py", "read_formats.py"]) {
       expect((await lstat(join(build, name))).isFile()).toBe(true);
     }
     const before = (await lstat(join(build, "worker.py"))).mtimeMs;

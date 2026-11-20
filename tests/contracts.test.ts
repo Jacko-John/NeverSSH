@@ -217,7 +217,9 @@ test("connection, file, and transfer return examples match their text formatters
     ssh_close: format.closeText({ connection_id: "7a2c9d4f", remote_cleanup: "confirmed" }),
     ssh_read_file: format.readText({ content: 'import { createServer } from "node:http";\n\n', startLine: 1, totalLines: 2 }),
     ssh_write_file: format.writeText({ path: "/srv/app/notes.txt", created: true }),
-    ssh_edit_file: format.editText({ path: "/srv/app/notes.txt" }),
+    ssh_edit_file: format.editText({
+      path: "/srv/app/notes.txt", replacements: 1, preview: { lines: [{ line: 1, text: "world" }], truncated: false },
+    }),
     ssh_upload: format.uploadText({ path: "/srv/app/assets/logo.png", localPath: "/Users/me/transfer/logo.png", bytesWritten: 2048, sha256 }),
     ssh_download: format.downloadText({ path: "/srv/app/build/app.tar.gz", localPath: "/Users/me/transfer/app.tar.gz", size: 4096, sha256 }),
   };
@@ -233,7 +235,7 @@ test("workspace and skill return examples match their typed text formatters", as
   const source = await Bun.file(new URL("../docs/interfaces.md", import.meta.url)).text();
   const base: WorkspaceContext = {
     workspace_id: "ws_b8e3a160", connection_id: "7a2c9d4f", root: "/srv/app", paths: ["/srv/app"],
-    instructions: [], skills: [], project_files: [], git: null, warnings: [],
+    instructions: [], rule_scopes: ["/srv/app"], skills: [], project_files: [], git: null, warnings: [],
   };
   const examples = {
     ssh_workspace_open: contextText(base),
@@ -296,16 +298,16 @@ test("connection inputs reject host overrides on follow-up calls and invalid com
   }
 });
 
-test("waits use fractional seconds up to five minutes without a command timeout", () => {
+test("foreground and query waits accept fractional seconds and enforce distinct caps", () => {
   const cases = [
-    { schema: commandContracts.ssh_bash.input, args: { connection_id: "1234abcd", command: "true" } },
-    { schema: commandContracts.ssh_task_output.input, args: { task_id: "task_abcd1234" } },
+    { schema: commandContracts.ssh_bash.input, max: 600, args: { connection_id: "1234abcd", command: "true" } },
+    { schema: commandContracts.ssh_task_output.input, max: 300, args: { task_id: "task_abcd1234" } },
   ];
-  for (const { schema, args } of cases) {
-    for (const wait_seconds of [0, 0.5, 120, 300]) {
+  for (const { schema, args, max } of cases) {
+    for (const wait_seconds of [0, 0.5, 120, max - 0.5, max]) {
       expect(schema.safeParse({ ...args, wait_seconds }).success).toBe(true);
     }
-    for (const wait_seconds of [-0.1, 300.1, Infinity, NaN]) {
+    for (const wait_seconds of [-0.1, max + 0.1, Infinity, NaN]) {
       expect(schema.safeParse({ ...args, wait_seconds }).success).toBe(false);
     }
     expect(schema.safeParse({ ...args, wait_ms: 1000 }).success).toBe(false);

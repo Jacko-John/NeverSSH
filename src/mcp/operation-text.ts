@@ -34,8 +34,10 @@ export function readText(value: RemoteResult): string {
   if (!content && total === 0) return "File exists but is empty.";
   if (!content && start > total) return `File has ${total} lines; offset ${start} is past the end.`;
 
-  const lines = content.replace(/\n$/, "").split("\n").map((line, index) =>
-    `${String(start + index).padStart(6)}\t${line.replace(/\r$/, "")}`);
+  // Match the worker's Python splitlines boundaries, including CRLF as one separator.
+  const bodies = content.split(/\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]/u);
+  if (bodies.at(-1) === "") bodies.pop();
+  const lines = bodies.map((line, index) => `${String(start + index).padStart(6)}\t${line}`);
   if (value.truncated) {
     lines.push(`PARTIAL view: showing lines ${start}-${count(value.endLine)} of ${total}. Use offset=${count(value.nextLine)} to continue.`);
   }
@@ -48,7 +50,13 @@ export function writeText(value: RemoteResult): string {
 }
 
 export function editText(value: RemoteResult): string {
-  return `The file ${text(value.path)} has been updated successfully.`;
+  const preview = value.preview as { lines: { line: number; text: string }[]; truncated: boolean };
+  const lines = [`The file ${text(value.path)} has been updated successfully.`];
+  if (count(value.replacements) > 1) lines.push(`Replaced ${value.replacements} occurrences. Showing the first changed region.`);
+  for (const entry of preview.lines) lines.push(`${String(entry.line).padStart(6)}\t${entry.text}`);
+  if (!preview.lines.length) lines.push("File is now empty.");
+  if (preview.truncated) lines.push("… (preview shortened)");
+  return lines.join("\n");
 }
 
 export function uploadText(value: RemoteResult): string {

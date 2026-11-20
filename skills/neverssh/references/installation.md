@@ -54,6 +54,8 @@ claude mcp list
 
 Register an absolute path. MCP clients spawn the command directly, without a shell, so `~` is not expanded. A configuration that says `~/.local/bin/neverssh` fails with `ENOENT` even though the file exists.
 
+For the full 600-second foreground wait, allow at least 660 seconds for tool calls, including any idle deadline. In Claude Code set `"timeout": 660000` on the `neverssh` server entry in `.mcp.json`. This value is in milliseconds. [Claude Code timeout settings](https://code.claude.com/docs/en/env-vars)
+
 ### JSON configuration for other clients
 
 ```json
@@ -67,7 +69,7 @@ Register an absolute path. MCP clients spawn the command directly, without a she
 }
 ```
 
-Omit `args` when using the default configuration. Use the absolute path in `command`.
+Omit `args` when using the default configuration. Use the absolute path in `command`. Set the client’s tool-call and idle timeouts to at least 660 seconds using that client’s settings.
 
 GUI clients do not inherit a terminal environment. Make sure the client can find `ssh`, `bun`, and the user's SSH agent through `SSH_AUTH_SOCK`. If Bun is not on the GUI `PATH`, use the source form below with an absolute Bun path.
 

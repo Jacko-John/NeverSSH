@@ -1,7 +1,6 @@
 /** Present command results as readable MCP text while preserving program whitespace. */
 import type { TaskResult, TaskSummary } from "./manager";
-
-type View = "bash" | "query" | "stop";
+import { acceptsExitOne } from "./simple-command";
 
 /** Include exact bytes so agents can choose a bounded log-reading strategy. */
 function size(bytes: number): string {
@@ -44,8 +43,8 @@ function log(task: TaskResult, hint = false): string {
 }
 
 /** A successful short command needs no handle; background and incomplete results do. */
-function bashHeader(task: TaskResult): string[] {
-  const lines = [`Task: ${task.task_id} (${status(task)})`];
+function bashHeader(task: TaskResult, acceptedExitOne: boolean): string[] {
+  const lines = [`Task: ${task.task_id} (${acceptedExitOne ? "completed" : status(task)})`];
   if (task.reason && task.reason !== "connection_lost") lines.push(`Reason: ${task.reason}`);
   if (task.finished) lines.push(`Exit code: ${task.exit_code ?? "unknown"}`);
   if (!task.size_known) lines.push(`Last confirmed output size: ${size(task.output_bytes)}; remote file size may differ`);
@@ -89,16 +88,19 @@ export function taskListText(tasks: TaskSummary[]): string {
     `${task.task_id}  ${listStatus(task)}  ${task.connection_id}  ${task.output_file || "-"}`).join("\n");
 }
 
-/** Keep the first line unambiguous for clients that read task handles from text. */
-export function taskText(task: TaskResult, view: View = "bash"): string {
-  if (view === "bash") {
-    const output = programOutput(task, false);
-    if (task.finished && task.reason === undefined && task.exit_code === 0 &&
-        task.preview_complete && task.output_complete && task.size_known) return output;
-    const header = bashHeader(task).join("\n");
-    return output ? `${header}\n\n${output}` : header;
-  }
+/** Classify the initial invocation while preserving its real exit code for later task queries. */
+export function bashResult(task: TaskResult, command: string): { text: string; isError: boolean } {
+  const output = programOutput(task, false);
+  if (task.finished && task.reason === undefined && task.exit_code === 0 &&
+      task.preview_complete && task.output_complete && task.size_known) return { text: output, isError: false };
+  const acceptedExitOne = task.finished && task.reason === undefined && task.exit_code === 1 && acceptsExitOne(command);
+  const isError = task.finished && (task.reason !== undefined || (task.exit_code !== 0 && !acceptedExitOne));
+  const header = bashHeader(task, acceptedExitOne).join("\n");
+  return { text: output ? `${header}\n\n${output}` : header, isError };
+}
 
+/** Queries and stops report the recorded process status regardless of command interpretation. */
+export function taskText(task: TaskResult, view: "query" | "stop"): string {
   const output = programOutput(task, true);
   const header = reportHeader(task, view === "stop").join("\n");
   return output ? `${header}\n\n${output}` : header;

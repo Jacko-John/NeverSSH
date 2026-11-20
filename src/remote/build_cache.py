@@ -253,6 +253,7 @@ def main(payload):
         build_dir, lease = ensure_build(payload)
         payload["buildDir"] = build_dir
         payload["fileOpsSource"] = read_text(os.path.join(build_dir, "file_ops.py"))
+        payload["readFormatsSource"] = read_text(os.path.join(build_dir, "read_formats.py"))
         payload["workspaceSource"] = read_text(os.path.join(build_dir, "workspace.py"))
         payload["archiveSource"] = read_text(os.path.join(build_dir, "archive.py"))
         source = read_text(os.path.join(build_dir, "worker.py"))

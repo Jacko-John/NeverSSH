@@ -4,11 +4,13 @@ The connection worker launches this source only for Bash requests. File operatio
 run inside the persistent worker and do not load this module.
 """
 import base64
+import hashlib
 import json
 import os
 import selectors
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -32,7 +34,43 @@ def die_with_parent():
         pass
 
 
-def command_session():
+def file_stamp(info):
+    """A rename, rewrite, or truncation during the view invalidates the observation."""
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def view_stamp(path, limit):
+    try:
+        info = os.stat(path)
+        if stat.S_ISREG(info.st_mode) and info.st_size <= limit:
+            return file_stamp(info)
+    except OSError:
+        pass  # The command itself reports missing or unreadable operands.
+
+
+def viewed_revision(path, stamp, limit, requested_cwd):
+    """Hash only the bounded regular file that stayed in place throughout the Bash view."""
+    if stamp is None:
+        return None
+    try:
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as handle:
+            if file_stamp(os.fstat(handle.fileno())) != stamp:
+                return None
+            data = handle.read(limit + 1)
+            canonical = os.path.realpath(path)
+            if len(data) == stamp[2] and file_stamp(os.stat(canonical)) == stamp:
+                # getcwd() resolves symlinked directories. Keep the caller's lexical alias
+                # only while it still points to the same file (including paths with '..').
+                request_path = os.path.normpath(os.path.join(requested_cwd, path))
+                if os.path.realpath(request_path) != canonical:
+                    request_path = canonical
+                return {"path": canonical, "requestPath": request_path,
+                        "sha256": hashlib.sha256(data).hexdigest()}
+    except OSError:
+        pass  # Revision tracking is optional when a file disappears during the command.
+
+
+def command_session(requested_cwd):
     """Run one noninteractive Bash with a private archive and an owned process group."""
     bash = shutil.which("bash")
     if bash is None:
@@ -75,6 +113,8 @@ def command_session():
     previous = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
     try:
         archive = store.new_task(request["connectionId"], args["taskId"], args["command"])
+        view = args.get("view")
+        stamp = view_stamp(view["path"], request["maxFileBytes"]) if view else None
         # Shell configuration and environment changes belong only to this process.
         child = subprocess.Popen([bash, "--noprofile", "--norc", "-c", args["command"]],
                                  cwd=os.getcwd(), stdin=subprocess.DEVNULL,
@@ -179,7 +219,10 @@ def command_session():
             signal.signal(sig, handler)
         if cleanup_error is not None:
             raise cleanup_error
-    emit({"event": "exit", "exitCode": child.returncode, "reason": reason,
+    revision = None
+    if stamp is not None and reason is None and (child.returncode == 0 or (view["search"] and child.returncode == 1)):
+        revision = viewed_revision(view["path"], stamp, request["maxFileBytes"], requested_cwd)
+    emit({"event": "exit", "exitCode": child.returncode, "reason": reason, "viewedFile": revision,
           "message": message, "outputBytes": archive.bytes,
           "outputComplete": output_complete})
 
@@ -191,8 +234,10 @@ args = request.get("args", {})
 
 try:
     die_with_parent()
-    os.chdir(os.path.expanduser(request["cwd"]))
-    command_session()
+    cwd = os.path.expanduser(request["cwd"])
+    requested_cwd = os.path.abspath(cwd)
+    os.chdir(cwd)
+    command_session(requested_cwd)
 except Exception as error:
     code = getattr(error, "code", type(error).__name__)
     emit({"ok": False, "error": {"code": code,

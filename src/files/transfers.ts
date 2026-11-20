@@ -59,7 +59,7 @@ export async function transferPath(config: Config, filename: string, writing: bo
 }
 
 /** Expand tilde against HOME, while ordinary relative paths resolve against the requested base. */
-function remotePath(value: string, base: string, home = base): string {
+export function remotePath(value: string, base: string, home = base): string {
   const expanded = value === "~" ? home : value.startsWith("~/") ? posix.join(home, value.slice(2)) : value;
   return expanded.startsWith("/") ? posix.normalize(expanded) : posix.normalize(posix.join(base, expanded));
 }

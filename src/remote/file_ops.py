@@ -2,16 +2,23 @@
 import base64
 import errno
 import hashlib
+import itertools
 import os
+import re
 import shutil
 import stat
 import sys
 import tempfile
 import threading
 
+import read_formats
+
 
 # Fixed lock striping bounds memory while aliases of one canonical path share admission.
 PATH_LOCKS = tuple(threading.Lock() for _ in range(64))
+# Match str.splitlines(), including CRLF as a single line boundary.
+LINE_BREAKS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+LINE_BOUNDARY = re.compile("\r\n|[" + LINE_BREAKS + "]")
 
 
 def mutation_lock(filename):
@@ -40,7 +47,7 @@ def load_bytes(filename, limit, follow_symlinks=True):
         if not stat.S_ISREG(info.st_mode):
             raise ValueError("Expected a regular file")
         if info.st_size > limit:
-            raise ValueError("File exceeds maxFileBytes; use an explicit SSH transfer for larger files")
+            raise ValueError("File exceeds maxFileBytes; inspect or convert it on the remote host with ssh_bash")
         data = handle.read(limit + 1)
         if len(data) > limit:
             raise ValueError("File grew beyond maxFileBytes")
@@ -52,24 +59,36 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def image_mime_type(data):
-    """Recognize common image encodings by signature without decoding their pixels."""
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if data.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if data.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif"
-    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
-        return "image/webp"
-    return None
-
-
-def text_from(data):
-    """Require UTF-8 for text reads and edits; read_file handles recognized images separately."""
+def text_from(data, lossy=False):
+    """Allow replacement characters for display while keeping exact edits UTF-8 only."""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        if lossy:
+            return data.decode("utf-16", errors="replace")
+        raise ValueError("Cannot edit UTF-16 text. Use ssh_write_file with clean UTF-8 text "
+                         "or convert its encoding with ssh_bash.")
     if b"\x00" in data:
-        raise ValueError("Binary file: use download instead of text tools")
-    return data.decode("utf-8")
+        raise ValueError("Binary file: inspect it with a format-specific tool or replace it with ssh_upload")
+    try:
+        return data.decode("utf-8", errors="replace" if lossy else "strict")
+    except UnicodeDecodeError:
+        raise ValueError("Cannot edit non-UTF-8 text. Read it with ssh_read_file and supply clean UTF-8 "
+                         "content to ssh_write_file, or convert its encoding with ssh_bash.") from None
+
+
+def line_spans(text):
+    """Yield start, body end and end offsets without allocating a list for the whole file."""
+    start = 0
+    for match in LINE_BOUNDARY.finditer(text):
+        yield start, match.start(), match.end()
+        start = match.end()
+    if start < len(text):
+        yield start, len(text), len(text)
+
+
+def line_count(text):
+    """Count line boundaries in native string scans, also accounting for an unterminated tail."""
+    breaks = sum(text.count(character) for character in LINE_BREAKS) - text.count("\r\n")
+    return breaks + int(bool(text) and text[-1] not in LINE_BREAKS)
 
 
 def fsync_directory(path):
@@ -124,31 +143,63 @@ def atomic_write(filename, data, original, expected, limit):
 
 
 def read_file(request):
-    """Return a recognized image or bounded UTF-8 lines, with the full-file revision."""
+    """Return a view of one bounded file snapshot with its exact revision."""
     args = request.get("args", {})
     filename = os.path.realpath(path_for(args["path"], request["cwd"]))
     data, _ = load_bytes(filename, request["maxFileBytes"])
-    mime_type = image_mime_type(data)
+    # Workspace validation follows symlinks; the user's filename can still identify the format.
+    requested = args.get("requestedPath", args["path"])
+    suffix = os.path.splitext(requested)[1].lower()
+    if suffix not in (".ipynb", ".pdf"):
+        suffix = os.path.splitext(filename)[1].lower()
+    if "pages" in args and suffix != ".pdf":
+        raise ValueError("The pages parameter is for PDF files; use offset and limit for text")
+    mime_type = read_formats.image_mime_type(data)
     if mime_type is not None:
         return {"kind": "image", "mimeType": mime_type,
                 "base64": base64.b64encode(data).decode("ascii"),
                 "path": filename, "size": len(data), "sha256": digest(data)}
-    lines = text_from(data).splitlines(keepends=True)
+    if suffix in (".ipynb", ".pdf"):
+        if suffix == ".ipynb":
+            result = read_formats.read_notebook(data, request["maxFileBytes"])
+        else:
+            result = read_formats.read_pdf(data, request)
+        result.update(path=filename, size=len(data), sha256=digest(data))
+        return result
+    extension = read_formats.binary_extension(requested) or read_formats.binary_extension(filename)
+    if extension:
+        raise ValueError("Binary file (%s): use a format-specific skill or inspect it with an appropriate "
+                         "reader through ssh_bash" % extension)
     start = args.get("startLine", 1) - 1
-    selected = []
-    used = 0
-    for line in lines[start:start + args.get("lineCount", 2000)]:
-        size = len(line.encode("utf-8"))
-        if used + size > args.get("maxBytes", 262144):
-            if not selected:
+    count = args.get("lineCount", 2000)
+    oversized = start == 0 and len(data) > read_formats.TEXT_READ_BYTES
+    paging_hint = ("Whole-file read exceeds 256 KiB. Read a smaller range with offset and limit "
+                   "or search with rg through ssh_bash.")
+    if oversized and "lineCount" not in args:
+        raise ValueError(paging_hint)
+    text = text_from(data, lossy=True)
+    total = line_count(text)
+    if oversized and count >= total:
+        raise ValueError(paging_hint)
+    first = last = len(text)
+    end = min(start, total)
+    remaining = args.get("maxBytes", read_formats.TEXT_READ_BYTES)
+    for left, _, right in itertools.islice(line_spans(text), end, min(start + count, total)):
+        # A UTF-8 character occupies at least one byte. Avoid copying very long lines just to reject them.
+        size = right - left
+        if size <= remaining and not text.isascii():
+            size = len(text[left:right].encode("utf-8"))
+        if size > remaining:
+            if end == start:
                 raise ValueError("Line exceeds the read byte budget; read a narrower range or download the file")
             break
-        selected.append(line)
-        used += size
-    end = min(start, len(lines)) + len(selected)
-    return {"path": filename, "content": "".join(selected), "startLine": start + 1,
-            "endLine": end, "totalLines": len(lines), "truncated": end < len(lines),
-            "nextLine": end + 1 if end < len(lines) else None,
+        first = min(first, left)
+        last = right
+        end += 1
+        remaining -= size
+    return {"path": filename, "content": text[first:last], "startLine": start + 1,
+            "endLine": end, "totalLines": total, "truncated": end < total,
+            "nextLine": end + 1 if end < total else None,
             "size": len(data), "sha256": digest(data)}
 
 
@@ -167,18 +218,69 @@ def write_file(request):
                 raise ValueError("Content conflict: expected file does not exist")
         if original is not None:
             if expected is None:
-                raise ValueError("File exists: read it with ssh_read_file first")
+                binary = read_formats.binary_extension(filename) or b"\x00" in current
+                readable_media = (read_formats.image_mime_type(current) or current.startswith((b"\xff\xfe", b"\xfe\xff"))
+                                  or filename.lower().endswith(".pdf"))
+                if binary and not readable_media:
+                    raise ValueError("Binary file: use ssh_upload with overwrite=true to replace it, "
+                                     "or use a format-specific command through ssh_bash.")
+                raise ValueError("File exists: read it with ssh_read_file first, through the last page. "
+                                 "For a file the reader cannot open, use ssh_upload with overwrite=true to replace it.")
             if digest(current) != expected:
                 raise ValueError("Content conflict: file changed since it was read; read it again")
         data = base64.b64decode(args["base64"], validate=True)
+        if original is not None and b"\xef\xbf\xbd" in data:
+            try:
+                current.decode("utf-8")
+            except UnicodeDecodeError:
+                raise ValueError("Cannot overwrite non-UTF-8 text with U+FFFD replacement characters. "
+                                 "Supply clean UTF-8 text or convert the original encoding with ssh_bash.") from None
         result = atomic_write(filename, data, original, expected, limit)
         result["created"] = original is None
         return result
 
 
+def edit_preview(content, match, old, new):
+    """Show the first replacement in the committed text, with two nearby lines on each side."""
+    # A caller may include substantial unchanged text to make the match unique.
+    prefix = 0
+    common = min(len(old), len(new))
+    while prefix < common and old[prefix] == new[prefix]:
+        prefix += 1
+    suffix = 0
+    while suffix < common - prefix and old[-1 - suffix] == new[-1 - suffix]:
+        suffix += 1
+    start = match + prefix
+    end = start + max(1, len(new) - prefix - suffix)
+
+    before = []
+    preview = []
+    following = 0
+    for number, (offset, body_end, line_end) in enumerate(line_spans(content), 1):
+        column = max(0, start - offset) if offset <= start < line_end else 0
+        left = max(0, column - 100)
+        right = min(offset + left + 512, body_end)
+        excerpt = ("…" if left else "") + content[offset + left:right] + ("…" if right < body_end else "")
+        entry = {"line": number, "text": excerpt}
+        if line_end <= start:
+            before = (before + [entry])[-2:]
+        else:
+            if offset >= end:
+                following += 1
+            if following > 2:
+                break
+            if len(preview) == 12:
+                return {"lines": before + preview, "truncated": True}
+            preview.append(entry)
+    return {"lines": before + preview, "truncated": False}
+
+
 def edit_file(request):
     """Apply one exact replacement, mirroring Claude Code's Edit semantics."""
     args = request.get("args", {})
+    old, new = args["oldText"], args["newText"]
+    if old == new:
+        raise ValueError("No changes to make: old_string and new_string are exactly the same.")
     filename = os.path.realpath(path_for(args["path"], request["cwd"]))
     with mutation_lock(filename):
         data, info = load_bytes(filename, request["maxFileBytes"])
@@ -186,19 +288,23 @@ def edit_file(request):
         if args.get("expectedSha256", revision) != revision:
             raise ValueError("Content conflict: file changed since it was read; read it again before editing")
         content = text_from(data)
-        old = args["oldText"]
         if not old:
             raise ValueError("oldText must not be empty")
         found = content.count(old)
         if args.get("replaceAll", False):
             if found == 0:
                 raise ValueError("oldText not found; file was not changed")
-            content = content.replace(old, args["newText"])
         else:
             if found != 1:
                 raise ValueError("Expected exactly one occurrence of oldText, found %d; file was not changed" % found)
-            content = content.replace(old, args["newText"], 1)
-        return atomic_write(filename, content.encode("utf-8"), info, revision, request["maxFileBytes"])
+        limit = request["maxFileBytes"]
+        if len(data) + found * (len(new.encode("utf-8")) - len(old.encode("utf-8"))) > limit:
+            raise ValueError("Content exceeds maxFileBytes")
+        updated = content.replace(old, new)
+        preview = edit_preview(updated, content.index(old), old, new)
+        result = atomic_write(filename, updated.encode("utf-8"), info, revision, limit)
+        result.update(preview=preview, replacements=found)
+        return result
 
 
 def commit_upload(request):

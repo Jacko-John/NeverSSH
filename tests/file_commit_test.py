@@ -2,15 +2,39 @@
 import base64
 import os
 from pathlib import Path
+import shutil
 import stat
 import sys
 import tempfile
 import threading
+import time
+import tracemalloc
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "remote"))
 import file_ops
+import read_formats
+
+
+def pdf_bytes(pages):
+    """Build a valid PDF with identical blank pages without any PDF-writing dependencies."""
+    kids = " ".join("%d 0 R" % (index + 3) for index in range(pages))
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>",
+               ("<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, pages)).encode()]
+    objects.extend([b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>"] * pages)
+    data = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for index, content in enumerate(objects, 1):
+        offsets.append(len(data))
+        data.extend(("%d 0 obj\n" % index).encode() + content + b"\nendobj\n")
+    xref = len(data)
+    size = len(objects) + 1
+    data.extend(("xref\n0 %d\n0000000000 65535 f \n" % size).encode())
+    for offset in offsets:
+        data.extend(("%010d 00000 n \n" % offset).encode())
+    data.extend(("trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (size, xref)).encode())
+    return bytes(data)
 
 
 class FileCommitTests(unittest.TestCase):
@@ -97,6 +121,96 @@ class FileCommitTests(unittest.TestCase):
         for target in (directory, fifo):
             with self.subTest(path=target.name), self.assertRaises((ValueError, IsADirectoryError)):
                 file_ops.dispatch(self.request("read", path=target.name))
+
+    def test_paging_a_line_dense_file_keeps_memory_proportional_to_its_bytes(self):
+        size = 2 * 1024 * 1024
+        (self.root / "blank-lines.txt").write_bytes(b"\n" * size)
+        request = self.request("read", path="blank-lines.txt", startLine=2, lineCount=2)
+        request["maxFileBytes"] = size
+        tracemalloc.start()
+        try:
+            result = file_ops.dispatch(request)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(result["content"], "\n\n")
+        self.assertEqual(result["totalLines"], size)
+        self.assertEqual(result["nextLine"], 4)
+        self.assertLess(peak, 4 * size)
+
+    def test_pdf_dependency_error_identifies_the_remote_tool(self):
+        (self.root / "example.pdf").write_bytes(pdf_bytes(1))
+        with patch.dict(os.environ, {"PATH": str(self.root)}):
+            with self.assertRaisesRegex(ValueError, "pdftoppm is not installed"):
+                file_ops.dispatch(self.request("read", path="example.pdf"))
+
+    def test_pdf_renderer_reaps_fast_overflow_and_cancelled_processes(self):
+        for cancel, command, error, message in (
+            (False, ["/bin/sh", "-c", "printf 123456789"], ValueError, "exceeds the read budget"),
+            (True, ["sleep", "30"], InterruptedError, "PDF read cancelled"),
+        ):
+            with self.subTest(command=command), tempfile.TemporaryFile() as snapshot:
+                children = []
+                stopped = threading.Event()
+                popen = read_formats.subprocess.Popen
+
+                def start(*args, **kwargs):
+                    child = popen(*args, **kwargs)
+                    children.append(child)
+                    if cancel:
+                        stopped.set()
+                    return child
+
+                with patch.object(read_formats.subprocess, "Popen", side_effect=start):
+                    with self.assertRaisesRegex(error, message):
+                        read_formats.poppler_output(command, snapshot, 8, time.monotonic() + 2, stopped)
+                self.assertTrue(children[0].stdout.closed)
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(children[0].pid, os.WNOHANG)
+
+    def test_pdf_page_ranges_are_checked_before_rendering(self):
+        for pages, total in ((None, 11), ("3-1", 3), ("2-4", 3), ("1-21", 21), ("0", 21)):
+            with self.subTest(pages=pages), self.assertRaises(ValueError):
+                read_formats.pdf_page_range(pages, total)
+        self.assertEqual(read_formats.pdf_page_range("2-21", 21), (2, 21))
+        self.assertEqual(read_formats.pdf_page_range(None, 10), (1, 10))
+
+    @unittest.skipUnless(shutil.which("pdftoppm") and shutil.which("pdfinfo"), "remote renderer requires Poppler")
+    def test_real_pdf_pages_are_images_from_the_recorded_revision(self):
+        target = self.root / "example.pdf"
+        for total, pages, first, last in ((1, None, 1, 1), (23, "4-5", 4, 5)):
+            data = pdf_bytes(total)
+            target.write_bytes(data)
+            args = {"pages": pages} if pages else {}
+            result = file_ops.dispatch(self.request("read", path=target.name, **args))
+            self.assertEqual(result["sha256"], file_ops.digest(data))
+            self.assertEqual(result["truncated"], total != 1)
+            blocks = result["blocks"]
+            self.assertEqual(len(blocks), (last - first + 1) * 2)
+            for index, page in enumerate(range(first, last + 1)):
+                self.assertEqual(blocks[index * 2], {"type": "text", "text": "Page %d of %d" % (page, total)})
+                image = blocks[index * 2 + 1]
+                self.assertEqual(image["mimeType"], "image/png")
+                self.assertTrue(base64.b64decode(image["data"], validate=True).startswith(b"\x89PNG\r\n\x1a\n"))
+
+    def test_edit_previews_show_the_difference_inside_a_large_unique_match(self):
+        target = self.root / "preview.txt"
+        for prefix in ("context\n" * 20, "x" * 800):
+            with self.subTest(prefix=prefix[:8]):
+                old = prefix + "before" + "\nsuffix" * 20
+                new = prefix + "after" + "\nsuffix" * 20
+                target.write_text(old)
+                result = file_ops.dispatch(self.request("edit", path=target.name, oldText=old, newText=new))
+                lines = result["preview"]["lines"]
+                self.assertTrue(any("after" in line["text"] for line in lines))
+                self.assertLessEqual(len(lines), 5)
+
+    def test_deleting_the_whole_file_returns_an_empty_preview(self):
+        target = self.root / "empty.txt"
+        target.write_bytes(b"remove me")
+        result = file_ops.dispatch(self.request("edit", path=target.name, oldText="remove me", newText=""))
+        self.assertEqual(result["preview"], {"lines": [], "truncated": False})
+        self.assertEqual(target.read_bytes(), b"")
 
     def test_concurrent_edit_write_and_upload_recheck_the_revision_after_admission(self):
         # Pause the first writer after its final hash check, exposing the original lost-update window.

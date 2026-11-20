@@ -15,10 +15,11 @@ const warnings = z.array(z.string().max(8192)).max(2048);
 const remoteContextSchema = z.strictObject({
   root: absolutePath,
   paths: z.array(absolutePath).min(1).max(64),
+  rule_scope_leaves: z.array(absolutePath).min(1).max(256),
   instructions: z.array(z.strictObject({ path: absolutePath, scope: absolutePath, sha256: digest, content: z.string().max(131072) })).max(MAX_KNOWN_RULES),
   skill_files: z.array(z.strictObject({ path: absolutePath, scope: absolutePath, content: z.string().max(65536) })).max(128),
   project_files: z.array(absolutePath).max(8192),
-  git: z.strictObject({ root: absolutePath.nullable(), branch: z.string().nullable(), status: z.string().max(65536), truncated: z.boolean() }).nullable(),
+  git: z.strictObject({ root: absolutePath.nullable(), branch: z.string().nullable(), status: z.string().max(65536), omitted: z.number().int().nonnegative() }).nullable(),
   warnings,
 });
 const remoteSkillSchema = z.strictObject({
@@ -88,13 +89,20 @@ function skillCatalog(root: string, files: RemoteContext["skill_files"], warning
 
 /** Validate remote context and parse skill metadata without changing delivery history. */
 function contextDetails(remote: RemoteContext, root: string, catalog: boolean): ContextDetails {
-  if (remote.root !== root || remote.paths.some((path) => !within(root, path))) {
+  if (remote.root !== root || [...remote.paths, ...remote.rule_scope_leaves].some((path) => !within(root, path))) {
     throw new ToolError("WORKSPACE_PATH_CHANGED", "Workspace paths changed; reopen the project with ssh_workspace_open before continuing");
   }
-  const { skill_files, ...details } = remote;
+  const { skill_files, rule_scope_leaves, ...details } = remote;
+  const inspected = new Set<string>();
+  for (const leaf of rule_scope_leaves) {
+    for (let scope = leaf; !inspected.has(scope); scope = posix.dirname(scope)) {
+      inspected.add(scope);
+      if (scope === root) break;
+    }
+  }
   const warnings = [...details.warnings];
   const skills = catalog ? skillCatalog(root, skill_files, warnings) : [];
-  return { ...details, skills, warnings };
+  return { ...details, rule_scopes: [...inspected], skills, warnings };
 }
 
 /** Own bounded project state for one MCP process; reconnecting requires opening a new handle. */
@@ -152,7 +160,7 @@ export class WorkspaceManager {
   }
 
   /** Resolve the project path and collect guidance for the operation's eventual response. */
-  async prepare(scope: WorkspaceScope, path: string, signal?: AbortSignal): Promise<PreparedScope> {
+  async prepare(scope: WorkspaceScope, path: string, signal?: AbortSignal, intent: "inspect" | "mutate" = "inspect"): Promise<PreparedScope> {
     this.validateScope(scope);
     checkAbort(signal);
     if (scope.connection_id !== undefined) {
@@ -161,6 +169,9 @@ export class WorkspaceManager {
     }
     const workspace = this.get(scope.workspace_id);
     const epoch = workspace.epoch;
+    // A concurrent call can deliver rules while inspection is in flight. That delivery
+    // cannot authorize a mutation the caller already issued before seeing the rules.
+    const knownAtStart = intent === "mutate" ? new Map(workspace.rules) : undefined;
     const remote = remoteContextSchema.parse(await this.ssh.run(workspace.connectionId, "workspace_context", {
       root: workspace.root, paths: [path],
     }, workspace.root, signal));
@@ -172,7 +183,24 @@ export class WorkspaceManager {
     }
     const context = this.contextResult(workspace, contextDetails(remote, workspace.root, false), false);
     // The worker returns the lexical path followed by its checked canonical target, if different.
-    return { connectionId: workspace.connectionId, path: context.paths.at(-1)!, context };
+    const prepared = { connectionId: workspace.connectionId, path: context.paths.at(-1)!, context };
+    if (knownAtStart) {
+      const delta = this.instructionDelta(knownAtStart, context);
+      if (delta.updated.length || delta.removed.length) return { ...prepared, needsRuleReview: true };
+    }
+    return prepared;
+  }
+
+  /** Recheck the delivery generation and any intervening rule changes immediately before dispatch. */
+  mutationNeedsReview(prepared: PreparedScope): boolean {
+    if (!prepared.context) return false;
+    const pending = this.currentDelivery(prepared.context);
+    if (!pending || pending.workspace.rulesOverflow) {
+      throw new ToolError("WORKSPACE_REOPEN_REQUIRED", "Workspace guidance changed during preparation. Reopen with ssh_workspace_open, then retry. Nothing was executed.");
+    }
+    if (prepared.needsRuleReview) return true;
+    const delta = this.instructionDelta(pending.workspace.rules, prepared.context);
+    return Boolean(delta.updated.length || delta.removed.length);
   }
 
   /** Resolve cwd without changing other calls' defaults; the remote inspection checks symlinks. */
@@ -188,7 +216,7 @@ export class WorkspaceManager {
   /** Preserve completed operation results while suppressing guidance from retired workspace state. */
   guidance(context: WorkspaceContext): InstructionDelta {
     const pending = this.currentDelivery(context);
-    return pending ? this.instructionDelta(pending.workspace, context) : { updated: [], removed: [] };
+    return pending ? this.instructionDelta(pending.workspace.rules, context) : { updated: [], removed: [] };
   }
 
   /** Remember applicable state after successful delivery; unchanged rules were delivered earlier. */
@@ -197,11 +225,9 @@ export class WorkspaceManager {
     this.pending.delete(context);
     if (!pending) return;
     const { workspace, catalog } = pending;
-    const current = new Set(context.instructions.map((rule) => rule.path));
-    for (const [path, rule] of workspace.rules) {
-      if (context.paths.some((target) => within(rule.scope, target)) && !current.has(path)) workspace.rules.delete(path);
-    }
-    for (const rule of context.instructions) {
+    const delta = this.instructionDelta(workspace.rules, context);
+    for (const rule of delta.removed) workspace.rules.delete(rule.path);
+    for (const rule of delta.updated) {
       if (!workspace.rules.has(rule.path) && workspace.rules.size >= MAX_KNOWN_RULES) {
         // Forgetting an old rule could miss its later deletion. Require reopening instead.
         workspace.rulesOverflow = true;
@@ -272,11 +298,13 @@ export class WorkspaceManager {
   }
 
   /** Return only rule changes that need presentation in the operation result. */
-  private instructionDelta(workspace: Workspace, context: WorkspaceContext): InstructionDelta {
+  private instructionDelta(known: ReadonlyMap<string, KnownRule>, context: WorkspaceContext): InstructionDelta {
     const current = new Set(context.instructions.map((rule) => rule.path));
-    const updated = context.instructions.filter((rule) => workspace.rules.get(rule.path)?.sha256 !== rule.sha256);
-    const removed = [...workspace.rules].filter(([path, rule]) =>
-      context.paths.some((target) => within(rule.scope, target)) && !current.has(path))
+    // A path through multiple directory links can inspect scopes outside both endpoint ancestry chains.
+    const inspected = new Set(context.rule_scopes);
+    const updated = context.instructions.filter((rule) => known.get(rule.path)?.sha256 !== rule.sha256);
+    const removed = [...known].filter(([path, rule]) =>
+      inspected.has(rule.scope) && !current.has(path))
       .map(([path, rule]) => ({ path, scope: rule.scope }));
     return { updated, removed };
   }

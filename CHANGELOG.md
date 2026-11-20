@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.0
+
+### Upgrade notes
+
+- Read text files over 256 KiB in pages using `offset` and `limit`. Editing or overwriting an existing file requires a complete read of the current revision, a qualifying single-file Bash view, or a prior write.
+- Workspace writes, edits, and uploads pause when applicable `AGENTS.md` rules have changed. Review the returned guidance and retry the operation.
+- Read clients should display ordered text and image blocks for notebooks and PDFs. PDF rendering requires `pdfinfo` and `pdftoppm` on the remote host.
+
+### Changes
+
+- Display Jupyter cells and saved outputs. Render PDFs up to 10 pages in full or select up to 20 pages per request with `pages`. Reads identify known binary formats and suggest a format-specific reader.
+- Show nearby numbered lines after an exact edit. Identical replacements leave the file and its recorded revision untouched. Re-reading externally modified content reports the change.
+- Display non-UTF-8 text and allow clean UTF-8 overwrites. Exact edits require UTF-8. Overwrites of non-UTF-8 text reject U+FFFD replacement characters.
+- Allow foreground Bash waits up to 600 seconds. Set the MCP client's tool-call timeout to at least 660 seconds to use the full wait. Standalone searches, comparisons, and predicates can return exit code 1 as an ordinary result.
+- Show up to 50 Git status entries when opening a workspace, with the omitted count and a command for the full listing.
+
 ## 0.4.0
 
 ### Breaking changes

@@ -8,12 +8,13 @@ export type Instruction = { path: string; scope: string; sha256: string; content
 export type SkillSummary = {
   name: string; callName: string; description: string; path: string; directory: string; scope: string;
 };
-export type GitSummary = { root: string | null; branch: string | null; status: string; truncated: boolean };
+export type GitSummary = { root: string | null; branch: string | null; status: string; omitted: number };
 export type WorkspaceContext = {
   workspace_id: string;
   connection_id: string;
   root: string;
   paths: string[];
+  rule_scopes: string[];
   instructions: Instruction[];
   skills: SkillSummary[];
   project_files: string[];
@@ -24,7 +25,7 @@ export type InstructionDelta = {
   updated: Instruction[];
   removed: Pick<Instruction, "path" | "scope">[];
 };
-export type PreparedScope = { connectionId: string; path: string; context?: WorkspaceContext };
+export type PreparedScope = { connectionId: string; path: string; context?: WorkspaceContext; needsRuleReview?: true };
 export type SkillRead = {
   workspace_id: string; connection_id: string; name: string;
   path: string; directory: string; execution: "remote"; content: string; sha256: string;

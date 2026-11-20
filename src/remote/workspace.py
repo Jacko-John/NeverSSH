@@ -18,6 +18,7 @@ RESOURCE_COUNT = 128
 PROJECT_COUNT = 128
 SCAN_ENTRIES = 512
 GIT_BYTES = 65536
+GIT_STATUS_ENTRIES = 50
 GIT_TIMEOUT = 5
 RESPONSE_OVERHEAD_BYTES = 131072
 SKILL_DIRECTORIES = (".agents/skills", ".claude/skills")
@@ -88,12 +89,11 @@ def context_directories(paths, root):
 def instructions_for(directories, root, limit):
     """Read complete rules in ancestor order; unreadable or oversized guidance fails closed."""
     instructions = []
-    seen = set()
+    scopes = list(dict.fromkeys(os.path.realpath(directory) for directory in directories))
     total = 0
-    for directory in directories:
-        scope = os.path.realpath(directory)
+    for scope in scopes:
         candidate = os.path.join(scope, "AGENTS.md")
-        if candidate in seen or not os.path.lexists(candidate):
+        if not os.path.lexists(candidate):
             continue
         filename = os.path.realpath(candidate)
         if not inside(filename, root):
@@ -106,10 +106,12 @@ def instructions_for(directories, root, limit):
         total += len(data)
         if total > CONTEXT_BYTES:
             raise ValueError("Project instructions exceed the 128 KiB context budget; request fewer paths")
-        seen.add(candidate)
         instructions.append({"path": candidate, "scope": scope,
                              "sha256": digest(data), "content": content})
-    return instructions, total
+    # context_directories includes every ancestor. Send only the leaves of these
+    # chains so a deep path does not repeat its entire prefix at every level.
+    parents = {os.path.dirname(scope) for scope in scopes if scope != root}
+    return instructions, total, [scope for scope in scopes if scope not in parents]
 
 
 def bounded_entries(directory, warnings, limit=SCAN_ENTRIES):
@@ -210,7 +212,7 @@ def check_cancel(cancel_event):
         raise InterruptedError("Workspace request cancelled")
 
 
-def git_command(root, arguments, limit, cancel_event=None):
+def git_command(root, arguments, limit, cancel_event=None, count_lines=False):
     """Inspect Git with bounded reads and a deadline, without a shell or inherited repository redirection."""
     check_cancel(cancel_event)
     environment = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", LC_ALL="C")
@@ -219,8 +221,8 @@ def git_command(root, arguments, limit, cancel_event=None):
     command = ["git", "-c", "core.fsmonitor=false", "-C", root] + arguments
     process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.DEVNULL, env=environment, start_new_session=True)
-    chunks = []
-    used = 0
+    preview = bytearray()
+    lines = 0
     truncated = False
     deadline = time.monotonic() + GIT_TIMEOUT
     try:
@@ -233,13 +235,18 @@ def git_command(root, arguments, limit, cancel_event=None):
                     raise TimeoutError("Git inspection timed out")
                 if not selector.select(min(0.05, remaining)):
                     continue
-                chunk = os.read(process.stdout.fileno(), min(8192, limit - used + 1))
+                chunk = os.read(process.stdout.fileno(), 8192)
                 if not chunk:
                     break
-                chunks.append(chunk[:limit - used])
-                used += len(chunk)
-                if used > limit:
+                remaining_bytes = limit - len(preview)
+                preview.extend(chunk[:remaining_bytes])
+                if len(chunk) > remaining_bytes:
                     truncated = True
+                if count_lines:
+                    # Short status quotes embedded newlines. Drain and count entries even
+                    # after the preview fills, within the same deadline and memory budget.
+                    lines += chunk.count(b"\n")
+                elif truncated:
                     process.kill()
                     break
         while process.poll() is None:
@@ -252,7 +259,7 @@ def git_command(root, arguments, limit, cancel_event=None):
             except subprocess.TimeoutExpired:
                 pass
         code = process.returncode
-        return b"".join(chunks).decode("utf-8", "replace"), code, truncated
+        return preview.decode("utf-8", "replace"), code, truncated, lines
     finally:
         # A Git wrapper can leave children alive even after its own process exits.
         try:
@@ -265,8 +272,9 @@ def git_command(root, arguments, limit, cancel_event=None):
 
 def git_status_arguments(root, warnings, cancel_event=None):
     """Disable content filters before automatic status can inspect tracked file bytes."""
-    configured, code, truncated = git_command(root, ["config", "--null", "--name-only", "--get-regexp",
-                                                    r"^filter\..*\.(clean|process|required)$"], GIT_BYTES, cancel_event)
+    configured, code, truncated, _ = git_command(
+        root, ["config", "--null", "--name-only", "--get-regexp", r"^filter\..*\.(clean|process|required)$"],
+        GIT_BYTES, cancel_event)
     if truncated or code not in (0, 1) or "\ufffd" in configured:
         raise ValueError("Cannot safely enumerate Git filters; automatic status was skipped")
     drivers = sorted({key.rsplit(".", 1)[0] for key in configured.split("\x00") if key})
@@ -281,30 +289,33 @@ def git_status_arguments(root, warnings, cancel_event=None):
         warnings.append("Automatic Git status skipped configured clean/process filter normalization; "
                         "status may differ from normalized content. Explicit Git validation may be needed "
                         "after reviewing project instructions.")
-    return arguments + ["status", "--short", "--untracked-files=normal", "--ignore-submodules=all", "--", "."]
+    # One uncolored line per entry, even when the user's normal status includes a branch header or columns.
+    return arguments + ["-c", "status.branch=false", "-c", "status.showStash=false", "-c", "column.status=never",
+                        "-c", "color.status=false", "status", "--short", "--untracked-files=normal",
+                        "--ignore-submodules=all", "--", "."]
 
 
 def git_details(root, warnings, cancel_event=None):
     """Report repository identity and existing changes, warning on bounded inspection failures."""
     try:
-        repository, code, truncated = git_command(root, ["rev-parse", "--show-toplevel"], 8192, cancel_event)
+        repository, code, truncated, _ = git_command(root, ["rev-parse", "--show-toplevel"], 8192, cancel_event)
         if code != 0:
             return None
         if truncated:
             raise ValueError("Git root exceeds the inspection byte budget")
-        branch, branch_code, branch_truncated = git_command(root, ["symbolic-ref", "--quiet", "--short", "HEAD"], 8192,
-                                                          cancel_event)
+        branch, branch_code, branch_truncated, _ = git_command(
+            root, ["symbolic-ref", "--quiet", "--short", "HEAD"], 8192, cancel_event)
         status_arguments = git_status_arguments(root, warnings, cancel_event)
-        status, status_code, truncated = git_command(root, status_arguments, GIT_BYTES, cancel_event)
-        if status_code != 0 and not truncated:
+        status, status_code, _, total = git_command(root, status_arguments, GIT_BYTES, cancel_event, count_lines=True)
+        if status_code != 0:
             raise ValueError("Git status failed")
         if branch_truncated:
             warnings.append("Git branch name exceeded the inspection byte budget")
-        if truncated:
-            warnings.append("Git status truncated after %d bytes" % GIT_BYTES)
+        # Drop the final fragment if the byte budget cut off a filename.
+        entries = status.split("\n", GIT_STATUS_ENTRIES)[:-1]
         return {"root": repository.rstrip("\n"),
                 "branch": branch.rstrip("\n") if branch_code == 0 and not branch_truncated else None,
-                "status": status, "truncated": truncated}
+                "status": "".join(entry + "\n" for entry in entries), "omitted": total - len(entries)}
     except InterruptedError:
         raise
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
@@ -337,8 +348,8 @@ def workspace_context(request, opening=False):
         raise ValueError("Workspace root changed; reopen the workspace before continuing")
     paths, directories = context_directories([root] if opening else args.get("paths", ["."]), root)
     warnings = []
-    instructions, used = instructions_for(directories, root, request["maxFileBytes"])
-    result = {"root": root, "paths": paths, "instructions": instructions,
+    instructions, used, leaves = instructions_for(directories, root, request["maxFileBytes"])
+    result = {"root": root, "paths": paths, "instructions": instructions, "rule_scope_leaves": leaves,
               "skill_files": [], "project_files": [], "git": None, "warnings": warnings}
     if opening:
         result["skill_files"] = skills_for(args.get("skillDirectories", SKILL_DIRECTORIES), root,

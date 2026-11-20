@@ -149,7 +149,13 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "transport byte budget.*fewer paths or skill_directories"):
             self.invoke("workspace_context", max_file_bytes=1024, paths=[str(directory / "new.py")])
 
-    def test_open_transport_budget_accounts_for_catalog_rules_and_git_together(self):
+    def test_deep_target_reports_scanned_scopes_without_repeating_ancestor_paths(self):
+        # The target's directories need not exist yet when preparing to create a file.
+        directory = Path(*(["nested-directory"] * 50))
+        result = self.invoke("workspace_context", max_file_bytes=1024, paths=[str(directory / "new.py")])
+        self.assertEqual(result["rule_scope_leaves"], [str(self.root / directory)])
+
+    def test_open_with_large_git_status_leaves_room_for_catalog_and_rules(self):
         subprocess.run(["git", "init", "--quiet", str(self.root)], check=True)
         self.write("AGENTS.md", "\x01" * 1024)
         for index in range(100):
@@ -161,8 +167,11 @@ class WorkspaceTests(unittest.TestCase):
             without_git = self.invoke(max_file_bytes=1024)
         self.assertEqual(len(without_git["instructions"]), 1)
         self.assertEqual(len(without_git["skill_files"]), 100)
-        with self.assertRaisesRegex(ValueError, "transport byte budget"):
-            self.invoke(max_file_bytes=1024)
+        result = self.invoke(max_file_bytes=1024)
+        self.assertEqual(result["instructions"], without_git["instructions"])
+        self.assertEqual(result["skill_files"], without_git["skill_files"])
+        self.assertEqual(len(result["git"]["status"].splitlines()), 50)
+        self.assertEqual(result["git"]["omitted"], 252)
 
     def test_git_cancellation_reaps_processes_before_and_after_stdout_closes(self):
         binary = self.home / "bin"
@@ -348,17 +357,17 @@ class WorkspaceTests(unittest.TestCase):
 
     def test_git_reports_user_changes_caps_output_and_ignores_repository_redirection(self):
         subprocess.run(["git", "init", "--quiet", str(self.root)], check=True)
-        self.write("existing.txt", "user change")
+        subprocess.run(["git", "-C", str(self.root), "config", "status.branch", "true"], check=True)
+        self.write("existing\nfile.txt", "user change")
         with patch.dict(os.environ, {"GIT_DIR": str(self.home / "wrong-git")}):
             result = self.invoke()
         self.assertEqual(result["git"]["root"], str(self.root))
-        self.assertIn("existing.txt", result["git"]["status"])
-        self.assertFalse(result["git"]["truncated"])
+        self.assertEqual(result["git"]["status"], '?? "existing\\nfile.txt"\n')
+        self.assertEqual(result["git"]["omitted"], 0)
         with patch.object(workspace, "GIT_BYTES", 5):
             result = self.invoke()
-        self.assertTrue(result["git"]["truncated"])
-        self.assertEqual(len(result["git"]["status"].encode()), 5)
-        self.assertTrue(any("Git status truncated" in warning for warning in result["warnings"]))
+        self.assertEqual(result["git"]["omitted"], 1)
+        self.assertEqual(result["git"]["status"], "")
 
     def test_git_timeout_is_reported_and_does_not_hide_loaded_rules(self):
         self.write("AGENTS.md", "root rules")

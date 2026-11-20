@@ -7,6 +7,7 @@ import { checkAbort, ToolError } from "../errors";
 import { ShortIds } from "../ids";
 import { JsonLines } from "../ssh/json-lines";
 import type { SshTransport } from "../ssh/transport";
+import { viewedFile } from "./file-view";
 
 const PREVIEW_BYTES = 65536;
 const PREVIEW_CHUNKS = 4096;
@@ -17,6 +18,9 @@ const RETENTION_MS = 14 * 24 * 60 * 60_000;
 type Stream = "stdout" | "stderr";
 type Preview = { stream: Stream; text: string };
 type Reason = "cancelled" | "connection_closed" | "connection_lost" | "failed" | "output_limit" | "output_error";
+const viewedRevision = z.object({
+  path: z.string().startsWith("/"), requestPath: z.string().startsWith("/"), sha256: z.string().regex(/^[a-f0-9]{64}$/),
+});
 
 /** Validate private helper records before they change local task state. */
 const helperEvent = z.union([
@@ -26,7 +30,7 @@ const helperEvent = z.union([
     base64: z.string().max(21848).regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/),
     outputBytes: z.number().int().nonnegative() }),
   z.object({ event: z.literal("exit"), exitCode: z.number().int(), outputBytes: z.number().int().nonnegative(),
-    outputComplete: z.boolean(), message: z.string().nullish(),
+    outputComplete: z.boolean(), message: z.string().nullish(), viewedFile: viewedRevision.nullish(),
     reason: z.enum(["cancelled", "disconnected", "failed", "output_limit", "output_error"]).nullish() }),
   z.object({ ok: z.literal(false), error: z.object({ code: z.string(), message: z.string() }) }),
 ]);
@@ -69,6 +73,8 @@ type Task = {
   previewBytes: number;
   previewComplete: boolean;
   readBytes: number;
+  viewObservation: number;
+  viewedFile?: z.infer<typeof viewedRevision>;
   started: boolean;
   finishedAt?: number;
   exitCode: number | null;
@@ -84,7 +90,7 @@ export class TaskManager {
   private readonly ids = new ShortIds();
   private closed = false;
 
-  constructor(private readonly ssh: Pick<SshTransport, "open">) {}
+  constructor(private readonly ssh: Pick<SshTransport, "open" | "cwd">) {}
 
   /** Task IDs are unique in this MCP instance; connection ownership stays internal. */
   private get(taskId: string): Task {
@@ -115,7 +121,7 @@ export class TaskManager {
   }
 
   /** Admit a command only after reserving local capacity, then confirm the remote child exists. */
-  async start(connectionId: string, command: string, cwd?: string, signal?: AbortSignal, attempt = 0): Promise<string> {
+  async start(connectionId: string, command: string, cwd?: string, signal?: AbortSignal, viewObservation = 0, attempt = 0): Promise<string> {
     checkAbort(signal);
     if (this.closed) throw new ToolError("CONNECTION_LOST", "Task manager is closed");
     const active = [...this.tasks.values()].filter((task) => task.connectionId === connectionId && task.finishedAt === undefined);
@@ -126,12 +132,13 @@ export class TaskManager {
     if (this.tasks.size >= MAX_RETAINED_TASKS) throw new ToolError("TASK_LIMIT_REACHED", "Task registry is full");
     const task: Task = {
       id: `task_${this.ids.next()}`, connectionId, outputFile: "", outputBytes: 0, outputComplete: true,
-      preview: [], previewBytes: 0, previewComplete: true, readBytes: 0, started: false, exitCode: null,
+      preview: [], previewBytes: 0, previewComplete: true, readBytes: 0, viewObservation, started: false, exitCode: null,
       stopRequested: false, changed: new EventEmitter(),
     };
     this.tasks.set(task.id, task);
     try {
-      const channel = await this.ssh.open(connectionId, "bash", { command, taskId: task.id }, cwd, signal);
+      const view = viewedFile(command, this.ssh.cwd(connectionId));
+      const channel = await this.ssh.open(connectionId, "bash", { command, taskId: task.id, ...(view ? { view } : {}) }, cwd, signal);
       task.channel = channel;
       await this.attach(task, channel, signal);
       return task.id;
@@ -140,7 +147,7 @@ export class TaskManager {
       this.tasks.delete(task.id);
       // Archive collisions are reported before Bash starts, so only this case permits an automatic retry.
       if (error instanceof ToolError && error.code === "TASK_ID_EXISTS" && attempt < 8) {
-        return this.start(connectionId, command, cwd, signal, attempt + 1);
+        return this.start(connectionId, command, cwd, signal, viewObservation, attempt + 1);
       }
       throw error;
     }
@@ -215,6 +222,7 @@ export class TaskManager {
               if (event.outputBytes > task.outputBytes) task.previewComplete = false;
               task.outputBytes = event.outputBytes;
               task.outputComplete = event.outputComplete;
+              if (event.viewedFile) task.viewedFile = event.viewedFile;
               channel.stdin.end();
             } else {
               throw new Error("Unexpected helper event");
@@ -238,6 +246,15 @@ export class TaskManager {
         task.changed.emit("change");
       });
     });
+  }
+
+  /** Deliver a file revision once, alongside a complete view. Replaying an old log cannot refresh it. */
+  takeFileView(result: TaskResult): (z.infer<typeof viewedRevision> & { observation: number }) | undefined {
+    if (!result.finished || result.reason || !result.output_complete || !result.preview_complete) return;
+    const task = this.get(result.task_id);
+    const view = task.viewedFile;
+    delete task.viewedFile;
+    if (view) return { ...view, observation: task.viewObservation };
   }
 
   /** List tasks with output not yet consumed by ssh_task_output, active first. */
@@ -297,8 +314,9 @@ export class TaskManager {
   }
 
   /** Cancel an interrupted initial call so it cannot silently leave an unreported background task. */
-  async execute(connectionId: string, command: string, cwd: string | undefined, waitMs: number, signal?: AbortSignal): Promise<TaskResult> {
-    const id = await this.start(connectionId, command, cwd, signal);
+  async execute(connectionId: string, command: string, cwd: string | undefined, waitMs: number, signal?: AbortSignal,
+    viewObservation = 0): Promise<TaskResult> {
+    const id = await this.start(connectionId, command, cwd, signal, viewObservation);
     try {
       await this.wait(this.get(id), waitMs, signal);
       const task = this.get(id);

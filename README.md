@@ -91,19 +91,20 @@ curl -fsSL https://github.com/Jacko-John/NeverSSH/releases/latest/download/never
 chmod +x ~/.local/bin/neverssh
 ```
 
-MCP 配置只需要指向这个 launcher：
+在 Claude Code 的 `.mcp.json` 中填写 launcher 的绝对路径。这个示例将工具调用超时设为 660 秒（660000 毫秒），为最长的前台等待预留启动和响应时间。
 
 ```json
 {
   "mcpServers": {
     "neverssh": {
-      "command": "/Users/you/.local/bin/neverssh"
+      "command": "/Users/you/.local/bin/neverssh",
+      "timeout": 660000
     }
   }
 }
 ```
 
-需要自定义配置文件时：
+其他 MCP 客户端请在各自的设置中将工具调用超时和空闲超时设为至少 660 秒。需要给 launcher 指定 NeverSSH 配置文件时，可以传入 `--config`。
 
 ```json
 {
@@ -150,13 +151,13 @@ cp -R skills/neverssh ~/.claude/skills/
 {"connection_id":"7a2c9d4f","path":"/srv/app"}
 ```
 
-返回工作区 ID（例如 `ws_b8e3a160`）、远端项目根目录、Git 状态、项目入口文件，以及根目录的 `AGENTS.md` 正文和可用 skill 目录。先检查规则和已有改动，再通过这个工作区操作项目。相对文件路径和 `cwd` 基于项目根目录，命令默认在根目录执行。
+返回工作区 ID（例如 `ws_b8e3a160`）、远端项目根目录、Git 状态、项目入口文件，以及根目录的 `AGENTS.md` 正文和可用 skill 目录。Git 状态最多列出前 50 项，并标出省略的项数。需要完整清单时，在工作区用 `ssh_bash` 运行 `git status --short -- .`。相对文件路径和 `cwd` 基于项目根目录，命令默认在根目录执行。
 
 项目文件默认直接在远端处理：用 `ssh_read_file` 读取，`ssh_write_file` 创建或整体写入，`ssh_edit_file` 做局部修改。批量变更和代码生成通过远端 `ssh_bash` 完成，再在远端测试和检查 diff。不要把“本地临时文件加上传”或“下载、本地编辑、再上传”当成默认开发流程。
 
-普通工作区操作从根目录向目标收集适用的 `AGENTS.md`，保留来源、适用目录和完整正文。文件读取、写入、编辑、上传、下载和 Bash 的结果会自动附上新增、变更或删除的适用规则，不因规则尚未返回或已经变化而拒绝操作。返回这些规则时，本次文件操作已经执行，Bash 命令已经启动；规则用于指导后续操作，服务器不保证 Agent 在本次操作前已理解它们。文件路径限制、读取后编辑和版本冲突检查仍然生效。
+普通工作区操作从根目录向目标收集适用的 `AGENTS.md`，保留来源、适用目录和完整正文。例如，首次向带有独立规则的子目录写文件时，`ssh_write_file` 会先返回 `WORKSPACE_RULES_CHANGED` 和规则，文件保持原样。阅读后可直接重试。编辑和上传采用同样的流程，已交付的规则发生变更或删除时也会暂停。读取、下载和 Bash 会随结果返回适用的规则变化。文件路径限制、读取后编辑和版本冲突检查仍然生效。
 
-操作结果保持在第一个 MCP 内容块中，通常是文本，读取图片时是原生 `image`；规则增量另放第二个文本块，规则无变化时只有操作结果。Bash 即使以非零状态退出，也可能附上规则提示，命令已经运行，不要因此重新执行。真正失败的文件或传输操作不附带规则；规则采集、路径校验和资源限制仍可能在执行前报错。
+客户端先收到操作结果，再收到有变化的工作区规则。文本或单张图片占一个内容块，笔记本和 PDF 可以返回多个内容块，规则增量始终附在最后。Bash 即使以非零状态退出，也可能附上规则提示，命令已经运行，不要因此重新执行。执行文件或传输操作时发生的错误不交付规则。
 
 普通操作不重复返回未变化的规则、Skill 目录和 Git 状态。需要恢复根目录上下文、刷新 Git 状态或重新发现 skill 时，再次调用 `ssh_workspace_open`。相同连接、根目录和 skill 配置可以复用工作区 ID，但会重置已返回规则的记录并重建 skill 目录。打开时只返回根目录规则，子目录规则会随后随目标操作自动返回。Bash 的规则发现只覆盖 `cwd`；涉及其他目录时，可以在对应 `cwd` 操作或主动读取该目录的 `AGENTS.md`。连接模式不加载项目上下文。
 
@@ -178,7 +179,7 @@ skill 目录列出可调用名称和描述；使用时通过 `ssh_skill_read({wo
 
 ## 工具使用
 
-工具返回可读文本，`ssh_read_file` 读取受支持的图片时返回原生 MCP `image` 内容块；其他工具仍只返回文本。所有工具都不提供 `structuredContent` 或 `outputSchema`。请求仍是严格校验的 MCP 参数对象；远端命令打印的内容保持原样。
+工具返回可读文本。`ssh_read_file` 还可以用原生 MCP `image` 内容块展示图片、笔记本图形输出和 PDF 页面。所有工具都不提供 `structuredContent` 或 `outputSchema`。请求仍是严格校验的 MCP 参数对象；远端命令打印的内容保持原样。
 
 连接：
 
@@ -214,15 +215,17 @@ Connection: 7a2c9d4f
 
 文件工具对齐 Claude Code 的 Read / Write / Edit：`file_path` 是远端文件路径，文本读取使用 `offset` / `limit`，编辑使用 `old_string` / `new_string` / `replace_all`。目录列表、文件查找和内容搜索通过 `ssh_bash` 执行 `ls`、`find`、`rg`。
 
-编辑前先用 `ssh_read_file` 读取文件；`ssh_read_file` 和 `ssh_write_file` 会记录文件版本，`ssh_edit_file` 自动用它拒绝过期修改。`old_string` 默认必须唯一匹配；设置 `replace_all=true` 替换全部匹配。文本读取结果带行号，默认最多 2000 行。写入和上传会自动创建远端父目录。
+编辑已有文件前，用 `ssh_read_file` 读完同一版本的全部内容，或在 `ssh_bash` 中用 `cat src/main.ts` 等命令查看单个文件。再次读取时，如果内容已在外部改变，工具会提示。精确编辑默认要求原文唯一，`replace_all=true` 可替换所有匹配。成功后会显示第一处替换附近的行号和正文。
 
-查看远端图片也直接调用 `ssh_read_file`，无需先下载到本地。工具按文件内容识别 PNG、JPEG、GIF 和 WebP，并完整返回图片，不写成本地文件，不依赖 SFTP；客户端需要支持 MCP 图片显示。`offset` / `limit` 只用于文本，图片不分页，仍受 `maxFileBytes` 限制（默认 4 MiB，最高 8 MiB）。SVG 继续作为 UTF-8 文本读取，其他二进制文件返回文本错误。
+超过 256 KiB 的文本需要指定 `offset` 和较小的 `limit` 分页读取。读取 Jupyter `.ipynb` 会按顺序展示单元格和保存的输出。读取 PDF 需要远端安装 Poppler，10 页以内可一次读取，更长的 PDF 用 `pages` 指定页码，例如 `"2-5"`，每次最多 20 页。
+
+查看远端图片也直接调用 `ssh_read_file`，无需先下载到本地。工具按文件内容识别 PNG、JPEG、GIF 和 WebP，并完整返回图片，不写成本地文件，不依赖 SFTP；客户端需要支持 MCP 图片显示。`offset` / `limit` 只用于文本，图片不分页，仍受 `maxFileBytes` 限制（默认 4 MiB，最高 8 MiB）。SVG 按文本读取。遇到 XLSX、Parquet 或 ZIP 等二进制文件，使用对应格式的 skill 或在 `ssh_bash` 中调用专用工具。
 
 图片及附带规则的 MCP 结果序列化后另有 9 MiB 上限，不能按原始图片大小理解。超过该上限会返回文本错误，需缩小图片后重试；不会截断图片或自动下载到本地。
 
 `ssh_bash` 的短命令成功完成时，操作结果只有程序输出；后台运行、等待到期、输出截断或失败时再给出 `task_...` 任务 ID、状态、远端日志路径和字节数。工作区规则有变化时，在独立的第二个文本块中附上提示。后台任务只需 `task_id` 调用 `ssh_task_output` 查询或等待，使用 `ssh_task_stop` 停止，不再需要 `connection_id`。`ssh_task_list` 列出尚未被 `ssh_task_output` 读取输出的任务；读取后移除，新输出会让它重新出现。
 
-`wait_seconds` 默认 120 秒，查询默认 30 秒，上限均为 300 秒，支持小数。等待到期只返回控制权，原进程继续运行；不提供命令运行时限参数。设置 `run_in_background=true` 可在启动后立即返回。
+`ssh_bash` 默认等待 120 秒，最长 600 秒。`ssh_task_output` 默认等待 30 秒，最长 300 秒。两者都支持小数。等待到期后原进程继续运行，设置 `run_in_background=true` 可在启动后立即返回。单独运行 `rg`、`grep` 等命令时，退出码 1 也能作为正常结果返回，例如一次没有匹配项的搜索。
 
 每次命令使用独立的 Bash，stdin 默认为 EOF，没有 PTY。连接模式的 `cwd` 默认是远端 HOME，工作区模式默认是项目根目录；`cd` 和变量不会延续到下一条命令。环境变量可直接写进命令，例如 `CI=1 make test`。
 
@@ -242,7 +245,7 @@ Connection: 7a2c9d4f
 - 连接注册表最多保留 64 项；容量紧张时移除已关闭记录。ID 在当前实例中不重复分配。
 - 本地内联预览最多保留最近 64 KiB 或 4096 个片段；任务表最多 256 项。新任务启动时移除结束已满 14 天的本地记录，容量紧张时可提前移除已结束记录；远端日志保留期不受影响。
 - 默认每任务日志最多 64 MiB，远端同一用户归档总量最多 1 GiB，分别使用 `maxTaskOutputBytes` 和 `maxArchiveBytes` 调整。达到预算时停止任务或拒绝启动，明确报告日志不完整，不提前删除未过期日志。计数只包括日志内容，不是整个文件系统的磁盘配额。
-- 文件和传输默认上限 4 MiB，可配置到 8 MiB。文本要求 UTF-8；写入已有文件前必须先读取或写入过该文件。
+- 文件和传输默认上限 4 MiB，可配置到 8 MiB。精确编辑要求 UTF-8。读取其他文本编码时，无法解码的字节显示为 �。完整读取后可用 `ssh_write_file` 提供干净的 UTF-8 全文进行转换。
 - 同一 worker 对同一文件的文本写入、编辑和上传提交会串行校验版本。禁止覆盖的上传以原子的创建操作提交；文本写入和编辑保留 Unix mode 和所有者，SFTP 上传不保证保留它们。两者都不保证 ACL、扩展属性和硬链接关系；哈希校验不构成跨进程事务锁。
 
 ## 生命周期与信任范围
@@ -279,8 +282,8 @@ JavaScript/TypeScript 使用 Bun。本地 Python 检查和测试解释器由 uv 
 推送 `v*` 标签会触发 GitHub Actions：
 
 ```sh
-git tag v0.4.0
-git push origin v0.4.0
+git tag -a v0.5.0 -m "NeverSSH 0.5.0"
+git push origin v0.5.0
 ```
 
 工作流运行检查、测试和构建，并上传 `neverssh.js`、`neverssh` launcher 和 `neverssh.config.example.json` 到对应 Release。launcher 在后台解析 `releases/latest`，新标签在用户下一次启动时生效，无需修改 MCP 配置。

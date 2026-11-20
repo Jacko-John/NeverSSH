@@ -4,9 +4,9 @@ Read this when changing NeverSSH's implementation, public tools, or development 
 
 ## Public interface and output
 
-MCP inputs remain strict parameter objects. Tool results return readable text, with one exception: `ssh_read_file` returns a native MCP `image` block for supported remote images. Other tools remain text-only. No tool provides `structuredContent` or `outputSchema`. Do not serialize internal objects into text or wrap them in JSON code fences. Internal result types can still be structured.
+MCP inputs remain strict parameter objects. Tool results return readable text, with one exception: `ssh_read_file` returns native MCP `image` blocks for supported remote images, notebook image outputs, and PDF pages. Other tools remain text-only. No tool provides `structuredContent` or `outputSchema`. Do not serialize internal objects into text or wrap them in JSON code fences. Internal result types can still be structured.
 
-Detect PNG, JPEG, GIF, and WebP by content and return the full image within `maxFileBytes`; `offset` and `limit` apply only to text. SVG remains UTF-8 text and other binary reads return text errors. Read images through the worker without SFTP or a local copy, and never put image data in text. Workspace rule changes may follow the image as a separate text block; unchanged rules stay omitted.
+Detect PNG, JPEG, GIF, and WebP by content and return the full image within `maxFileBytes`; `offset` and `limit` apply only to text. SVG remains text. Refuse known binary extensions before attempting text decoding. Render notebooks as cells and saved outputs, and PDFs as page labels and images with the remote host’s Poppler utilities. Read images through the worker without SFTP or a local copy, and never put image data in text. Workspace rule changes may follow the image as a separate text block; unchanged rules stay omitted.
 
 The complete image result, including appended workspace rules, must serialize within 9 MiB, separately from the raw file's `maxFileBytes` limit. Reject oversized results with a text error instructing the caller to reduce the image size before retrying. Do not truncate images, automatically download them, or acknowledge rules that were not delivered. This additional budget applies only to image results; existing text reads keep their current behavior.
 
@@ -53,7 +53,7 @@ Existing formatters in `src/mcp/operation-text.ts` and `src/tasks/text.ts` produ
 | --- | --- | --- |
 | Connect | `Connection: 7a2c9d4f` | `{"connection_id":"7a2c9d4f"}` |
 | Empty task list | `No tasks.` | `{"tasks":[],"count":0}` |
-| Edit | `The file /srv/app/main.ts has been updated successfully.` | A dump of path, hashes, byte counts, and internal flags |
+| Edit | Success message followed by numbered lines around the first replacement | A dump of path, hashes, byte counts, and internal flags |
 | Partial file read | Numbered lines followed by `PARTIAL view` and the next `offset` | A silently truncated string or a JSON-escaped file body |
 
 For example, `readText` uses a six-character line-number column and a tab before the source. A partial three-line file viewed one line at a time can read:
@@ -109,14 +109,14 @@ Bash, file, and transfer inputs require exactly one of `connection_id` and `work
 Good, from the edit path in `src/mcp/server.ts`:
 
 ```ts
-if (!revision) throw new ToolError("FILE_NOT_READ", "Read the file with ssh_read_file before editing it");
+if (!revision) throw new ToolError("FILE_NOT_READ", "Read the entire current file with ssh_read_file before editing it. Follow any paging hints.");
 ```
 
 The text-only handler's catch branch in Example 1 uses `errorText(error)` and sets `isError: true`, producing:
 
 ```text
 Error: FILE_NOT_READ
-Read the file with ssh_read_file before editing it
+Read the entire current file with ssh_read_file before editing it. Follow any paging hints.
 ```
 
 Incorrect:
@@ -163,11 +163,13 @@ Good: the existing `ssh_bash` registration delegates waiting and cancellation to
 
 ```ts
 async (args, context) => {
-  const prepared = await prepareFile(args, args.cwd ?? ".", context);
+  const prepared = await prepareOperation(args, args.cwd ?? ".", context);
   const task = await runtime.tasks.execute(prepared.connectionId, args.command, args.workspace_id ? prepared.path : args.cwd,
     args.run_in_background ? 0 : args.wait_seconds * 1000, context.mcpReq.signal);
-  const failed = task.finished && (task.reason !== undefined || task.exit_code !== 0);
-  return operationResult(prepared, taskText(task, "bash"), failed);
+  const result = bashResult(task, args.command);
+  const response = operationResult(prepared, textResult(result.text, result.isError));
+  rememberView(task);
+  return response;
 }
 ```
 
@@ -188,9 +190,9 @@ Keep the following existing invariants when adding a feature:
 - Use system OpenSSH with argument arrays and the existing access policy. Do not interpolate paths into a local shell, accept model-supplied SSH flags/credentials, weaken host-key checks, or silently replace SFTP with another transport.
 - Keep local and remote paths distinct. Only transfer operations access local user payload files, using each call's absolute `localPath` on the MCP host. Omitted or empty `localTransferRoots` imposes no directory restriction; a nonempty list requires canonical paths to stay within a configured root, including through symlinks. Preserve file type, size, overwrite, atomic commit, and cancellation checks in both modes. Remote workspaces and `cwd` do not resolve `localPath`; remote `cwd` is not a sandbox.
 - Keep remote project development on the remote host: use `ssh_read_file`, `ssh_write_file`, and `ssh_edit_file` directly, and run batch changes or code generation with remote `ssh_bash`. Do not make local temporary files plus upload, or download-edit-upload round trips, the default. Upload the user's existing local files or satisfy a specific transfer requirement; download files when they need to be retrieved locally. A required local-only tool can justify a transfer based on the actual task.
-- Workspace file paths stay inside the canonical project root. Ordinary file operations, transfers, and Bash return new, changed, or removed rules with their results; unread or changed guidance must not block execution. The file operation has run or the command has started when guidance is presented, so this does not guarantee prior understanding. Bash discovers rules only for `cwd`; callers can operate in the intended directory or read its `AGENTS.md` explicitly. Connection mode does not load project context. Preserve path and file revision checks.
-- Opening a workspace returns complete root guidance and the skill catalog, without traversing subdirectory rules. Ordinary workspace operations load applicable rules and present their changes, updating the server-side snapshot after successful delivery. Reopen with the same connection, canonical root, and skill configuration to recover root context and rediscover skills; a handle may be reused, but rule delivery resets and the catalog is rebuilt. Subdirectory rules are delivered again by subsequent target operations. A concurrent reopen can still invalidate an operation's preparation before execution; keep that lifecycle error separate from rule discovery.
-- Preserve the original operation result as the first MCP content block: text retains task headers and program whitespace, and image reads retain native image content. Put rule changes in a separate text block; omit it when unchanged. A started/background Bash delivers guidance with its first result, and nonzero program exits can still deliver rules. Thrown operation errors do not attach or acknowledge collected guidance. Rule collection and path validation still run before execution and may fail for unreadable files or resource limits; exhausted rule history requires reopening, independent of whether guidance was read.
+- Workspace file paths stay inside the canonical project root. Writes, edits, and uploads must return pending rule changes before changing the remote file. Report `WORKSPACE_RULES_CHANGED` and let the caller review the guidance and retry. Reads, downloads, and Bash return guidance with their results. Bash discovers rules only for `cwd`; callers can operate in the intended directory or read its `AGENTS.md` explicitly. Connection mode does not load project context. Preserve path and file revision checks.
+- Opening a workspace returns complete root guidance, a preview of up to 50 Git status entries with an omitted count, and the skill catalog, without traversing subdirectory rules. Ordinary workspace operations load applicable rules and present their changes, updating the server-side snapshot after successful delivery. Reopen with the same connection, canonical root, and skill configuration to recover root context and rediscover skills; a handle may be reused, but rule delivery resets and the catalog is rebuilt. Subdirectory rules are delivered again by subsequent target operations. A concurrent reopen can still invalidate an operation's preparation before execution; keep that lifecycle error separate from rule discovery.
+- Preserve the original operation content blocks in order: text retains task headers and program whitespace, and image reads retain native image content. Put rule changes in a separate text block; omit it when unchanged. A started/background Bash delivers guidance with its first result, and nonzero program exits can still deliver rules. Thrown operation errors do not attach or acknowledge collected guidance. Rule collection and path validation still run before execution and may fail for unreadable files or resource limits; exhausted rule history requires reopening, independent of whether guidance was read.
 - Keep revision hashes internal for rule-change checks; do not print them in project-rule or skill results. Keep fixed development workflow reminders in the distributed NeverSSH skill instead of appending them to every workspace response. Preserve rule sources, scopes, complete bodies, and the skill's remote resource and script locations.
 - Skill discovery provides metadata; full instructions and text resources are read explicitly. Remote skill paths and scripts remain remote, with no automatic dependency installation or script execution. Workspace and skill guidance do not expand user authorization or replace client-owned local skills.
 - Skill discovery roots are fixed by `ssh_workspace_open`, defaulting to `.agents/skills` and `.claude/skills` under the workspace root. Resolve all configured relative directories once from that root; explicit absolute and home-relative shared directories remain supported. Do not derive skill roots from operation target paths: subdirectory skill discovery is unsupported. Reopening discovers the catalog again. This does not change scoped `AGENTS.md` collection.
@@ -236,7 +238,7 @@ Good: reopen the project after conversation compaction to recover root guidance 
 
 Use `ssh_workspace_open` for that request, preserving the original skill configuration. Reopening may reuse the handle but resets rule delivery and rebuilds the catalog. Reload active skills using its current names; applicable subdirectory rules arrive with subsequent file operations or commands in those directories. Opening alone does not recover every subdirectory's rules. If a command generates files outside its `cwd`, operate in the intended directory or read the relevant `AGENTS.md` explicitly.
 
-Incorrect: refusing an ordinary operation solely because an applicable rule has not been returned, or treating rules included with an operation result as proof that they were understood before execution. A workspace supplies path defaults and project guidance; it is not a command sandbox or a local editor mount. `WORKSPACE_REOPEN_REQUIRED` rejects invalidated preparation, exhausted rule history, or a skill read from an obsolete catalog. Completed operations retain their result without obsolete rule attachments; unread rules do not gate execution.
+An edit that encounters new scoped rules must leave the file untouched and deliver those rules. Shell commands may already have started when their guidance arrives. A workspace supplies path defaults and project guidance; it is not a command sandbox or a local editor mount. `WORKSPACE_REOPEN_REQUIRED` rejects invalidated preparation, exhausted rule history, or a skill read from an obsolete catalog. Completed operations retain their result without obsolete rule attachments.
 
 Use the isolated `SshFixture` in `tests/fixture.ts`: temporary keys, known_hosts, files, a loopback SSH endpoint, real system OpenSSH, and MCP stdio. Do not use a user's live servers or modify their SSH configuration for regression tests. Python tests run through uv, following the existing Bun wrappers.
 

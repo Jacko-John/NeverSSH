@@ -2,7 +2,27 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { RemoteChannel, type RemoteResult } from "../src/ssh/request-channel";
 import { TaskManager } from "../src/tasks/manager";
-import { taskText } from "../src/tasks/text";
+import { bashResult } from "../src/tasks/text";
+import { simpleCommandWords } from "../src/tasks/simple-command";
+import { viewedFile } from "../src/tasks/file-view";
+
+const REMOTE_HOME = "/home/fixture";
+
+test("only literal single-file viewing commands identify a read", () => {
+  for (const command of [
+    "cat --number", "/bin/cat -n", "nl -ba", "nl -b a", "bat --plain", "batcat --style=numbers",
+    "head --lines=1", "tail -n 1", "sed -n '1,2p'", "grep -n hi", "egrep -e 'hi|bye'",
+    "fgrep --regexp=hi", "rg -uu -C 1 hi",
+  ]) {
+    expect(viewedFile(command + " 'file name'", REMOTE_HOME)?.path, command).toBe("file name");
+  }
+  for (const command of [
+    "cat a b", "cat a | head", "head a > result", "bat --version a", "rg --files a", "rg -h a",
+    "rg -f patterns a", "cat *.txt", "cat $file", "cat -", "sed -n '1w changed' a", "./cat a",
+  ]) {
+    expect(viewedFile(command, REMOTE_HOME), command).toBeUndefined();
+  }
+});
 
 const CONNECTION = "1234abcd";
 const HEADER_BYTES = Buffer.byteLength("Command:\nfixture\n\nOutput:\n");
@@ -16,6 +36,8 @@ class TaskFixture {
   readonly channels: RemoteChannel[] = [];
   readonly messages: RemoteResult[] = [];
   readonly sizes = new Map<RemoteChannel, number>();
+
+  cwd(): string { return REMOTE_HOME; }
 
   /** The test controls start/exit timing; stop requests receive a normal helper acknowledgement. */
   async open(_connectionId: string, _operation: string, args: RemoteResult): Promise<RemoteChannel> {
@@ -78,7 +100,40 @@ test("foreground waits for completion even after output arrives", async () => {
   fixture.finish(channel);
   const result = await pending;
   expect(result).toMatchObject({ finished: true, exit_code: 0, output_bytes: HEADER_BYTES + 6, preview: [{ stream: "stdout", text: "ready\n" }] });
-  expect(taskText(result)).toBe("ready\n");
+  expect(bashResult(result, "fixture").text).toBe("ready\n");
+});
+
+test("literal Bash argument recognition preserves quotes and rejects shell evaluation", () => {
+  expect(simpleCommandWords(`  cat  'one 'two\\ three "four\\q" '' "a\\$b"  `, REMOTE_HOME))
+    .toEqual(["cat", "one two three", "four\\q", "", "a$b"]);
+  expect(simpleCommandWords("cat ~/project/'my file'\n", REMOTE_HOME)).toEqual(["cat", REMOTE_HOME + "/project/my file"]);
+  expect(simpleCommandWords('cat "~/project/file#1"', REMOTE_HOME)).toEqual(["cat", "~/project/file#1"]);
+  expect(simpleCommandWords("cat file#1", REMOTE_HOME)).toEqual(["cat", "file#1"]);
+  for (const command of ["cat *.ts", "cat ?.ts", "cat [ab]", 'cat "$path"', "cat foo|true",
+    "cat < file", "cat foo # comment", "cat a{b,c}", "cat $(pwd)", "cat `pwd`", "cat ~other/f",
+    'cat "$[1+1]"', 'cat "${file}"',
+    "cat 'unfinished", "cat \\", "cat file\nfalse"]) {
+    expect(simpleCommandWords(command, REMOTE_HOME)).toBeUndefined();
+  }
+});
+
+test("only an independently recognized command with exit 1 and no failure reason is accepted", async () => {
+  const { id, channel } = await start();
+  fixture.finish(channel, 1);
+  const task = tasks.snapshot(id);
+  for (const command of ["grep", "rg a src", "egrep", "fgrep", "find", "diff a b", "test -e f",
+    "[ a = b ]", "git diff --exit-code", "git grep 'a|b'", "git -C /srv/project --no-pager diff --quiet",
+    "/usr/bin/grep -E 'a|b' *.ts", 'test -n "$value"', 'test -n "${value}"', "rg pattern src\n"]) {
+    const result = bashResult(task, command);
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain("Exit code: 1");
+  }
+  for (const command of ["pgrep", "git status", "git -C grep status", "grepper", "grep a f && false", "grep a f | false",
+    "grep a f > /missing/f", "grep a f\nfalse"]) {
+    expect(bashResult(task, command).isError).toBe(true);
+  }
+  expect(bashResult({ ...task, reason: "output_error" }, "grep").isError).toBe(true);
+  expect(bashResult({ ...task, exit_code: 2 }, "grep").isError).toBe(true);
 });
 
 test("task list contains only tasks with unread output", async () => {
@@ -111,8 +166,8 @@ test("zero wait yields and cancelling a later query leaves the task running", as
   fixture.started(fixture.channels[0]!);
   const initial = await pending;
   expect(initial).toMatchObject({ finished: false, exit_code: null, output_bytes: HEADER_BYTES });
-  expect(taskText(initial)).toContain("Task: ");
-  expect(taskText(initial)).toContain("running in background");
+  expect(bashResult(initial, "fixture").text).toContain("Task: ");
+  expect(bashResult(initial, "fixture").text).toContain("running in background");
   const controller = new AbortController();
   const query = tasks.output(initial.task_id, 300000, controller.signal);
   controller.abort();
@@ -163,7 +218,7 @@ test("large previews stay bounded while the archived byte count includes all out
   const result = tasks.snapshot(id);
   expect(result).toMatchObject({ finished: true, output_bytes: HEADER_BYTES + 2097152, preview_complete: false, output_complete: true });
   expect(result.preview.reduce((sum, event) => sum + Buffer.byteLength(event.text), 0)).toBeLessThanOrEqual(65536);
-  const text = taskText(result);
+  const text = bashResult(result, "fixture").text;
   expect(text).toContain(`${HEADER_BYTES + 2097152} bytes`);
   expect(text).toContain("read selectively");
   expect(text).not.toContain('"output"');
@@ -188,7 +243,7 @@ test("a large command header does not trigger a reading reminder when output is 
   fixture.finish(channel);
   const result = await pending;
   expect(result.output_bytes).toBeGreaterThan(65536);
-  expect(taskText(result)).toBe("ready\n");
+  expect(bashResult(result, "fixture").text).toBe("ready\n");
 });
 
 test("fully shown retained output needs no reading reminder even when the command log is incomplete", async () => {
@@ -196,7 +251,7 @@ test("fully shown retained output needs no reading reminder even when the comman
   fixture.output(channel, Buffer.from("prefix"));
   emit(channel, { event: "exit", exitCode: -15, reason: "output_limit", outputBytes: fixture.sizes.get(channel), outputComplete: false });
   channel.finish(0);
-  const text = taskText(tasks.snapshot(id));
+  const text = bashResult(tasks.snapshot(id), "fixture").text;
   expect(text).toContain("Log incomplete or unconfirmed.");
   expect(text).not.toContain("read selectively");
 });
@@ -207,7 +262,7 @@ test("output archived without a delivered preview is marked for selective readin
   channel.finish(0);
   const result = tasks.snapshot(id);
   expect(result.preview_complete).toBe(false);
-  expect(taskText(result)).toContain("read selectively");
+  expect(bashResult(result, "fixture").text).toContain("read selectively");
 });
 
 test("connection loss retains output without inventing a final size or process exit code", async () => {
@@ -216,7 +271,7 @@ test("connection loss retains output without inventing a final size or process e
   channel.finish(255, "connection reset");
   const result = tasks.snapshot(id);
   expect(result).toMatchObject({ finished: true, exit_code: null, reason: "connection_lost", size_known: false });
-  const text = taskText(result);
+  const text = bashResult(result, "fixture").text;
   expect(text).toContain("Exit code: unknown");
   expect(text).toContain("remote process state unknown");
   expect(text).toContain(`Last confirmed output size: ${HEADER_BYTES + 12} bytes`);
@@ -236,6 +291,6 @@ test("stopping twice preserves the original result and retained output", async (
   const result = await tasks.stop(id);
   expect(result).toMatchObject({ finished: true, exit_code: -15, reason: "cancelled" });
   expect(await tasks.stop(id)).toEqual(result);
-  expect(taskText(result)).toContain("Reason: cancelled");
-  expect(taskText(result)).toContain("ready\n");
+  expect(bashResult(result, "fixture").text).toContain("Reason: cancelled");
+  expect(bashResult(result, "fixture").text).toContain("ready\n");
 });

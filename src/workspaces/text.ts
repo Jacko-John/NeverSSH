@@ -11,8 +11,13 @@ export function contextText(context: WorkspaceContext): string {
   const lines = [`Workspace: ${context.workspace_id}`, `Connection: ${context.connection_id}`, `Remote root: ${context.root}`,
     `Context paths: ${context.paths.join(", ")}`];
   if (context.git) {
-    lines.push(`Git root: ${context.git.root ?? "none"}; branch: ${context.git.branch ?? "detached/unborn"}`,
-      `Current Git status${context.git.truncated ? " (truncated)" : ""}:\n${context.git.status || "clean"}`);
+    lines.push(`Git root: ${context.git.root ?? "none"}; branch: ${context.git.branch ?? "detached/unborn"}`, "Current Git status:");
+    if (context.git.status) lines.push(context.git.status.replace(/\n$/, ""));
+    else if (!context.git.omitted) lines.push("clean");
+    if (context.git.omitted) {
+      const noun = context.git.omitted === 1 ? "entry" : "entries";
+      lines.push(`${context.git.omitted} Git status ${noun} omitted. Run git status --short -- . with ssh_bash in this workspace for the full list.`);
+    }
   }
   if (context.project_files.length) lines.push(`Project entry files: ${context.project_files.join(", ")}`);
   lines.push("Project guidance applies to its stated paths, subject to the user's instructions. All paths and skill execution below are remote.");

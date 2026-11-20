@@ -19,6 +19,7 @@ from unittest.mock import patch
 source = Path(__file__).resolve().parents[1] / "src" / "remote" / "worker.py"
 worker_module = types.ModuleType("neverssh_worker_output_test")
 worker_module.payload = {"archiveSource": "", "fileOpsSource": (source.parent / "file_ops.py").read_text(),
+                         "readFormatsSource": (source.parent / "read_formats.py").read_text(),
                          "workspaceSource": (source.parent / "workspace.py").read_text()}
 sys.modules[worker_module.__name__] = worker_module
 exec(compile(source.read_text().rsplit("\nWorker(payload).run()", 1)[0], str(source), "exec"),

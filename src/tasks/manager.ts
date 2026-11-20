@@ -7,7 +7,7 @@ import { checkAbort, ToolError } from "../errors";
 import { ShortIds } from "../ids";
 import { JsonLines } from "../ssh/json-lines";
 import type { SshTransport } from "../ssh/transport";
-import { viewedFile } from "./file-view";
+import { showsSearchText, viewedFile, type FileView } from "./file-view";
 
 const PREVIEW_BYTES = 65536;
 const PREVIEW_CHUNKS = 4096;
@@ -20,6 +20,7 @@ type Preview = { stream: Stream; text: string };
 type Reason = "cancelled" | "connection_closed" | "connection_lost" | "failed" | "output_limit" | "output_error";
 const viewedRevision = z.object({
   path: z.string().startsWith("/"), requestPath: z.string().startsWith("/"), sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  hasNul: z.boolean(),
 });
 
 /** Validate private helper records before they change local task state. */
@@ -74,6 +75,7 @@ type Task = {
   previewComplete: boolean;
   readBytes: number;
   viewObservation: number;
+  view: FileView | undefined;
   viewedFile?: z.infer<typeof viewedRevision>;
   started: boolean;
   finishedAt?: number;
@@ -130,15 +132,15 @@ export class TaskManager {
     }
     this.prune();
     if (this.tasks.size >= MAX_RETAINED_TASKS) throw new ToolError("TASK_LIMIT_REACHED", "Task registry is full");
+    const view = viewedFile(command, this.ssh.cwd(connectionId));
     const task: Task = {
       id: `task_${this.ids.next()}`, connectionId, outputFile: "", outputBytes: 0, outputComplete: true,
       preview: [], previewBytes: 0, previewComplete: true, readBytes: 0, viewObservation, started: false, exitCode: null,
-      stopRequested: false, changed: new EventEmitter(),
+      stopRequested: false, changed: new EventEmitter(), view,
     };
     this.tasks.set(task.id, task);
     try {
-      const view = viewedFile(command, this.ssh.cwd(connectionId));
-      const channel = await this.ssh.open(connectionId, "bash", { command, taskId: task.id, ...(view ? { view } : {}) }, cwd, signal);
+      const channel = await this.ssh.open(connectionId, "bash", { command, taskId: task.id, ...(view ? { viewPath: view.path } : {}) }, cwd, signal);
       task.channel = channel;
       await this.attach(task, channel, signal);
       return task.id;
@@ -248,13 +250,18 @@ export class TaskManager {
     });
   }
 
-  /** Deliver a file revision once, alongside a complete view. Replaying an old log cannot refresh it. */
+  /** A search may show just some matches. Other views require a complete preview with stdout. */
   takeFileView(result: TaskResult): (z.infer<typeof viewedRevision> & { observation: number }) | undefined {
-    if (!result.finished || result.reason || !result.output_complete || !result.preview_complete) return;
+    if (!result.finished || result.reason || result.exit_code !== 0 || !result.output_complete) return;
     const task = this.get(result.task_id);
-    const view = task.viewedFile;
+    const revision = task.viewedFile;
+    if (!revision || !task.view) return;
     delete task.viewedFile;
-    if (view) return { ...view, observation: task.viewObservation };
+    const stdout = result.preview.filter((chunk) => chunk.stream === "stdout").map((chunk) => chunk.text).join("");
+    if (task.view.search) {
+      if (!showsSearchText(task.view, stdout, revision.hasNul, !result.preview_complete)) return;
+    } else if (!result.preview_complete || !stdout) return;
+    return { ...revision, observation: task.viewObservation };
   }
 
   /** List tasks with output not yet consumed by ssh_task_output, active first. */

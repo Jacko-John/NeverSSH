@@ -16,6 +16,7 @@ type Schema = {
   default?: unknown;
   minimum?: number;
   maximum?: number;
+  minLength?: number;
   maxLength?: number;
   minItems?: number;
   maxItems?: number;
@@ -28,6 +29,10 @@ const taskScope = {
 const operationScope = {
   connection_id: "远端连接 ID；与 workspace_id 必须且只能填写一个。",
   workspace_id: "远端工作区 ID；与 connection_id 必须且只能填写一个。",
+};
+const fileScope = {
+  ...operationScope,
+  workspace_rules_ack: "仅用于工作区。阅读 WORKSPACE_RULES_CHANGED 的规则后，在重试原调用时原样回传其中的确认值。",
 };
 const descriptions: Record<string, Record<string, string>> = {
   "ssh_connect.input": {
@@ -65,25 +70,25 @@ const descriptions: Record<string, Record<string, string>> = {
     resource: "相对于远端 skill 目录的 UTF-8 文本资源路径；默认读取 SKILL.md，不执行脚本。",
   },
   "ssh_read_file.input": {
-    ...operationScope,
+    ...fileScope,
     file_path: "远端文件路径；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。",
     offset: "文本起始行号，省略时从第 1 行开始。",
     limit: "最多读取的文本行数，省略时为 2000 行。",
   },
   "ssh_write_file.input": {
-    ...operationScope,
+    ...fileScope,
     file_path: "目标远端文件；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。",
     content: "完整文件内容；字符数上限随 maxFileBytes 配置，远端另按 UTF-8 字节数校验。",
   },
   "ssh_edit_file.input": {
-    ...operationScope,
+    ...fileScope,
     file_path: "要编辑的远端文件；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。",
     old_string: "要替换的原文；不能为空，且不能含 NUL。字符数上限随 maxFileBytes 配置。",
     new_string: "替换后的文本；字符数上限随 maxFileBytes 配置，结果另受远端文件字节上限约束。",
     replace_all: "为 true 时替换所有匹配；否则必须恰好匹配一次。",
   },
   "ssh_upload.input": {
-    ...operationScope,
+    ...fileScope,
     cwd: "远端工作目录；默认使用工作区根目录或连接的远端 HOME。",
     localPath: "本地文件的绝对路径；localTransferRoots 非空时，必须位于其中一个目录内。",
     remotePath: "目标远端路径；支持绝对路径、~/ 和相对于 cwd 的路径。",
@@ -91,7 +96,7 @@ const descriptions: Record<string, Record<string, string>> = {
     expectedSha256: "期望的远端文件 SHA-256，小写十六进制；用于冲突检查。",
   },
   "ssh_download.input": {
-    ...operationScope,
+    ...fileScope,
     cwd: "远端工作目录；默认使用工作区根目录或连接的远端 HOME。",
     remotePath: "要下载的远端路径；支持绝对路径、~/ 和相对于 cwd 的路径。",
     localPath: "本地文件的绝对路径；localTransferRoots 非空时，必须位于其中一个目录内。",
@@ -119,6 +124,7 @@ function displayBounds(schema: Schema): string {
   }
   if (minimum !== undefined) return `不小于 ${minimum}。`;
   if (maximum !== undefined) return `不大于 ${maximum}。`;
+  if (schema.maxLength !== undefined && schema.minLength === schema.maxLength) return `长度为 ${schema.maxLength} 个字符。`;
   if (schema.maxLength !== undefined) return `最长 ${schema.maxLength} 个字符。`;
   return "";
 }

@@ -2,6 +2,16 @@
 
 NeverSSH 不安装远端服务。远端 Python 源码由本地包提供，首次连接写入内容寻址的构建缓存，后续连接复用。
 
+## 0.7.0 客户端升级
+
+工作区的读取、写入、编辑、上传和下载现在需要显式确认规则。收到 `WORKSPACE_RULES_CHANGED` 后，客户端应先展示完整规则，待阅读后，把同一响应给出的 `workspace_rules_ack` 作为参数加入原调用。旧客户端如果只重发原调用，会再次收到规则提示。即使首次响应丢失，被暂停的读取也不返回文件正文，被暂停的下载也不创建目的文件。打开工作区和运行 Bash 会展示规则，文件操作的确认单独记录。重新打开工作区后，需要重新确认适用规则。图片响应的 9 MiB 上限单独计算。
+
+并发检查同一目录时，如果收到 `WORKSPACE_RULES_RETRY`，使用原工作区 ID 重试即可。工具会先核对最新规则，再决定是否访问文件。
+
+远端 HOME 位于 NFS 时，修复了回收旧构建、重装损坏缓存和清理过期命令归档时报“目录非空”的问题。这些操作已在 Linux 的 NFSv4.1 挂载上验证。
+
+单文件 Bash 查看命令的标准输出为零字节时，不会建立读取记录。要整体替换空文件，可先用 `ssh_read_file` 读取。单文件搜索只有在交付的预览包含文件正文时才建立读取记录，预览可以截断。无匹配仍是有效的搜索结果，后续编辑前仍需读取文件。文本分页超过 256 KiB 时，客户端应调小 `limit` 或通过 `ssh_bash` 搜索。从任何 `offset` 起读到末尾，若剩余正文超过该上限，工具会返回整文件分页提示。
+
 ## 0.6.0 客户端升级
 
 `ssh_read_file` 已移除 PDF 渲染和 `pages` 参数。升级时，原先读取 PDF 的调用应改用远端已有的 PDF 工具。例如，远端安装了 `pdftotext` 时，可通过 `ssh_bash` 运行 `pdftotext report.pdf -` 提取正文。
@@ -40,8 +50,8 @@ skill 默认只从工作区根目录的 `.agents/skills`、`.claude/skills` 发�
 
 | 维度 | 当前值 | 兼容规则 |
 | --- | --- | --- |
-| MCP 服务版本 | `0.6.0` | `0.x` 阶段不兼容接口调整升 minor；`1.0` 起按 semver 升 major |
-| worker 协议 | `1` | 只在 wire 不兼容时递增；客户端校验，不匹配返回 `PROTOCOL_INCOMPATIBLE` |
+| MCP 服务版本 | `0.7.0` | `0.x` 阶段不兼容接口调整升 minor；`1.0` 起按 semver 升 major |
+| worker 协议 | `2` | 客户端与 worker 以新格式交换 Bash 文件读取记录，协议不匹配时返回 `PROTOCOL_INCOMPATIBLE` |
 | 构建 ID | 源码内容哈希 | 本地与远端必须完全一致；不匹配返回 `BUILD_MISMATCH` |
 | 最低 Python | `3.8` | 在加载任何源码前检查；过旧返回 `RUNTIME_UNSUPPORTED` |
 | 归档格式 | `1` | 新版本不删除未知或未来格式；旧任务仍可读取 |
@@ -69,7 +79,7 @@ skill 默认只从工作区根目录的 `.agents/skills`、`.claude/skills` 发�
 
 - 目录 700，文件 600，拒绝符号链接；每个源文件在安装和执行前校验 SHA-256。
 - 安装先写入 `.tmp-*`，校验后原子 rename；并发安装同一构建时以先完成者为准。
-- worker 对 `builds/<buildId>/.lock` 持有共享锁直到进程退出；清理器只有拿到独占锁才会删除。
+- worker 对 `builds/<buildId>/.lock` 持有共享锁直到进程退出。清理器持有缓存目录总锁，确认该构建已无人使用，关闭构建锁文件后才删除目录。
 - 默认保留当前构建和最近 2 个未锁定构建；超过 30 天的未锁定构建也会清理。
 - 缓存不可写或校验失败时返回 `BUILD_UNAVAILABLE`；正在使用的损坏构建不会被原地替换。
 
@@ -88,7 +98,7 @@ skill 默认只从工作区根目录的 `.agents/skills`、`.claude/skills` 发�
 | Bash | 命令工具需要 Bash | `BASH_UNAVAILABLE` |
 | Git | 可选；工作区用于检查分支和已有改动 | 在文本中说明不可用，规则、skill 和文件操作仍可使用 |
 | 远端 HOME | 可写，用于 `~/.neverssh` | `BUILD_UNAVAILABLE` / `ARCHIVE_UNAVAILABLE` |
-| 文件系统 | 本地 Linux 文件系统；NFS/SMB 的 `flock` 需验证 | `doctor` 报告 HOME 文件系统类型 |
+| 文件系统 | 需要支持进程间 `flock`。已验证 Linux 本地文件系统和 NFSv4.1（`local_lock=none`）。其他 NFS/SMB 配置需单独验证 | `doctor` 报告 HOME 文件系统类型 |
 | SFTP | 上传/下载需要远端启用 SFTP 子系统 | `SFTP_UNAVAILABLE` |
 | 本地 OpenSSH | 需要 `ssh` 和 `sftp` 客户端 | `SSH_UNAVAILABLE` / `SFTP_UNAVAILABLE` |
 | 压缩 | OpenSSH `Compression=yes`，服务端可拒绝 | 自动降级，不影响正确性 |
@@ -97,5 +107,5 @@ skill 默认只从工作区根目录的 `.agents/skills`、`.claude/skills` 发�
 
 - 本地包是唯一发布物；远端不单独发布，也不需要升级服务。
 - 构建 ID 由内容计算，发布物和远端缓存使用同一套源码。
-- 破坏性接口变化升 major，行为修复升 patch，新增工具或字段升 minor。
+- 行为修复升 patch，新增工具或字段升 minor。不兼容的接口调整在 0.x 阶段升 minor，从 1.0 起升 major。
 - 发布前至少覆盖 Linux 容器矩阵：Python 3.8–3.12、OpenSSH 8/9、SFTP/无 SFTP、Bash/无 Bash、NFS HOME、压缩开/关，以及旧归档格式的清理测试。

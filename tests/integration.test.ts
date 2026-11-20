@@ -11,7 +11,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { SshFixture } from "./fixture";
 import { Runtime } from "../src/runtime";
 import { ShortIds } from "../src/ids";
-import { BUILD_ID } from "../src/remote/bundle";
+import { BUILD_ID, PROTOCOL_VERSION, SERVER_VERSION } from "../src/remote/bundle";
 
 const fixture = new SshFixture();
 let client: Client;
@@ -140,9 +140,10 @@ describe("MCP and connections", () => {
     }
     expect(listing.tools.find((tool) => tool.name === "ssh_read_file")?.annotations?.readOnlyHint).toBe(true);
     const properties = (name: string) => Object.keys(listing.tools.find((tool) => tool.name === name)?.inputSchema.properties ?? {});
-    expect(properties("ssh_read_file")).toEqual(["connection_id", "workspace_id", "file_path", "offset", "limit"]);
-    expect(properties("ssh_write_file")).toEqual(["connection_id", "workspace_id", "file_path", "content"]);
-    expect(properties("ssh_edit_file")).toEqual(["connection_id", "workspace_id", "file_path", "old_string", "new_string", "replace_all"]);
+    const fileScope = ["connection_id", "workspace_id", "workspace_rules_ack"];
+    expect(properties("ssh_read_file")).toEqual([...fileScope, "file_path", "offset", "limit"]);
+    expect(properties("ssh_write_file")).toEqual([...fileScope, "file_path", "content"]);
+    expect(properties("ssh_edit_file")).toEqual([...fileScope, "file_path", "old_string", "new_string", "replace_all"]);
     expect(properties("ssh_task_list")).toEqual(["connection_id"]);
     // Some model providers reject the JSON Schema `pattern` keyword with a 400.
     for (const tool of listing.tools) {
@@ -395,6 +396,62 @@ describe("remote files", () => {
     await call("ssh_edit_file", { connection_id: dev, file_path: literal, old_string: "local", new_string: "edited local" });
   });
 
+  test("empty Bash views keep edit and overwrite guards until the caller receives file content or reads the empty file", async () => {
+    const connection_id = connectionId(await call("ssh_connect", { host: "fixture" }));
+    const file_path = "empty-bash-view.txt";
+    const edit = { connection_id, file_path, old_string: "content", new_string: "replacement" };
+    await writeFile(join(fixture.workspace, file_path), "\ncontent\n");
+    // BSD head rejects zero counts. On Linux these commands succeed with no output.
+    const commands = ["sed -n '999,1000p'", ...(process.platform === "linux" ? ["head -n 0", "head -c 0"] : [])];
+    for (const command of commands) {
+      expect(await call("ssh_bash", { connection_id, command: `${command} ${file_path}` })).toBe("");
+      expect(await call("ssh_edit_file", edit, true)).toContain("FILE_NOT_READ");
+    }
+    expect(await call("ssh_bash", { connection_id, command: `head -n 1 ${file_path}` })).toBe("\n");
+    expect(await call("ssh_edit_file", edit)).toContain("replacement");
+
+    const empty = { connection_id, file_path: "empty-cat-view.txt" };
+    await writeFile(join(fixture.workspace, empty.file_path), "");
+    expect(await call("ssh_bash", { connection_id, command: `cat ${empty.file_path}` })).toBe("");
+    const write = { ...empty, content: "filled" };
+    expect(await call("ssh_write_file", write, true)).toContain("read it with ssh_read_file first");
+    const background = await call("ssh_bash", { connection_id, command: `cat ${empty.file_path}`, run_in_background: true });
+    const query = { ...taskScope(background), wait_seconds: 3 };
+    const complete = await call("ssh_task_output", query);
+    expect(complete).toContain("Exit code: 0");
+    expect(await call("ssh_task_output", query)).toBe(complete);
+    expect(await call("ssh_write_file", write, true)).toContain("read it with ssh_read_file first");
+    expect(await call("ssh_read_file", empty)).toBe("File exists but is empty.");
+    await call("ssh_write_file", write);
+    expect(await readFile(join(fixture.workspace, empty.file_path), "utf8")).toBe("filled");
+  });
+
+  test("a single-file search establishes a revision only after matching text reaches the client", async () => {
+    const connection_id = connectionId(await call("ssh_connect", { host: "fixture" }));
+    const file_path = "search-revision.txt";
+    const edit = { connection_id, file_path, old_string: "first", new_string: "edited" };
+    await writeFile(join(fixture.workspace, file_path), "first\n" + "matching line\n".repeat(8000));
+    const miss = await call("ssh_bash", { connection_id, command: `grep absent ${file_path}` });
+    expect(miss).toContain("Exit code: 1");
+    await call("ssh_task_output", taskScope(miss));
+    expect(await call("ssh_edit_file", edit, true)).toContain("FILE_NOT_READ");
+    expect(await call("ssh_bash", { connection_id, command: `grep -l matching ${file_path}` })).toContain(file_path);
+    expect(await call("ssh_edit_file", edit, true)).toContain("FILE_NOT_READ");
+    if (Bun.which("rg")) {
+      const lineNumbers = await call("ssh_bash", { connection_id, command: `rg -m2 -no '^' ${file_path}` });
+      expect(lineNumbers).toBe("1:\n2:\n");
+      expect(await call("ssh_edit_file", edit, true)).toContain("FILE_NOT_READ");
+      const offsets = await call("ssh_bash", { connection_id, command: `rg -m1 -Unbo 'a{0}' ${file_path}` });
+      expect(offsets).toMatch(/^(?:1:\d+:\n)+$/);
+      expect(await call("ssh_edit_file", edit, true)).toContain("FILE_NOT_READ");
+    }
+
+    const matches = await call("ssh_bash", { connection_id, command: `grep matching ${file_path}` });
+    expect(matches).toContain("read selectively");
+    expect(matches).toContain("matching line");
+    expect(await call("ssh_edit_file", edit)).toContain("edited");
+  });
+
   test("reads non-UTF-8 text and permits clean rewrites while guarding exact edits and replacement characters", async () => {
     const file_path = join(fixture.workspace, "sjis.txt");
     const args = { connection_id: dev, file_path };
@@ -475,9 +532,13 @@ describe("remote files", () => {
     const connection_id = connectionId(await call("ssh_connect", { host: "fixture" }));
     const file_path = "long-source.txt";
     await writeFile(join(fixture.workspace, file_path), "a".repeat(99).concat("\n").repeat(3000));
-    for (const paging of [{}, { offset: 1 }, { offset: 1, limit: 3000 }]) {
-      expect(await call("ssh_read_file", { connection_id, file_path, ...paging }, true)).toContain("offset and limit");
+    for (const paging of [{}, { offset: 1 }, { offset: 1, limit: 3000 }, { offset: 2, limit: 2999 }]) {
+      expect(await call("ssh_read_file", { connection_id, file_path, ...paging }, true)).toContain("Whole-file read exceeds 256 KiB");
     }
+    const overBudget = await call("ssh_read_file", { connection_id, file_path, offset: 2, limit: 2700 }, true);
+    expect(overBudget).toContain("rg through ssh_bash");
+    expect(overBudget).not.toContain("PARTIAL");
+    expect(await call("ssh_read_file", { connection_id, file_path, offset: 3000 })).toBe("  3000\t" + "a".repeat(99));
     const page = await call("ssh_read_file", { connection_id, file_path, limit: 2 });
     expect(page).toContain("PARTIAL view: showing lines 1-2 of 3000.");
     for (const ext of ["xlsx", "PARQUET", "heic", "zip", "PDF"]) {
@@ -946,7 +1007,8 @@ describe("Bash tasks and archives", () => {
     const build = join(fixture.workspace, ".neverssh", "builds", BUILD_ID);
     const manifest = JSON.parse(await readFile(join(build, "manifest.json"), "utf8"));
     expect(manifest.build_id).toBe(BUILD_ID);
-    expect(manifest.protocol).toBe(1);
+    expect(manifest.protocol).toBe(PROTOCOL_VERSION);
+    expect(manifest.server_version).toBe(SERVER_VERSION);
     for (const name of ["worker.py", "file_ops.py", "helper.py", "archive.py", "build_cache.py", "workspace.py", "read_formats.py"]) {
       expect((await lstat(join(build, name))).isFile()).toBe(true);
     }

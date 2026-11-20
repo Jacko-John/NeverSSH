@@ -63,6 +63,10 @@ test("project operations accept exactly one scope and retain strict portable inp
     expect(input.safeParse({ ...args, connection_id: "1234abcd", workspace_id: "ws_abcd1234" }).success, name).toBe(false);
     expect(input.safeParse({ ...args, workspace_id: "abcd1234" }).success, name).toBe(false);
     expect(input.safeParse({ ...args, workspace_id: "ws_abcd1234", host: "other" }).success, name).toBe(false);
+    const ack = { workspace_rules_ack: "1a".repeat(32) };
+    expect(input.safeParse({ ...args, connection_id: "1234abcd", ...ack }).success, name).toBe(false);
+    expect(input.safeParse({ ...args, workspace_id: "ws_abcd1234", ...ack }).success, name).toBe(name !== "ssh_bash");
+    expect(input.safeParse({ ...args, workspace_id: "ws_abcd1234", workspace_rules_ack: "invalid" }).success, name).toBe(false);
   }
   for (const { name, inputSchema } of tools) {
     expect(inputSchema.type, name).toBe("object");

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.0
+
+- Workspace reads, writes, edits, uploads, and downloads require explicit rule confirmation. After reviewing `WORKSPACE_RULES_CHANGED`, retry the same call with its `workspace_rules_ack`. Losing the review response leaves the operation paused. Opening a workspace or running Bash can display rules without confirming them for file access.
+- Single-file Bash views that return zero bytes on stdout leave the file unread. A search qualifies when its delivered preview shows file text, even if truncated. To record an empty file before overwriting it, use `ssh_read_file`.
+- Text reads fail when the selected range exceeds 256 KiB. Choose a smaller `limit` or search with `rg`. An over-budget range through the end of the file gets the whole-file paging hint at any offset.
+- On NFS-backed home directories, NeverSSH can now remove unused builds and expired command archives and reinstall a damaged build without failing with “Directory not empty.”
+
 ## 0.6.0
 
 ### Breaking changes

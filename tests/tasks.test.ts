@@ -4,14 +4,14 @@ import { RemoteChannel, type RemoteResult } from "../src/ssh/request-channel";
 import { TaskManager } from "../src/tasks/manager";
 import { bashResult } from "../src/tasks/text";
 import { simpleCommandWords } from "../src/tasks/simple-command";
-import { viewedFile } from "../src/tasks/file-view";
+import { showsSearchText, viewedFile } from "../src/tasks/file-view";
 
 const REMOTE_HOME = "/home/fixture";
 
 test("only literal single-file viewing commands identify a read", () => {
   for (const command of [
     "cat --number", "/bin/cat -n", "nl -ba", "nl -b a", "bat --plain", "batcat --style=numbers",
-    "head --lines=1", "tail -n 1", "sed -n '1,2p'", "grep -n hi", "egrep -e 'hi|bye'",
+    "head --lines=1", "head -n 0", "head -c 0", "tail -n 1", "sed -n '1,2p'", "grep -n hi", "egrep -e 'hi|bye'",
     "fgrep --regexp=hi", "rg -uu -C 1 hi",
   ]) {
     expect(viewedFile(command + " 'file name'", REMOTE_HOME)?.path, command).toBe("file name");
@@ -19,9 +19,13 @@ test("only literal single-file viewing commands identify a read", () => {
   for (const command of [
     "cat a b", "cat a | head", "head a > result", "bat --version a", "rg --files a", "rg -h a",
     "rg -f patterns a", "cat *.txt", "cat $file", "cat -", "sed -n '1w changed' a", "./cat a",
+    "rg -l match a", "grep -il match a", "egrep --count match a", "fgrep -q match a",
   ]) {
     expect(viewedFile(command, REMOTE_HOME), command).toBeUndefined();
   }
+  expect(viewedFile("rg -na match file", REMOTE_HOME)?.binaryAsText).toBe(true);
+  expect(viewedFile("grep --text match file", REMOTE_HOME)?.binaryAsText).toBe(true);
+  expect(viewedFile("grep -eapart file", REMOTE_HOME)?.binaryAsText).toBe(false);
 });
 
 const CONNECTION = "1234abcd";
@@ -79,8 +83,8 @@ beforeEach(() => { fixture = new TaskFixture(); tasks = new TaskManager(fixture)
 afterEach(async () => { await tasks.close(); });
 
 /** Let open attach its listeners before emitting the remote handshake. */
-async function start(): Promise<{ id: string; channel: RemoteChannel }> {
-  const pending = tasks.start(CONNECTION, "fixture");
+async function start(command = "fixture"): Promise<{ id: string; channel: RemoteChannel }> {
+  const pending = tasks.start(CONNECTION, command);
   await Promise.resolve();
   const channel = fixture.channels.at(-1)!;
   fixture.started(channel);
@@ -222,6 +226,69 @@ test("large previews stay bounded while the archived byte count includes all out
   expect(text).toContain(`${HEADER_BYTES + 2097152} bytes`);
   expect(text).toContain("read selectively");
   expect(text).not.toContain('"output"');
+});
+
+test("file views require delivered stdout and only searches may have a truncated preview", async () => {
+  const revision = { path: "/srv/text", requestPath: "/srv/text", sha256: "a".repeat(64) };
+  for (const { command, code, stdout, stderr, credit } of [
+    { command: "rg abc text", code: 1, stdout: 0, stderr: 0, credit: false },
+    { command: "rg abc text", code: 0, stdout: 0, stderr: 1, credit: false },
+    { command: "rg abc text", code: 0, stdout: 5, stderr: 0, credit: true },
+    { command: "rg abc text", code: 0, stdout: 1, stderr: 5, credit: false },
+    { command: "cat text", code: 0, stdout: 5, stderr: 0, credit: false },
+    { command: "cat text", code: 0, stdout: 1, stderr: 0, credit: true },
+    { command: "head -n 0 text", code: 0, stdout: 0, stderr: 0, credit: false },
+    { command: "head -c 0 text", code: 0, stdout: 0, stderr: 1, credit: false },
+  ]) {
+    const { id, channel } = await start(command);
+    for (let i = 0; i < stdout; i++) fixture.output(channel, Buffer.alloc(16384, 120));
+    for (let i = 0; i < stderr; i++) fixture.output(channel, Buffer.alloc(16384, 100), "stderr");
+    emit(channel, { event: "exit", exitCode: code, outputBytes: fixture.sizes.get(channel),
+      outputComplete: true, viewedFile: { ...revision, hasNul: false } });
+    channel.finish(0);
+    const result = await tasks.output(id, 0);
+    expect(Boolean(tasks.takeFileView(result)), command).toBe(credit);
+    expect(tasks.takeFileView(result)).toBeUndefined();
+  }
+});
+
+test("search output distinguishes file text, match separators and binary-only notices", () => {
+  const plain = viewedFile("rg match sample", REMOTE_HOME)!;
+  const fragments = viewedFile("rg -o match sample", REMOTE_HOME)!;
+  const binaryNotice = 'binary file matches (found "\\0" byte around offset 123)\n';
+  expect(showsSearchText(plain, "\n", false)).toBe(true);
+  expect(showsSearchText(fragments, "\n\n", false)).toBe(false);
+  expect(showsSearchText(fragments, " \n", false)).toBe(true);
+  expect(showsSearchText(plain, binaryNotice, false)).toBe(true);
+  expect(showsSearchText(plain, binaryNotice, true)).toBe(false);
+  expect(showsSearchText(plain, "Binary file sample matches\n", true)).toBe(false);
+  expect(showsSearchText(plain, "match\n" + binaryNotice, true)).toBe(true);
+});
+
+test("multiline only-matching searches require visible text beyond match columns", () => {
+  const unnumbered = viewedFile("rg -Uo 'a{0}' sample", REMOTE_HOME)!;
+  expect(showsSearchText(unnumbered, "\n\n", false)).toBe(false);
+  const numbered = viewedFile("rg -Unbo 'a{0}' sample", REMOTE_HOME)!;
+  expect(showsSearchText(numbered, "1:0:\n1:1:\n2:2:\n", false)).toBe(false);
+  expect(showsSearchText(numbered, "1:0:a\n3:0:b\n", false)).toBe(true);
+  expect(showsSearchText(numbered, "1:0: \n2:0:\t\n", false)).toBe(true);
+});
+
+test("only-matching output strips precisely the requested match columns", () => {
+  const file = "part:1.txt";
+  for (const [flags, prefix] of [
+    ["-o", ""], ["-no", "1:"], ["-ob", "0:"], ["-onb", "1:0:"],
+    ["-Ho", file + ":"], ["-Ho --line-number", file + ":1:"], ["-Hbon", file + ":1:0:"],
+    ["-HnobI", "1:0:"], ["-Iob -H", file + ":0:"],
+  ] as const) {
+    const view = viewedFile(`rg ${flags} '^' ${file}`, REMOTE_HOME)!;
+    expect(showsSearchText(view, prefix + "\n" + prefix + "\n", false), flags).toBe(false);
+    expect(showsSearchText(view, prefix + "1:\n", false), flags).toBe(true);
+    expect(showsSearchText(view, prefix + " \n", false), flags).toBe(true);
+  }
+  const clipped = viewedFile(`rg -Hnbo '^' ${file}`, REMOTE_HOME)!;
+  expect(showsSearchText(clipped, "rt:1.txt:1:0:\n", false, true)).toBe(false);
+  expect(showsSearchText(clipped, "body from a long match\n", false, true)).toBe(true);
 });
 
 test("tiny output writes are also bounded by retained chunk count", async () => {

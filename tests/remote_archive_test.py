@@ -1,4 +1,5 @@
 """Exercise retention and quotas against real POSIX locks and temporary archive files."""
+import fcntl
 import json
 import multiprocessing
 import os
@@ -120,6 +121,52 @@ class ArchiveTests(unittest.TestCase):
         self.store.cleanup(now=finished + RETENTION_SECONDS + 1)
         self.assertTrue(Path(task.path).exists())
         self.assertTrue(Path(task.metadata_path).exists())
+
+    def test_future_session_format_preserves_even_recognizable_task_files(self):
+        task = self.task()
+        task.finish(0, None)
+        directory = Path(task.path).parent
+        write_metadata(directory / "session.json", {"format": 99})
+        self.store.cleanup(now=time.time() + RETENTION_SECONDS + 1)
+        self.assertTrue(Path(task.path).exists())
+        self.assertTrue(Path(task.metadata_path).exists())
+
+    def test_retirement_closes_leaf_locks_under_guard_and_leaves_new_entries(self):
+        identifier = "abcdef12"
+        session = self.store.new_session(identifier)
+        try:
+            task = self.store.new_task(identifier, "task_87654321", COMMAND)
+            task.finish(0, None)
+        finally:
+            os.close(session)
+        directory = Path(task.path).parent
+        task_lock = directory / "task_87654321.lock"
+        session_lock = directory / ".session.lock"
+        marker = directory / "user-file"
+        removed = []
+        unlink = os.unlink
+
+        def observe(path):
+            if Path(path) in (task_lock, session_lock):
+                with (self.root / ".archive.lock").open("r+b") as parent:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(parent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with open(path, "r+b") as leaf:
+                    fcntl.flock(leaf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                removed.append(Path(path))
+                if Path(path) == session_lock:
+                    marker.write_text("keep", encoding="utf-8")
+            return unlink(path)
+
+        with patch.object(os, "unlink", observe):
+            self.store.cleanup(now=time.time() + RETENTION_SECONDS + 1)
+        self.assertEqual(removed, [task_lock, session_lock])
+        self.assertEqual(marker.read_text(), "keep")
+        self.assertFalse(Path(task.path).exists())
+        self.store.cleanup()
+        self.assertEqual(marker.read_text(), "keep")
+        with self.store.guard():
+            self.assertEqual(self.store.usage(), 0)
 
     def test_active_lock_protects_even_old_logs_and_metadata(self):
         task = self.task()

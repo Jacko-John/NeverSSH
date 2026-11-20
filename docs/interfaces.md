@@ -279,13 +279,13 @@ No AGENTS.md instructions apply to these paths.
 
 规则、目录扫描和 Git 输出都有资源上限；规则不能完整读取时调用失败，目录或 Git 信息不完整时返回可读警告。整个上下文超过响应预算时也会失败；按错误说明重新打开项目并缩减 `skill_directories`，或调整配置中的 `maxFileBytes`。不会静默截断 `AGENTS.md`。Git 缺失或检查失败不阻止文件开发。自动 Git 检查禁用 fsmonitor，并在检测到 clean/process 过滤器时跳过这些过滤器并提示差异；需要正常项目 Git 行为时，先读取规则，再通过 `ssh_bash` 显式检查。
 
-工作区的写入、编辑和上传先检查适用规则。发现新增、变更或删除的规则时，调用返回 `WORKSPACE_RULES_CHANGED`、适用规则正文或删除提示，文件保持原样。阅读后直接重试即可。读取、下载和 Bash 随操作结果交付规则。路径范围、读取后编辑和文件版本检查继续生效。
+工作区的读取、写入、编辑、上传和下载都先检查适用规则。发现新增、变更或删除的规则时，调用返回 `WORKSPACE_RULES_CHANGED`，并在单独的文本块中给出新增或变更规则的完整正文、来源和范围，或指明已删除的规则。第一个文本块的 `workspace_rules_ack: …` 行给出本次确认值。阅读规则后，把该值原样作为 `workspace_rules_ack` 参数加入原调用。遗漏确认值或回传已失效的确认值时，工具会再次给出完整的待确认规则和当前确认值。被暂停的读取不返回文件内容或记录文件版本，被暂停的下载不创建本地目录或文件，已存在的目的文件也保持原样。路径范围、读取后编辑和文件版本检查继续生效。
 
-客户端先收到操作结果，普通文本保留任务首行和程序输出的空白，图片使用原生 `image` 内容块，笔记本可以返回多个内容块。规则有变化时，最后一个文本块单独返回规则增量，没有变化时不重复返回。已启动或转入后台的 Bash 在首次返回结果时交付规则，程序非零退出的结果也可附规则；命令已经运行，不要因为收到规则提示而重放。文件读取、编辑或传输等操作抛错时，不附规则，也不将本次采集的规则记为已返回。
+`ssh_bash` 仍会运行命令，并在首次返回结果时附上 `cwd` 的规则变化。程序输出的空白、任务首行和非零退出状态都会保留。命令已经运行，无需因规则提示而重放。只有规则发生变化才会出现附加文本块。
 
-如果操作执行期间工作区被重新打开或连接失效，保留原操作结果，但不再附带属于旧工作区状态的规则。
+打开工作区和 Bash 返回的规则只供阅读。文件工具收到对应的确认值后，才会记录该工作区已确认的规则。如果两个请求都遇到待确认的规则，两者都可以返回完整提示。任一调用确认后，后续请求可复用仍然适用且未变化的规则。确认值对应当前工作区、目标和规则版本。执行期间重新打开工作区或连接失效时，已执行的操作保留自身结果，过期工作区的规则不再随 Bash 结果返回。
 
-普通操作不重复未变化的规则、skill 目录和 Git 状态。再次调用 `ssh_workspace_open` 可恢复根目录上下文、刷新 Git 状态和重新发现 skill。相同连接、规范化根目录和 skill 配置可复用原句柄，但会重置规则交付记录并重建 skill 目录；后续目标操作会重新返回适用的子目录规则。对话压缩后再次打开并重读仍需使用的 skill，服务器无法判断模型是否还记得内容。
+普通操作省略 skill 目录和 Git 状态，文件操作省略已确认且未变化的规则。再次调用 `ssh_workspace_open` 可恢复根目录上下文、刷新 Git 状态和重新发现 skill。相同连接、规范化根目录和 skill 配置可复用原句柄，但会清除规则确认并重建 skill 目录；后续目标操作会重新返回适用的子目录规则。对话压缩后再次打开并重读仍需使用的 skill，服务器无法判断模型是否还记得内容。
 
 Bash 的规则发现只覆盖 `cwd`，不会分析命令内部的 `cd`、脚本或生成器涉及哪些目录。需要其他目录的规则时，可以在对应 `cwd` 操作或主动读取该目录的 `AGENTS.md`。连接模式不加载项目上下文。项目规则只为已授权任务提供指导，不扩大用户授权，也不改变客户端指令的优先级。
 
@@ -556,7 +556,7 @@ task_b8e3a160  running  7a2c9d4f  /home/developer/.neverssh/sessions/7a2c9d4f/ta
 
 ## 文件与传输
 
-文件工具必须且只能选择 `connection_id` 或 `workspace_id`。`file_path` 是远端路径：连接模式相对远端 HOME 解析，工作区模式相对项目根目录解析。读取返回带行号的文本、受支持的图片，或 Jupyter 单元格及其保存的输出，并按真实目标路径记录文件版本；符号链接与已读取的其他路径拼写共享该版本，编辑前必须读取或写入该文件。工作区中的写入、编辑和上传会先交付规则变更并要求重试。读取和下载随结果交付规则。再次调用 `ssh_workspace_open` 可恢复根目录上下文。连接模式不加载项目上下文。目录列表、文件查找和内容搜索通过 `ssh_bash` 执行 `ls`、`find`、`rg`。
+文件工具必须且只能选择 `connection_id` 或 `workspace_id`。`file_path` 是远端文件路径。连接模式从远端 HOME 解析相对路径，工作区模式从项目根目录解析。工作区文件或传输操作返回 `WORKSPACE_RULES_CHANGED` 时，读完规则并携带响应中的 `workspace_rules_ack` 重试原调用。再次调用 `ssh_workspace_open` 可恢复根目录上下文。连接模式不加载项目规则。读取返回带行号的文本、受支持的图片，或 Jupyter 单元格及其保存的输出。文件版本按真实目标记录，符号链接与目标路径共享版本。目录列表、文件查找和内容搜索通过 `ssh_bash` 执行 `ls`、`find`、`rg`。
 
 远端写入、上传和下载会自动创建缺失的父目录；配置了非空 `localTransferRoots` 时，本地父目录不能通过符号链接逃出该范围。`ssh_upload` / `ssh_download` 使用 SFTP，复用当前连接的 ControlMaster；其他工具走 worker，包括图片读取。SSH 压缩默认开启（`compression: true`），可通过本地配置关闭。文件版本由服务端内部记录。项目开发默认直接使用远端文件工具，批量修改和代码生成使用远端 `ssh_bash`；上传下载用于具体的文件传输需求。
 
@@ -570,20 +570,21 @@ task_b8e3a160  running  7a2c9d4f  /home/developer/.neverssh/sessions/7a2c9d4f/ta
 | --- | --- | --- | --- | --- |
 | `connection_id` | string | 否 | 无 | 远端连接 ID；与 workspace_id 必须且只能填写一个。 |
 | `workspace_id` | string | 否 | 无 | 远端工作区 ID；与 connection_id 必须且只能填写一个。 |
+| `workspace_rules_ack` | string | 否 | 无 | 仅用于工作区。阅读 WORKSPACE_RULES_CHANGED 的规则后，在重试原调用时原样回传其中的确认值。长度为 64 个字符。 |
 | `file_path` | string | 是 | 无 | 远端文件路径；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。最长 4096 个字符。 |
 | `offset` | integer | 否 | 无 | 文本起始行号，省略时从第 1 行开始。不小于 1。 |
 | `limit` | integer | 否 | 无 | 最多读取的文本行数，省略时为 2000 行。不小于 1。 |
 
 ### 返回
 
-文本正文使用 `cat -n` 风格显示行号。如果内容自上次读取后发生变化，工具会另附提示。工作区规则变更放在结果末尾的独立文本块中。
+文本正文使用 `cat -n` 风格显示行号。如果内容自上次读取后发生变化，工具会另附提示。
 
 ```text
      1	import { createServer } from "node:http";
      2	
 ```
 
-读取被截断时追加：
+成功读取的页后面还有行时，工具会给出下一页起点。
 
 ```text
 PARTIAL view: showing lines 1-2000 of 5000. Use offset=2001 to continue.
@@ -591,7 +592,7 @@ PARTIAL view: showing lines 1-2000 of 5000. Use offset=2001 to continue.
 
 空文件返回 `File exists but is empty.`；`offset` 超过最后一行时返回 `File has <N> lines; offset <M> is past the end.`
 
-图片完整返回为原生 MCP `image` 内容块，不把图片数据写入文本，也不在本地保存文件。客户端需要支持 MCP 图片显示。工作区规则有变化时，仍在图片后附加独立的文本块；未变化的规则不重复返回。
+图片完整返回为原生 MCP `image` 内容块，不把图片数据写入文本，也不在本地保存文件。客户端需要支持 MCP 图片显示。
 
 ### 示例
 
@@ -616,13 +617,13 @@ PARTIAL view: showing lines 1-2000 of 5000. Use offset=2001 to continue.
 
 按文件内容的标识识别 PNG、JPEG、GIF 和 WebP，不依赖扩展名。查看远端图片直接传入其 `file_path`，无需通过 SFTP 下载到本地。图片完整返回，`offset` 和 `limit` 只适用于文本。SVG 按文本读取。对于 XLSX、Parquet、HEIC、ZIP 等已知二进制扩展名，工具会提示通过对应格式的 skill 或远端命令查看。
 
-所有输入文件均受 `maxFileBytes` 限制（默认 4 MiB，可配置到 8 MiB）。普通文本默认从第 1 行起最多显示 2000 行。整文件超过 256 KiB 时，默认调用及显式覆盖全文的请求会失败。用较小的 `limit` 指定行数，用 `offset` 继续。每段返回的文本也有 256 KiB 的预算。
+所有输入文件均受 `maxFileBytes` 限制（默认 4 MiB，可配置到 8 MiB）。普通文本默认从第 1 行起最多显示 2000 行。整文件超过 256 KiB 时，默认调用会提示用 `offset` 和 `limit` 分页。从任意行读到末尾，只要剩余正文超过 256 KiB，也会返回整文件分页提示。选取中间一段时，所选行必须全部容纳在 256 KiB 内，否则调用失败，提示缩小范围或通过 `ssh_bash` 用 `rg` 搜索。恰好 256 KiB 可以读取。成功返回的 `PARTIAL view` 表示所选行已完整交付，后面还有行可读。
 
 `.ipynb` 按顺序返回各单元格的类型、源代码或 Markdown，以及保存的文本输出、报错和图形。文字总量超过 256 KiB 时，可在远端通过 `ssh_bash` 运行 `jq` 选取需要的单元格。
 
 直接读取 PDF 会返回格式不支持的错误。需要提取文字时，可通过 `ssh_bash` 调用远端已有的 PDF 工具。例如，`pdftotext -f 1 -l 3 report.pdf -` 会将前三页的文字写到标准输出。
 
-图片及附带规则的完整 MCP 结果序列化后另有 9 MiB 上限，独立于原始文件的 `maxFileBytes` 限制。超限时返回文本错误，需缩小图片后重试；不会截断图片或自动下载。本次未交付的工作区规则不会被记为已返回。
+含图片的完整 MCP 响应序列化后另有 9 MiB 上限，独立于原始文件的 `maxFileBytes` 限制。工作区规则在先前的暂停响应中单独交付。图片响应超限时，工具返回文本错误，提示缩小图片后重试，不会截断图片或自动下载。
 
 同一版本的全部内容读完后，可以精确编辑或覆盖该文件。看到 `PARTIAL view` 时，可按提示继续翻页，也可乱序读取。文本按行记录读取进度。每个文件记录最多 32 段互不相连的范围。跳读超过这个数量时，从较小的行号顺序往后读即可补齐。两次读取之间文件内容有变化时，工具会提示，分页进度从新版本重新计算。并发读取返回旧快照时，工具会提示重新确认内容，并保留较新版本的记录。读取不会延长日志保留期。
 
@@ -638,6 +639,7 @@ PARTIAL view: showing lines 1-2000 of 5000. Use offset=2001 to continue.
 | --- | --- | --- | --- | --- |
 | `connection_id` | string | 否 | 无 | 远端连接 ID；与 workspace_id 必须且只能填写一个。 |
 | `workspace_id` | string | 否 | 无 | 远端工作区 ID；与 connection_id 必须且只能填写一个。 |
+| `workspace_rules_ack` | string | 否 | 无 | 仅用于工作区。阅读 WORKSPACE_RULES_CHANGED 的规则后，在重试原调用时原样回传其中的确认值。长度为 64 个字符。 |
 | `file_path` | string | 是 | 无 | 目标远端文件；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。最长 4096 个字符。 |
 | `content` | string | 是 | 无 | 完整文件内容；字符数上限随 maxFileBytes 配置，远端另按 UTF-8 字节数校验。最长 4194304 个字符。 |
 
@@ -691,6 +693,7 @@ File created successfully at: /srv/app/notes.txt
 | --- | --- | --- | --- | --- |
 | `connection_id` | string | 否 | 无 | 远端连接 ID；与 workspace_id 必须且只能填写一个。 |
 | `workspace_id` | string | 否 | 无 | 远端工作区 ID；与 connection_id 必须且只能填写一个。 |
+| `workspace_rules_ack` | string | 否 | 无 | 仅用于工作区。阅读 WORKSPACE_RULES_CHANGED 的规则后，在重试原调用时原样回传其中的确认值。长度为 64 个字符。 |
 | `file_path` | string | 是 | 无 | 要编辑的远端文件；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。最长 4096 个字符。 |
 | `old_string` | string | 是 | 无 | 要替换的原文；不能为空，且不能含 NUL。字符数上限随 maxFileBytes 配置。最长 4194304 个字符。 |
 | `new_string` | string | 是 | 无 | 替换后的文本；字符数上限随 maxFileBytes 配置，结果另受远端文件字节上限约束。最长 4194304 个字符。 |
@@ -727,7 +730,7 @@ The file /srv/app/notes.txt has been updated successfully.
 
 同一连接下，读完同一版本的文件、查看单文件的 Bash 命令或一次成功写入均可建立编辑所需的版本记录。缺少记录时返回 `FILE_NOT_READ`。文件随后被外部修改时，哈希检查会拒绝编辑，需要重新读取。
 
-例如，`cat src/main.ts` 或 `sed -n '1,20p' src/main.ts` 的完整命令输出交付后，可接着编辑该文件。支持 `cat`、`nl`、`bat`、`batcat`、`head`、`tail`、`sed -n` 打印行范围，以及单文件 `grep`、`egrep`、`fgrep`、`rg`。命令须能确定唯一的文件路径。`cat ~/'my file'` 从远端用户主目录读取，引号包住整个 `'~/my file'` 时则按 Bash 的规则在当前目录查找名为 `~` 的子目录。带管道、重定向、动态文件名或多个文件的命令不能建立记录。
+例如，`sed -n '1,20p' src/main.ts` 完整返回选中行的正文后，可接着编辑该文件。如果所选范围超出文件末尾，或 `head -n 0` 返回零字节标准输出，命令正常完成，文件仍需读取。实际返回的空行含一个换行符，可以计入读取。对于空文件，`ssh_read_file` 会确认文件为空，随后可用 `ssh_write_file` 写入。支持 `cat`、`nl`、`bat`、`batcat`、`head`、`tail`、`sed -n` 打印行范围，以及单文件 `grep`、`egrep`、`fgrep`、`rg`。单文件搜索成功时，只要交付的预览含文件正文，即使预览被截断，也可建立读取记录。无匹配的搜索仍是有效的 Bash 结果。无输出、仅计数、仅列文件名或仅报告二进制匹配的搜索不能用于后续编辑。命令须能确定唯一的文件路径。`cat ~/'my file'` 从远端用户主目录读取，引号包住整个 `'~/my file'` 时则按 Bash 的规则在当前目录查找名为 `~` 的子目录。带管道、重定向、动态文件名或多个文件的命令不能建立记录。
 
 `replace_all=false` 时 `old_string` 必须恰好出现一次；`replace_all=true` 时至少出现一次。匹配数不符或文件无法作为 UTF-8 文本读取时不写入任何内容。相同的新旧字符串会直接返回 `NO_CHANGES`。替换成功后显示第一处修改和附近的行，多处替换还会给出总次数。较长的预览含省略标记。编辑沿用已有文件的换行、Unix mode 和所有者。
 
@@ -741,6 +744,7 @@ The file /srv/app/notes.txt has been updated successfully.
 | --- | --- | --- | --- | --- |
 | `connection_id` | string | 否 | 无 | 远端连接 ID；与 workspace_id 必须且只能填写一个。 |
 | `workspace_id` | string | 否 | 无 | 远端工作区 ID；与 connection_id 必须且只能填写一个。 |
+| `workspace_rules_ack` | string | 否 | 无 | 仅用于工作区。阅读 WORKSPACE_RULES_CHANGED 的规则后，在重试原调用时原样回传其中的确认值。长度为 64 个字符。 |
 | `cwd` | string | 否 | 无 | 远端工作目录；默认使用工作区根目录或连接的远端 HOME。最长 4096 个字符。 |
 | `localPath` | string | 是 | 无 | 本地文件的绝对路径；localTransferRoots 非空时，必须位于其中一个目录内。最长 4096 个字符。 |
 | `remotePath` | string | 是 | 无 | 目标远端路径；支持绝对路径、~/ 和相对于 cwd 的路径。最长 4096 个字符。 |
@@ -791,6 +795,7 @@ SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 | --- | --- | --- | --- | --- |
 | `connection_id` | string | 否 | 无 | 远端连接 ID；与 workspace_id 必须且只能填写一个。 |
 | `workspace_id` | string | 否 | 无 | 远端工作区 ID；与 connection_id 必须且只能填写一个。 |
+| `workspace_rules_ack` | string | 否 | 无 | 仅用于工作区。阅读 WORKSPACE_RULES_CHANGED 的规则后，在重试原调用时原样回传其中的确认值。长度为 64 个字符。 |
 | `cwd` | string | 否 | 无 | 远端工作目录；默认使用工作区根目录或连接的远端 HOME。最长 4096 个字符。 |
 | `remotePath` | string | 是 | 无 | 要下载的远端路径；支持绝对路径、~/ 和相对于 cwd 的路径。最长 4096 个字符。 |
 | `localPath` | string | 是 | 无 | 本地文件的绝对路径；localTransferRoots 非空时，必须位于其中一个目录内。最长 4096 个字符。 |
@@ -844,7 +849,8 @@ SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 | `FILE_NOT_READ` | 缺少可用于编辑的当前文件版本 | 用 `ssh_read_file` 读完所需页面，再次提交编辑。 |
 | `NO_CHANGES` | 新旧字符串完全相同 | 提供要替换的内容，或跳过这次编辑。 |
 | `WORKSPACE_NOT_FOUND` | 工作区 ID 无效或不再可用 | 确认连接可用后重新打开项目。 |
-| `WORKSPACE_RULES_CHANGED` | 工作区目标存在待交付的规则变化，写入、编辑或上传已暂停 | 阅读规则后重新提交操作。 |
+| `WORKSPACE_RULES_CHANGED` | 工作区文件或传输操作因适用规则变化而暂停 | 阅读规则，在原调用中原样回传响应给出的 `workspace_rules_ack`。 |
+| `WORKSPACE_RULES_RETRY` | 并发检查期间，另一请求已交付不同的目录规则，本次文件操作已暂停 | 在同一工作区重试原调用，工具会重新检查当前规则。 |
 | `WORKSPACE_REOPEN_REQUIRED` | 准备操作期间工作区被重新打开、规则历史达到上限，或 skill 读取结果所属的目录已失效 | 按具体错误指引重新打开工作区；准备阶段失败时操作未执行，过期 skill 的结果会被丢弃。 |
 | `OPERATION_FAILED` | 本地文件、参数处理失败或图片响应超限 | 按消息检查目录限制、路径和权限；图片响应过大时缩小图片后重试。 |
 | `OPERATION_CANCELLED` / `OPERATION_INTERRUPTED` | 调用被取消，或远端操作超时 | 写入结果可能未知，先检查目标再重试。 |

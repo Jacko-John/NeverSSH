@@ -50,8 +50,6 @@ def view_stamp(path, limit):
 
 def viewed_revision(path, stamp, limit, requested_cwd):
     """Hash only the bounded regular file that stayed in place throughout the Bash view."""
-    if stamp is None:
-        return None
     try:
         with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as handle:
             if file_stamp(os.fstat(handle.fileno())) != stamp:
@@ -64,7 +62,7 @@ def viewed_revision(path, stamp, limit, requested_cwd):
                 request_path = os.path.normpath(os.path.join(requested_cwd, path))
                 if os.path.realpath(request_path) != canonical:
                     request_path = canonical
-                return {"path": canonical, "requestPath": request_path,
+                return {"path": canonical, "requestPath": request_path, "hasNul": b"\x00" in data,
                         "sha256": hashlib.sha256(data).hexdigest()}
     except OSError:
         pass  # Revision tracking is optional when a file disappears during the command.
@@ -113,8 +111,8 @@ def command_session(requested_cwd):
     previous = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
     try:
         archive = store.new_task(request["connectionId"], args["taskId"], args["command"])
-        view = args.get("view")
-        stamp = view_stamp(view["path"], request["maxFileBytes"]) if view else None
+        view_path = args.get("viewPath")
+        stamp = view_stamp(view_path, request["maxFileBytes"]) if view_path else None
         # Shell configuration and environment changes belong only to this process.
         child = subprocess.Popen([bash, "--noprofile", "--norc", "-c", args["command"]],
                                  cwd=os.getcwd(), stdin=subprocess.DEVNULL,
@@ -220,8 +218,8 @@ def command_session(requested_cwd):
         if cleanup_error is not None:
             raise cleanup_error
     revision = None
-    if stamp is not None and reason is None and (child.returncode == 0 or (view["search"] and child.returncode == 1)):
-        revision = viewed_revision(view["path"], stamp, request["maxFileBytes"], requested_cwd)
+    if stamp is not None and reason is None and child.returncode == 0:
+        revision = viewed_revision(view_path, stamp, request["maxFileBytes"], requested_cwd)
     emit({"event": "exit", "exitCode": child.returncode, "reason": reason, "viewedFile": revision,
           "message": message, "outputBytes": archive.bytes,
           "outputComplete": output_complete})

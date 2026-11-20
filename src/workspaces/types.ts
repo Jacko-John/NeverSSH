@@ -25,7 +25,8 @@ export type InstructionDelta = {
   updated: Instruction[];
   removed: Pick<Instruction, "path" | "scope">[];
 };
-export type PreparedScope = { connectionId: string; path: string; context?: WorkspaceContext; needsRuleReview?: true };
+export type InstructionReview = InstructionDelta & { token: string };
+export type PreparedScope = { connectionId: string; path: string; context?: WorkspaceContext };
 export type SkillRead = {
   workspace_id: string; connection_id: string; name: string;
   path: string; directory: string; execution: "remote"; content: string; sha256: string;

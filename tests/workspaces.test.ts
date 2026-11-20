@@ -35,6 +35,22 @@ async function call(name: string, args: Record<string, unknown>, error = false):
   return textCall(client, name, args, error);
 }
 
+/** Read the acknowledgement from the review the client actually received. */
+function acknowledgement(review: string): { workspace_rules_ack: string } {
+  const match = /^workspace_rules_ack: ([a-f0-9]{64})$/m.exec(review);
+  expect(match, review.slice(0, 2048)).not.toBeNull();
+  return { workspace_rules_ack: match![1]! };
+}
+
+async function pausedAccess(peer: Client, name: "ssh_read_file" | "ssh_download", args: Record<string, unknown>, guidance: string): Promise<string> {
+  const response = await textCall(peer, name, args, true);
+  expect(response).toStartWith("Error: WORKSPACE_RULES_CHANGED\n");
+  expect(response).toContain(name === "ssh_read_file" ? "The file was not read." : "The file was not downloaded.");
+  expect(response).toMatch(/retry/i);
+  expect(response).toContain(guidance);
+  return response;
+}
+
 /** Extract only the advertised opaque handle needed for the next call. */
 function workspaceId(text: string): string {
   const match = /^Workspace: (ws_[a-f0-9]{8})$/m.exec(text);
@@ -158,57 +174,77 @@ describe("workspace context and instruction delivery", () => {
     const written = guidance?.type === "text" ? guidance.text : "";
     expect(written).toContain("Backend rule.\n");
     expect(written.indexOf("Backend rule.")).toBeLessThan(written.indexOf("API rule."));
-    expect(written).not.toContain("Root rule.\n");
+    expect(written).toContain("Root rule.\n");
+    expect(written.indexOf("Root rule.")).toBeLessThan(written.indexOf("Backend rule."));
     expect(written).not.toContain("Frontend-only rule.");
     expect(await stat(join(root, "backend/api/new")).catch(() => null)).toBeNull();
-    const repeated = await call("ssh_write_file", { workspace_id: id, file_path, content: "new file\n" });
+    const repeated = await call("ssh_write_file", { workspace_id: id, file_path, content: "new file\n",
+      ...acknowledgement(result?.type === "text" ? result.text : "") });
     expect(repeated).not.toContain("Backend rule.");
     expect(repeated).not.toContain("API rule.");
     expect(await readFile(join(root, file_path), "utf8")).toBe("new file\n");
   });
 
-  test("successful reads deliver nested rules and reopening resets their delivery", async () => {
+  test("new nested rules pause reads before recording a revision and reopening resets their delivery", async () => {
     const root = await project({ "AGENTS.md": "Root rule.\n", "src/AGENTS.md": "Nested rule.\n", "src/value.txt": "before\n" });
     const original = await open(root);
-    const read = await call("ssh_read_file", { workspace_id: original.id, file_path: "src/value.txt" });
-    expect(read).toContain("Nested rule.\n");
-    expect(read).not.toContain("Root rule.\n");
-    expect(read).toStartWith("     1\tbefore");
-    expect(await call("ssh_read_file", { workspace_id: original.id, file_path: "src/value.txt" })).toBe("     1\tbefore");
-    await call("ssh_edit_file", { workspace_id: original.id, file_path: "src/value.txt", old_string: "before", new_string: "after" });
+    const args = { workspace_id: original.id, file_path: "src/value.txt" };
+    const paused = await pausedAccess(client, "ssh_read_file", args, "Nested rule.\n");
+    expect(paused).toContain("Root rule.\n");
+    expect(paused).not.toContain("     1\tbefore");
+    const edit = { ...args, old_string: "before", new_string: "after" };
+    expect(await call("ssh_edit_file", edit, true)).toContain("WORKSPACE_RULES_CHANGED");
+    const retry = await pausedAccess(client, "ssh_read_file", args, "Nested rule.\n");
+    expect(retry).not.toContain("     1\tbefore");
+    const malformed = await call("ssh_read_file", { ...args, workspace_rules_ack: "invalid" }, true);
+    expect(malformed).not.toContain("     1\tbefore");
+    const wrongToken = await pausedAccess(client, "ssh_read_file", { ...args, workspace_rules_ack: "0".repeat(64) }, "Nested rule.\n");
+    expect(wrongToken).not.toContain("     1\tbefore");
+    expect(await call("ssh_read_file", { ...args, ...acknowledgement(retry) })).toBe("     1\tbefore");
+    await call("ssh_edit_file", edit);
     expect(await readFile(join(root, "src/value.txt"), "utf8")).toBe("after\n");
     const reopened = await open(root);
     expect(reopened.id).toBe(original.id);
     expect(reopened.text).not.toContain("Nested rule.");
     const write = { workspace_id: reopened.id, file_path: "src/new.txt", content: "new\n" };
-    expect(await call("ssh_write_file", write, true)).toContain("Nested rule.\n");
+    const afterReopen = await call("ssh_write_file", { ...write, ...acknowledgement(retry) }, true);
+    expect(afterReopen).toContain("Nested rule.\n");
+    expect(afterReopen).toContain("Root rule.\n");
+    expect(acknowledgement(afterReopen)).not.toEqual(acknowledgement(retry));
     expect(await stat(join(root, "src/new.txt")).catch(() => null)).toBeNull();
-    await call("ssh_write_file", { workspace_id: reopened.id, file_path: "root.txt", content: "root guidance delivered\n" });
-    expect(await call("ssh_write_file", write)).not.toContain("Nested rule.");
+    expect(await call("ssh_write_file", { ...write, ...acknowledgement(afterReopen) })).not.toContain("Nested rule.");
+    await call("ssh_write_file", { workspace_id: reopened.id, file_path: "root.txt", content: "root guidance confirmed\n" });
     expect(await readFile(join(root, "src/new.txt"), "utf8")).toBe("new\n");
   });
 
-  test("image reads return the image before new guidance and do not repeat delivered rules", async () => {
+  test("image reads return only the scoped guidance until the caller retries", async () => {
     const base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
     const root = await project({ "AGENTS.md": "Root image rule.\n", "src/AGENTS.md": "Source image rule.\n" });
     await writeFile(join(root, "src/preview.bin"), Buffer.from(base64, "base64"));
     const { id } = await open(root);
     const args = { workspace_id: id, file_path: "src/preview.bin" };
-    const first = await client.callTool({ name: "ssh_read_file", arguments: args });
-    expect(Boolean(first.isError)).toBe(false);
-    expect(first.structuredContent).toBeUndefined();
-    expect(first.content).toHaveLength(2);
-    expect(first.content[0]).toEqual({ type: "image", data: base64, mimeType: "image/png" });
-    const guidance = first.content[1];
-    expect(guidance?.type).toBe("text");
-    const text = guidance?.type === "text" ? guidance.text : "";
-    expect(text).toContain(`Project instructions: ${root}/src/AGENTS.md\nScope: ${root}/src\nSource image rule.\n`);
-    expect(text).not.toContain("Root image rule.");
+    const text = await pausedAccess(client, "ssh_read_file", args,
+      `Project instructions: ${root}/src/AGENTS.md\nScope: ${root}/src\nSource image rule.\n`);
+    expect(text).toContain("Root image rule.");
     expect(text).not.toContain(base64);
-    const second = await client.callTool({ name: "ssh_read_file", arguments: args });
+    const second = await client.callTool({ name: "ssh_read_file", arguments: { ...args, ...acknowledgement(text) } });
     expect(Boolean(second.isError)).toBe(false);
     expect(second.structuredContent).toBeUndefined();
     expect(second.content).toEqual([{ type: "image", data: base64, mimeType: "image/png" }]);
+  });
+
+  test("a review for one target cannot confirm a sibling target before acknowledgement", async () => {
+    const root = await project({ "src/AGENTS.md": "Review the source directory.\n", "src/one": "first", "src/two": "second" });
+    const { id } = await open(root);
+    const one = { workspace_id: id, file_path: "src/one" };
+    const two = { workspace_id: id, file_path: "src/two" };
+    const first = await pausedAccess(client, "ssh_read_file", one, "Review the source directory.");
+    const sibling = await pausedAccess(client, "ssh_read_file", { ...two, ...acknowledgement(first) }, "Review the source directory.");
+    expect(sibling).not.toContain("     1\tsecond");
+    const localPath = join(fixture.transfers, "sibling-acknowledged.txt");
+    await call("ssh_download", { workspace_id: id, remotePath: two.file_path, localPath, ...acknowledgement(sibling) });
+    expect(await readFile(localPath, "utf8")).toBe("second");
+    expect(await call("ssh_read_file", one)).toBe("     1\tfirst");
   });
 
   test("ordinary reads omit catalogs and report only changed or removed rules", async () => {
@@ -216,8 +252,8 @@ describe("workspace context and instruction delivery", () => {
       ".agents/skills/check/SKILL.md": "---\nname: check\ndescription: Catalog must not repeat on reads.\n---\nBody.\n" });
     const opened = await open(root);
     expect(opened.text).toContain("Catalog must not repeat on reads.");
-    const first = await call("ssh_read_file", { workspace_id: opened.id, file_path: "src/value.txt" });
-    expect(first).toContain("Nested rule.\n");
+    const args = { workspace_id: opened.id, file_path: "src/value.txt" };
+    const first = await pausedAccess(client, "ssh_read_file", args, "Nested rule.\n");
     expect(first).not.toContain("Revision:");
     expect(first).not.toContain("Catalog must not repeat on reads.");
     const reopened = await open(root);
@@ -225,33 +261,34 @@ describe("workspace context and instruction delivery", () => {
     expect(reopened.text).toContain("Root rule.\n");
     expect(reopened.text).not.toContain("Nested rule.\n");
     expect(reopened.text).toContain("Catalog must not repeat on reads.");
-    const recovered = await call("ssh_read_file", { workspace_id: reopened.id, file_path: "src/value.txt" });
-    expect(recovered).toContain("Nested rule.\n");
-    expect(recovered).not.toContain("Root rule.\n");
+    const recovered = await pausedAccess(client, "ssh_read_file", { ...args, ...acknowledgement(first) }, "Nested rule.\n");
+    expect(recovered).toContain("Root rule.\n");
     expect(recovered).not.toContain("Catalog must not repeat on reads.");
+    expect(await call("ssh_read_file", { ...args, ...acknowledgement(recovered) })).toBe("     1\tbefore");
 
     await writeFile(join(root, "src/AGENTS.md"), "Changed nested rule.\n");
-    const changed = await call("ssh_read_file", { workspace_id: opened.id, file_path: "src/value.txt" });
-    expect(changed).toContain("Changed nested rule.\n");
+    const changed = await pausedAccess(client, "ssh_read_file", { ...args, ...acknowledgement(recovered) }, "Changed nested rule.\n");
     expect(changed).not.toContain("Root rule.\n");
     expect(changed).not.toContain("Nested rule.\n");
 
     await unlink(join(root, "src/AGENTS.md"));
-    const removed = await call("ssh_read_file", { workspace_id: opened.id, file_path: "src/value.txt" });
-    expect(removed).toContain(`Project instructions removed: ${root}/src/AGENTS.md\nScope: ${root}/src`);
+    const removed = await pausedAccess(client, "ssh_read_file", { ...args, ...acknowledgement(changed) },
+      `Project instructions removed: ${root}/src/AGENTS.md\nScope: ${root}/src`);
     expect(removed).not.toContain("Changed nested rule.\n");
+    expect(await call("ssh_read_file", { ...args, ...acknowledgement(removed) })).toBe("     1\tbefore");
     await call("ssh_edit_file", { workspace_id: opened.id, file_path: "src/value.txt", old_string: "before", new_string: "after" });
   });
 
-  test("a failed missing or binary read does not deliver the prepared nested guidance", async () => {
+  test("a missing or binary file reports its read error only after guidance is delivered", async () => {
     for (const file of ["missing.txt", "binary.txt"]) {
       const root = await project({ "src/AGENTS.md": "Guidance that must reach the response.\n", "src/binary.txt": "\0binary" });
       const { id } = await open(root);
-      const failed = await call("ssh_read_file", { workspace_id: id, file_path: "src/" + file }, true);
+      const target = { workspace_id: id, file_path: "src/" + file };
+      const review = await pausedAccess(client, "ssh_read_file", target, "Guidance that must reach the response.\n");
+      const failed = await call("ssh_read_file", { ...target, ...acknowledgement(review) }, true);
+      expect(failed).toMatch(file === "missing.txt" ? /no such file/i : /binary/i);
       expect(failed).not.toContain("Guidance that must reach the response.");
       const args = { workspace_id: id, file_path: "src/new.txt", content: "written" };
-      const written = await call("ssh_write_file", args, true);
-      expect(written).toContain("Guidance that must reach the response.\n");
       await call("ssh_write_file", args);
       expect(await readFile(join(root, "src/new.txt"), "utf8")).toBe("written");
       expect(await call("ssh_read_file", { workspace_id: id, file_path: "src/new.txt" })).not.toContain("Guidance that must reach the response.");
@@ -300,7 +337,7 @@ describe("workspace context and instruction delivery", () => {
     }
   }, 15000);
 
-  test("a failed read formatter does not deliver guidance after the remote read succeeded", async () => {
+  test("a paused read skips formatting and a failed retry leaves the file unread", async () => {
     const root = await project({ "src/AGENTS.md": "Formatter delivery rule.\n", "src/value.txt": "before\n" });
     const runtime = new Runtime(fixture.config);
     const peer = new Client({ name: "formatter-delivery-test", version: "1" });
@@ -312,21 +349,23 @@ describe("workspace context and instruction delivery", () => {
       const context = await textCall(peer, "ssh_workspace_open", { connection_id: connected.slice("Connection: ".length), path: root });
       const id = workspaceId(context);
       const hook = spyOn(operationText, "readText").mockImplementation(() => { throw new Error("formatter fixture failure"); });
+      const args = { workspace_id: id, file_path: "src/value.txt" };
       try {
-        expect(await textCall(peer, "ssh_read_file", { workspace_id: id, file_path: "src/value.txt" }, true)).toContain("formatter fixture failure");
+        const review = await pausedAccess(peer, "ssh_read_file", args, "Formatter delivery rule.\n");
+        expect(hook).not.toHaveBeenCalled();
+        const failed = await textCall(peer, "ssh_read_file", { ...args, ...acknowledgement(review) }, true);
+        expect(failed).toContain("formatter fixture failure");
+        expect(failed).not.toContain("Formatter delivery rule.");
+        expect(hook).toHaveBeenCalledTimes(1);
       } finally { hook.mockRestore(); }
-      const args = { workspace_id: id, file_path: "src/new.txt", content: "written" };
-      const written = await textCall(peer, "ssh_write_file", args, true);
-      expect(written).toContain("Formatter delivery rule.\n");
-      await textCall(peer, "ssh_write_file", args);
-      expect(await readFile(join(root, "src/new.txt"), "utf8")).toBe("written");
+      expect(await textCall(peer, "ssh_edit_file", { ...args, old_string: "before", new_string: "after" }, true)).toContain("FILE_NOT_READ");
     } finally {
       await peer.close();
       await runtime.close();
     }
   }, 15000);
 
-  test("image response budget includes guidance and leaves failed delivery pending", async () => {
+  test("image reads check guidance before fetching bytes and give the retried image its full response budget", async () => {
     const root = await project({ "src/AGENTS.md": "图片规则仍需交付。\n", "src/value.txt": "before\n" });
     const runtime = new Runtime(fixture.config);
     const peer = new Client({ name: "image-guidance-budget-test", version: "1" });
@@ -348,13 +387,20 @@ describe("workspace context and instruction delivery", () => {
           size: image.data.length / 4 * 3, sha256: "a".repeat(64) };
       });
       try {
+        const review = await pausedAccess(peer, "ssh_read_file", args, "图片规则仍需交付。\n");
+        expect(hook.mock.calls.some((request) => request[1] === "read")).toBe(false);
+        const fits = await peer.callTool({ name: "ssh_read_file", arguments: { ...args, ...acknowledgement(review) } });
+        expect(Boolean(fits.isError)).toBe(false);
+        expect(fits.content).toHaveLength(1);
+        const returned = fits.content[0];
+        expect(returned?.type).toBe("image");
+        expect(returned?.type === "image" ? returned.data.length : 0).toBe(image.data.length);
+        image.data += "AAAA";
         const rejected = await textCall(peer, "ssh_read_file", args, true);
         expect(rejected).toStartWith("Error: OPERATION_FAILED\n");
         expect(rejected).toContain("9 MiB MCP response budget");
         expect(rejected).not.toContain("图片规则仍需交付。");
       } finally { hook.mockRestore(); }
-      expect(await textCall(peer, "ssh_read_file", args)).toContain("图片规则仍需交付。\n");
-      expect(await textCall(peer, "ssh_read_file", args)).toBe("     1\tbefore");
     } finally {
       await peer.close();
       await runtime.close();
@@ -364,12 +410,15 @@ describe("workspace context and instruction delivery", () => {
   test("changed guidance pauses an edit and Bash still delivers guidance with its results", async () => {
     const root = await project({ "AGENTS.md": "Original root rule.\n", "src/value.txt": "before\n" });
     const { id } = await open(root);
-    await call("ssh_read_file", { workspace_id: id, file_path: "src/value.txt" });
+    const read = { workspace_id: id, file_path: "src/value.txt" };
+    const original = await pausedAccess(client, "ssh_read_file", read, "Original root rule.\n");
+    await call("ssh_read_file", { ...read, ...acknowledgement(original) });
     await writeFile(join(root, "AGENTS.md"), "Changed root rule.\n");
     const edit = { workspace_id: id, file_path: "src/value.txt", old_string: "before", new_string: "after" };
-    expect(await call("ssh_edit_file", edit, true)).toContain("Changed root rule.\n");
+    const review = await call("ssh_edit_file", edit, true);
+    expect(review).toContain("Changed root rule.\n");
     expect(await readFile(join(root, "src/value.txt"), "utf8")).toBe("before\n");
-    const edited = await call("ssh_edit_file", edit);
+    const edited = await call("ssh_edit_file", { ...edit, ...acknowledgement(review) });
     expect(edited).toContain(`The file ${root}/src/value.txt has been updated successfully.`);
     expect(await readFile(join(root, "src/value.txt"), "utf8")).toBe("after\n");
     expect(await call("ssh_bash", { workspace_id: id, command: "pwd" })).toBe(root + "\n");
@@ -377,6 +426,9 @@ describe("workspace context and instruction delivery", () => {
     const changed = await call("ssh_bash", { workspace_id: id, command: "printf side-effect > root-effect" });
     expect(changed).toContain("Changed command rule.\n");
     expect(await readFile(join(root, "root-effect"), "utf8")).toBe("side-effect");
+    const afterBash = await pausedAccess(client, "ssh_read_file", read, "Changed command rule.\n");
+    expect(afterBash).not.toContain("     1\tafter");
+    await call("ssh_read_file", { ...read, ...acknowledgement(afterBash) });
     expect(await call("ssh_bash", { workspace_id: id, command: "pwd" })).toBe(root + "\n");
     await writeFile(join(root, "src/AGENTS.md"), "New nested rule.\n");
     const bash = { workspace_id: id, cwd: "src", command: "printf side-effect >> nested-effects" };
@@ -448,7 +500,7 @@ describe("workspace context and instruction delivery", () => {
     const review = await call("ssh_edit_file", edit, true);
     expect(review).toStartWith("Error: WORKSPACE_RULES_CHANGED\n");
     expect(review).toContain("Read code before replacing it.\n");
-    const failed = await call("ssh_edit_file", edit, true);
+    const failed = await call("ssh_edit_file", { ...edit, ...acknowledgement(review) }, true);
     expect(failed).toStartWith("Error: FILE_NOT_READ\n");
     expect(failed).not.toContain("Read code before replacing it.");
     expect(await readFile(join(root, "src/value.txt"), "utf8")).toBe("before\n");
@@ -462,13 +514,15 @@ describe("workspace context and instruction delivery", () => {
     await symlink(join(root, "instructions/source.md"), join(root, "src/AGENTS.md"));
     await symlink(join(root, "src"), join(root, "alias"));
     const { id } = await open(root);
-    const read = await call("ssh_read_file", { workspace_id: id, file_path: "alias/value.txt" });
-    expect(read).toContain(`Project instructions: ${root}/src/AGENTS.md\nScope: ${root}/src\n`);
+    const args = { workspace_id: id, file_path: "alias/value.txt" };
+    const linked = await pausedAccess(client, "ssh_read_file", args, `Project instructions: ${root}/src/AGENTS.md\nScope: ${root}/src\n`);
+    expect(await call("ssh_read_file", { ...args, ...acknowledgement(linked) })).toBe("     1\tbefore");
     await unlink(join(root, "src/AGENTS.md"));
     const edit = { workspace_id: id, file_path: "alias/value.txt", old_string: "before", new_string: "after" };
-    expect(await call("ssh_edit_file", edit, true)).toContain(`Project instructions removed: ${root}/src/AGENTS.md\nScope: ${root}/src`);
+    const removed = await call("ssh_edit_file", edit, true);
+    expect(removed).toContain(`Project instructions removed: ${root}/src/AGENTS.md\nScope: ${root}/src`);
     expect(await readFile(join(root, "src/value.txt"), "utf8")).toBe("before\n");
-    await call("ssh_edit_file", edit);
+    await call("ssh_edit_file", { ...edit, ...acknowledgement(removed) });
     expect(await readFile(join(root, "src/value.txt"), "utf8")).toBe("after\n");
     await writeFile(join(root, "src/value.txt"), "outside update\n");
     await call("ssh_read_file", { workspace_id: id, file_path: join(root, "src/value.txt") });
@@ -483,7 +537,8 @@ describe("workspace context and instruction delivery", () => {
     const { id } = await open(root);
     const scope = { workspace_id: id };
     const file_path = "alias/next/value";
-    expect(await call("ssh_read_file", { ...scope, file_path })).toContain("Review intermediate files.");
+    const intermediate = await pausedAccess(client, "ssh_read_file", { ...scope, file_path }, "Review intermediate files.");
+    await call("ssh_read_file", { ...scope, file_path, ...acknowledgement(intermediate) });
     await unlink(join(root, "middle/AGENTS.md"));
     // Direct access to the same file does not traverse the intermediate directory.
     expect(await call("ssh_read_file", { ...scope, file_path: "final/value" })).not.toContain("instructions removed");
@@ -491,7 +546,7 @@ describe("workspace context and instruction delivery", () => {
     const paused = await call("ssh_edit_file", edit, true);
     expect(paused).toContain(`Project instructions removed: ${root}/middle/AGENTS.md`);
     expect(await readFile(join(root, "final/value"), "utf8")).toBe("first");
-    expect(await call("ssh_edit_file", edit)).not.toContain("instructions removed");
+    expect(await call("ssh_edit_file", { ...edit, ...acknowledgement(paused) })).not.toContain("instructions removed");
     expect(await readFile(join(root, "final/value"), "utf8")).toBe("second");
   });
 });
@@ -503,19 +558,23 @@ describe("workspace skills and operation boundaries", () => {
     const first = await open(firstRoot);
     const second = await open(secondRoot);
     expect(second.id).not.toBe(first.id);
-    await call("ssh_read_file", { workspace_id: first.id, file_path: "src/value.txt" });
+    const firstReview = await pausedAccess(client, "ssh_read_file", { workspace_id: first.id, file_path: "src/value.txt" }, "First source rules.\n");
+    expect(await call("ssh_read_file", { connection_id: connectionId, file_path: join(secondRoot, "src/value.txt") })).toBe("     1\tsecond");
     const secondArgs = { workspace_id: second.id, file_path: "src/new.txt", content: "second only" };
-    const secondWrite = await call("ssh_write_file", secondArgs, true);
+    const secondWrite = await call("ssh_write_file", { ...secondArgs, ...acknowledgement(firstReview) }, true);
+    expect(secondWrite).toContain("WORKSPACE_RULES_CHANGED");
     expect(secondWrite).toContain("Second source rules.\n");
     expect(secondWrite).not.toContain("First source rules.");
-    await call("ssh_write_file", secondArgs);
-    expect(await call("ssh_write_file", { workspace_id: first.id, file_path: "src/new.txt", content: "first only" })).not.toContain("First source rules.");
+    expect(await stat(join(secondRoot, "src/new.txt")).catch(() => null)).toBeNull();
+    await call("ssh_write_file", { ...secondArgs, ...acknowledgement(secondWrite) });
+    const firstArgs = { workspace_id: first.id, file_path: "src/new.txt", content: "first only" };
+    const firstWrite = await call("ssh_write_file", firstArgs, true);
+    expect(await call("ssh_write_file", { ...firstArgs, ...acknowledgement(firstWrite) })).not.toContain("First source rules.");
     expect(await readFile(join(firstRoot, "src/new.txt"), "utf8")).toBe("first only");
     expect(await readFile(join(secondRoot, "src/new.txt"), "utf8")).toBe("second only");
     expect(await call("ssh_bash", { workspace_id: first.id, command: "pwd" })).toBe(firstRoot + "\n");
     expect(await call("ssh_bash", { workspace_id: second.id, command: "pwd" })).toBe(secondRoot + "\n");
     expect(await call("ssh_bash", { connection_id: connectionId, command: "pwd" })).toBe(fixture.workspace + "\n");
-    expect(await call("ssh_read_file", { connection_id: connectionId, file_path: join(secondRoot, "src/value.txt") })).toBe("     1\tsecond");
   });
 
   test("requires exactly one scope on files, commands, and transfers", async () => {
@@ -586,7 +645,7 @@ describe("workspace skills and operation boundaries", () => {
     }, 15000);
   }
 
-  test("uploads pause before transfer and downloads deliver changed guidance with the file", async () => {
+  test("uploads and downloads pause before transfer even when the local destination already exists", async () => {
     const root = await project({ "AGENTS.md": "Transfer root rule.\n", "assets/AGENTS.md": "Review new assets.\n" });
     const { id } = await open(root);
     const localPath = join(fixture.transfers, "workspace-upload.bin");
@@ -595,7 +654,7 @@ describe("workspace skills and operation boundaries", () => {
     expect(paused).toStartWith("Error: WORKSPACE_RULES_CHANGED\n");
     expect(paused).toContain("Review new assets.");
     expect(await stat(join(root, "assets/data.bin")).catch(() => null)).toBeNull();
-    const failed = await call("ssh_upload", args, true);
+    const failed = await call("ssh_upload", { ...args, ...acknowledgement(paused) }, true);
     expect(failed).not.toContain("Review new assets.");
     const bytes = Buffer.from([0, 1, 2, 128, 255]);
     await writeFile(localPath, bytes);
@@ -610,13 +669,85 @@ describe("workspace skills and operation boundaries", () => {
     expect(download).toContain(`Downloaded ${root}/assets/data.bin to ${downloaded}`);
     expect(await readFile(downloaded)).toEqual(bytes);
     await writeFile(join(root, "assets/AGENTS.md"), "Download revised assets carefully.\n");
-    const refreshed = await call("ssh_download", { workspace_id: id, localPath: downloaded, remotePath: "data.bin", cwd: "assets", overwrite: true });
-    expect(refreshed).toContain("Download revised assets carefully.\n");
+    const refresh = { workspace_id: id, localPath: downloaded, remotePath: "data.bin", cwd: "assets", overwrite: true };
+    await writeFile(downloaded, "original local file");
+    await pausedAccess(client, "ssh_download", refresh, "Download revised assets carefully.\n");
+    const revised = await pausedAccess(client, "ssh_download", refresh, "Download revised assets carefully.\n");
+    expect(await readFile(downloaded, "utf8")).toBe("original local file");
+    expect(await call("ssh_download", { ...refresh, ...acknowledgement(revised) })).not.toContain("Download revised assets carefully.");
+    expect(await readFile(downloaded)).toEqual(bytes);
+    await unlink(join(root, "assets/AGENTS.md"));
+    const freshPath = join(fixture.transfers, "workspace-new-download", "data.bin");
+    const removed = await pausedAccess(client, "ssh_download", { ...refresh, localPath: freshPath, ...acknowledgement(revised) },
+      `Project instructions removed: ${root}/assets/AGENTS.md\nScope: ${root}/assets`);
+    expect(await stat(dirname(freshPath)).catch(() => null)).toBeNull();
+    await call("ssh_download", { ...refresh, localPath: freshPath, ...acknowledgement(removed) });
+    expect(await readFile(freshPath)).toEqual(bytes);
     expect(await call("ssh_bash", { workspace_id: id, cwd: "assets", command: "pwd" })).toBe(join(root, "assets") + "\n");
     const escaped = join(fixture.workspace, "escaped-upload.bin");
     await call("ssh_upload", { ...args, remotePath: escaped }, true);
     expect(await stat(escaped).catch(() => null)).toBeNull();
   });
+
+  test("overlapping reads and downloads both report added and removed rules before touching their files", async () => {
+    const root = await project({ "src/AGENTS.md": "Old rule.\n", "src/sub/read.txt": "report\n" });
+    const runtime = new Runtime(fixture.config);
+    const peer = new Client({ name: "concurrent-rule-delivery-test", version: "1" });
+    try {
+      const [local, remote] = InMemoryTransport.createLinkedPair();
+      await createServer(runtime).connect(remote);
+      await peer.connect(local);
+      const connected = await textCall(peer, "ssh_connect", { host: "fixture" });
+      const opened = await textCall(peer, "ssh_workspace_open", { connection_id: connected.slice("Connection: ".length), path: root });
+      const scope = { workspace_id: workspaceId(opened) };
+      expect(await textCall(peer, "ssh_bash", { ...scope, cwd: "src", command: "pwd" })).toContain("Old rule.\n");
+      const read = { ...scope, file_path: "src/sub/read.txt" };
+      const oldRule = await pausedAccess(peer, "ssh_read_file", read, "Old rule.\n");
+      await textCall(peer, "ssh_read_file", { ...read, ...acknowledgement(oldRule) });
+      await unlink(join(root, "src/AGENTS.md"));
+      await writeFile(join(root, "src/sub/AGENTS.md"), "Superseded rule.\n");
+      const removed = `Project instructions removed: ${root}/src/AGENTS.md\nScope: ${root}/src`;
+      const localPath = join(fixture.transfers, "racing-download", "pull.txt");
+      const download = { ...scope, remotePath: "src/sub/pull.txt", localPath };
+      const inspected = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const original = runtime.ssh.run.bind(runtime.ssh);
+      const hook = spyOn(runtime.ssh, "run").mockImplementation(async (...request) => {
+        const result = await original(...request);
+        const paths = request[2]?.paths;
+        if (request[1] === "workspace_context" && Array.isArray(paths) && paths.includes(join(root, download.remotePath))) {
+          inspected.resolve();
+          await release.promise;
+        }
+        return result;
+      });
+      try {
+        const first = pausedAccess(peer, "ssh_download", download, "New rule.\n");
+        await inspected.promise;
+        await writeFile(join(root, "src/sub/AGENTS.md"), "New rule.\n");
+        const newer = await pausedAccess(peer, "ssh_read_file", read, "New rule.\n");
+        expect(newer).toContain(removed);
+        expect(await textCall(peer, "ssh_read_file", { ...read, ...acknowledgement(newer) })).toBe("     1\treport");
+        release.resolve();
+        const delayed = await first;
+        expect(delayed).toContain(removed);
+        expect(delayed).not.toContain("Superseded rule.");
+        acknowledgement(delayed);
+      } finally { release.resolve(); hook.mockRestore(); }
+      expect(await stat(dirname(localPath)).catch(() => null)).toBeNull();
+      const missing = await textCall(peer, "ssh_download", download, true);
+      expect(missing).toContain("Remote file does not exist");
+      expect(missing).not.toContain("New rule.");
+      expect(await stat(localPath).catch(() => null)).toBeNull();
+      await writeFile(join(root, download.remotePath), "downloaded\n");
+      await textCall(peer, "ssh_download", download);
+      expect(await readFile(localPath, "utf8")).toBe("downloaded\n");
+      expect(await textCall(peer, "ssh_read_file", read)).toBe("     1\treport");
+    } finally {
+      await peer.close();
+      await runtime.close();
+    }
+  }, 15000);
 
   test("discovers only root and explicitly shared skills while retaining scoped AGENTS instructions", async () => {
     const root = await project({
@@ -768,8 +899,10 @@ describe("remote development lifecycle", () => {
         await writeFile(join(directory, "SKILL.md"), `---\nname: extra-${index}\ndescription: ${"a".repeat(950)}\n---\n`);
       }
       expect(await textCall(peer, "ssh_workspace_open", { connection_id: connected.slice("Connection: ".length), path: root }, true)).toContain("transport byte budget");
-      const first = await textCall(peer, "ssh_read_file", { workspace_id: id, file_path: "src/value.txt", limit: 1 });
-      expect(first).toContain("Source rule.\n");
+      const args = { workspace_id: id, file_path: "src/value.txt", limit: 1 };
+      const review = await pausedAccess(peer, "ssh_read_file", args, "Source rule.\n");
+      const first = await textCall(peer, "ssh_read_file", { ...args, ...acknowledgement(review) });
+      expect(first).not.toContain("Source rule.\n");
       expect(first).toContain("Use offset=2 to continue.");
       expect(first).not.toContain("Root rule.\n");
       const second = await textCall(peer, "ssh_read_file", { workspace_id: id, file_path: "src/value.txt", offset: 2, limit: 1 });
@@ -845,7 +978,9 @@ describe("remote development lifecycle", () => {
     const opened = await open(root);
     expect(opened.text).toContain(`Git root: ${root}; branch: main`);
     expect(opened.text).toContain("user-notes.txt");
-    expect(await call("ssh_read_file", { workspace_id: opened.id, file_path: "src/message.txt" })).toStartWith("     1\tbefore");
+    const read = { workspace_id: opened.id, file_path: "src/message.txt" };
+    const review = await pausedAccess(client, "ssh_read_file", read, "Keep the message on one line.\n");
+    expect(await call("ssh_read_file", { ...read, ...acknowledgement(review) })).toStartWith("     1\tbefore");
     await call("ssh_edit_file", { workspace_id: opened.id, file_path: "src/message.txt", old_string: "before", new_string: "after" });
     expect(await call("ssh_bash", { workspace_id: opened.id, command: "bash scripts/check.sh" })).toBe("checks passed\n");
     const diff = await call("ssh_bash", { workspace_id: opened.id, command: "git diff --check && git diff -- src/message.txt" });
@@ -913,7 +1048,95 @@ function rule(scope: string, content: string): Instruction {
 }
 
 describe("bounded workspace state", () => {
-  test("a mutation started before another response delivered its rules still needs a retry", async () => {
+  test("open and Bash can display all rules while files still require an explicit, scoped receipt", async () => {
+    const transport = new ContextTransport();
+    const manager = new WorkspaceManager(transport);
+    const root = rule("/project", "Root rule");
+    const nested = rule("/project/src", "Source rule");
+    transport.rules = [root, nested];
+    const opened = await manager.open("00000001", "/project", []);
+    const scope = { workspace_id: opened.workspace_id };
+    manager.delivered(opened);
+    const bash = await manager.prepare(scope, "src", undefined, "bash");
+    expect(manager.guidance(bash.context!).updated).toEqual([nested]);
+    manager.delivered(bash.context!);
+    const target = "src/file";
+    const file = await manager.prepare(scope, target);
+    const review = manager.reviewGuidance(file)!;
+    expect(review.updated).toEqual([root, nested]);
+    expect(review.token).toMatch(/^[a-f0-9]{64}$/);
+    manager.delivered(file.context!);
+    expect(manager.reviewGuidance(await manager.prepare(scope, target))).toEqual(review);
+    const sibling = manager.reviewGuidance(await manager.prepare(scope, "src/other"), review.token)!;
+    expect(sibling.updated).toEqual([root, nested]);
+    expect(sibling.token).not.toBe(review.token);
+    const other = await manager.open("00000001", "/project", ["/shared"]);
+    manager.delivered(other);
+    const wrongWorkspace = manager.reviewGuidance(await manager.prepare({ workspace_id: other.workspace_id }, target), review.token)!;
+    expect(wrongWorkspace.token).not.toBe(review.token);
+    expect(wrongWorkspace.updated).toEqual([root, nested]);
+    expect(manager.reviewGuidance(await manager.prepare(scope, target), review.token)).toBeUndefined();
+    expect(manager.reviewGuidance(await manager.prepare(scope, "src/other"))).toBeUndefined();
+    expect(manager.reviewGuidance(await manager.prepare(scope, target), wrongWorkspace.token)).toBeUndefined();
+    manager.delivered(await manager.open("00000001", "/project", []));
+    const reopened = manager.reviewGuidance(await manager.prepare(scope, target), review.token)!;
+    expect(reopened.token).not.toBe(review.token);
+    expect(reopened.updated).toEqual([root, nested]);
+  });
+
+  test("a displayed rule removed before acknowledgment requires a fresh receipt even if the original bytes return", async () => {
+    const transport = new ContextTransport();
+    const manager = new WorkspaceManager(transport);
+    const opened = await manager.open("00000001", "/project", []);
+    manager.delivered(opened);
+    const scope = { workspace_id: opened.workspace_id };
+    async function present(ack?: string) {
+      const file = await manager.prepare(scope, "src/file");
+      const review = manager.reviewGuidance(file, ack);
+      if (review) manager.delivered(file.context!);
+      return review;
+    }
+    const original = rule("/project/src", "Original");
+    transport.rules = [original];
+    const first = (await present())!;
+    transport.rules = [];
+    const removed = (await present(first.token))!;
+    expect(removed.updated).toEqual([]);
+    expect(removed.removed).toEqual([{ path: original.path, scope: original.scope }]);
+    expect(removed.token).not.toBe(first.token);
+    expect(await present(first.token)).toEqual(removed);
+    expect(await present(removed.token)).toBeUndefined();
+    transport.rules = [original];
+    const restored = (await present(first.token))!;
+    expect(restored.updated).toEqual([original]);
+    expect(restored.token).not.toBe(first.token);
+    transport.rules = [rule("/project/src", "Revised")];
+    const revised = (await present(restored.token))!;
+    expect(revised.updated).toEqual(transport.rules);
+    expect(revised.token).not.toBe(restored.token);
+    expect(await present(revised.token)).toBeUndefined();
+    expect(await present()).toBeUndefined();
+  });
+
+  test("a late Bash delivery leaves a newer explicit file confirmation intact", async () => {
+    const transport = new ContextTransport();
+    const manager = new WorkspaceManager(transport);
+    const opened = await manager.open("00000001", "/project", []);
+    manager.delivered(opened);
+    const scope = { workspace_id: opened.workspace_id };
+    transport.rules = [rule("/project/src", "Old rule")];
+    const bash = await manager.prepare(scope, "src", undefined, "bash");
+    transport.rules = [rule("/project/src", "Current rule")];
+    const file = await manager.prepare(scope, "src/file");
+    const review = manager.reviewGuidance(file)!;
+    manager.delivered(file.context!);
+    expect(manager.reviewGuidance(await manager.prepare(scope, "src/file"), review.token)).toBeUndefined();
+    expect(manager.guidance(bash.context!).updated[0]?.content).toBe("Old rule");
+    manager.delivered(bash.context!);
+    expect(manager.reviewGuidance(await manager.prepare(scope, "src/file"))).toBeUndefined();
+  });
+
+  test("file accesses already in progress return the full review even if another access confirms it first", async () => {
     const transport = new ContextTransport();
     const manager = new WorkspaceManager(transport);
     const opened = await manager.open("00000001", "/project", []);
@@ -921,18 +1144,105 @@ describe("bounded workspace state", () => {
     transport.rules = [rule("/project/src", "Check generated files")];
     const scope = { workspace_id: opened.workspace_id };
     const reading = await manager.prepare(scope, "src/read");
-    const writing = manager.prepare(scope, "src/write", undefined, "mutate");
+    const downloading = manager.prepare(scope, "src/download");
+    const pending = { updated: transport.rules, removed: [] };
+    const review = manager.reviewGuidance(reading)!;
+    expect(review).toMatchObject(pending);
     manager.delivered(reading.context!);
-    const prepared = await writing;
-    expect(manager.mutationNeedsReview(prepared)).toBe(true);
-    expect(manager.guidance(prepared.context!)).toEqual({ updated: [], removed: [] });
-    const retry = await manager.prepare(scope, "src/write", undefined, "mutate");
-    expect(manager.mutationNeedsReview(retry)).toBe(false);
+    expect(manager.reviewGuidance(await manager.prepare(scope, "src/read"), review.token)).toBeUndefined();
+    const prepared = await downloading;
+    expect(manager.reviewGuidance(prepared)).toMatchObject(pending);
+    const retry = await manager.prepare(scope, "src/download");
+    expect(manager.reviewGuidance(retry)).toBeUndefined();
     await manager.open("00000001", "/project", []);
-    expect(() => manager.mutationNeedsReview(retry)).toThrow("Reopen with ssh_workspace_open");
+    expect(() => manager.reviewGuidance(retry)).toThrow("Reopen with ssh_workspace_open");
   });
 
-  test("overlapping reads report guidance once and compare against intervening operation responses", async () => {
+  test("a rule deleted after preparation cannot be returned or acknowledged again by the old file access", async () => {
+    const transport = new ContextTransport();
+    const manager = new WorkspaceManager(transport);
+    const opened = await manager.open("00000001", "/project", []);
+    manager.delivered(opened);
+    const scope = { workspace_id: opened.workspace_id };
+    transport.rules = [rule("/project/src", "Original rule")];
+    const original = await manager.prepare(scope, "src/file");
+    const oldReceipt = manager.reviewGuidance(original)!.token;
+    manager.delivered(original.context!);
+    const delayed = await manager.prepare(scope, "src/file");
+    transport.rules = [];
+    const removed = await manager.prepare(scope, "src/file");
+    const review = manager.reviewGuidance(removed)!;
+    expect(review.removed).toEqual([{ path: "/project/src/AGENTS.md", scope: "/project/src" }]);
+    manager.delivered(removed.context!);
+    expect(() => manager.reviewGuidance(delayed, oldReceipt)).toThrow(expect.objectContaining({ code: "WORKSPACE_RULES_RETRY" }));
+    expect(manager.reviewGuidance(await manager.prepare(scope, "src/file"), oldReceipt)).toEqual(review);
+    expect(manager.reviewGuidance(await manager.prepare(scope, "src/file"))).toEqual(review);
+    expect(manager.reviewGuidance(await manager.prepare(scope, "src/file"), review.token)).toBeUndefined();
+  });
+
+  test("first reads in independent directories each inspect once and return their own pending rule", async () => {
+    const transport = new ContextTransport();
+    const manager = new WorkspaceManager(transport);
+    const opened = await manager.open("00000001", "/project", []);
+    manager.delivered(opened);
+    const scope = { workspace_id: opened.workspace_id };
+    const source = rule("/project/src", "Source rules");
+    const docs = rule("/project/docs", "Docs rules");
+    transport.rules = [source, docs];
+    const original = transport.run.bind(transport);
+    const hook = spyOn(transport, "run").mockImplementation(async (id, operation, args) => {
+      const result = await original(id, operation, args);
+      if (Array.isArray(args?.paths) && args.paths.includes("src/read")) {
+        const other = await manager.prepare(scope, "docs/read");
+        expect(manager.reviewGuidance(other)).toMatchObject({ updated: [docs], removed: [] });
+        manager.delivered(other.context!);
+      }
+      return result;
+    });
+    try {
+      const delayed = await manager.prepare(scope, "src/read");
+      expect(manager.reviewGuidance(delayed)).toMatchObject({ updated: [source], removed: [] });
+      expect(transport.requests.filter((op) => op === "workspace_context")).toHaveLength(2);
+    } finally { hook.mockRestore(); }
+  });
+
+  for (const scenario of ["continued changes", "a temporary rule"] as const) {
+    test(`file inspection retries at most once during ${scenario} and preserves the latest delivery`, async () => {
+      const transport = new ContextTransport();
+      const manager = new WorkspaceManager(transport);
+      const opened = await manager.open("00000001", "/project", []);
+      manager.delivered(opened);
+      const scope = { workspace_id: opened.workspace_id };
+      transport.rules = [rule("/project/src", "First revision")];
+      const original = transport.run.bind(transport);
+      let inspections = 0;
+      const hook = spyOn(transport, "run").mockImplementation(async (id, operation, args) => {
+        const snapshot = await original(id, operation, args);
+        if (Array.isArray(args?.paths) && args.paths.includes("src/delayed")) {
+          inspections++;
+          if (scenario === "continued changes" && inspections <= 2) {
+            transport.rules = [rule("/project/src", `Revision after inspection ${inspections}`)];
+            manager.delivered((await manager.prepare(scope, "src/other")).context!);
+          } else if (inspections === 1) {
+            manager.delivered((await manager.prepare(scope, "src/other")).context!);
+            transport.rules = [];
+            manager.delivered((await manager.prepare(scope, "src/other")).context!);
+          }
+        }
+        return snapshot;
+      });
+      try {
+        const attempt = manager.prepare(scope, "src/delayed").then((prepared) => manager.reviewGuidance(prepared));
+        if (scenario === "continued changes") await expect(attempt).rejects.toMatchObject({ code: "WORKSPACE_RULES_RETRY" });
+        else expect(await attempt).toMatchObject({ updated: [], removed: [{ path: "/project/src/AGENTS.md", scope: "/project/src" }] });
+        expect(inspections).toBe(2);
+      } finally { hook.mockRestore(); }
+      const review = manager.reviewGuidance(await manager.prepare(scope, "src/delayed"))!;
+      expect(manager.reviewGuidance(await manager.prepare(scope, "src/delayed"), review.token)).toBeUndefined();
+    });
+  }
+
+  test("overlapping Bash results calculate guidance against intervening operation responses", async () => {
     const transport = new ContextTransport();
     const manager = new WorkspaceManager(transport);
     const opened = await manager.open("00000001", "/project", []);
@@ -940,18 +1250,18 @@ describe("bounded workspace state", () => {
     const scope = { workspace_id: opened.workspace_id };
     const original = rule("/project/src", "Original source rule");
     transport.rules = [original];
-    const first = await manager.prepare(scope, "/project/src/file");
-    const second = await manager.prepare(scope, "/project/src/file");
+    const first = await manager.prepare(scope, "/project/src", undefined, "bash");
+    const second = await manager.prepare(scope, "/project/src", undefined, "bash");
     expect(manager.guidance(first.context!).updated).toEqual([original]);
     manager.delivered(first.context!);
     expect(manager.guidance(second.context!)).toEqual({ updated: [], removed: [] });
 
     transport.rules = [rule("/project/src", "Refreshed source rule")];
-    const refreshed = await manager.prepare(scope, "/project/src/file");
+    const refreshed = await manager.prepare(scope, "/project/src", undefined, "bash");
     manager.delivered(refreshed.context!);
     expect(manager.guidance(second.context!).updated).toEqual([original]);
     manager.delivered(second.context!);
-    const next = await manager.prepare(scope, "/project/src/file");
+    const next = await manager.prepare(scope, "/project/src", undefined, "bash");
     expect(manager.guidance(next.context!).updated).toEqual(transport.rules);
   });
 

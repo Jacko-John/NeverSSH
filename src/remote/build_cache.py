@@ -140,8 +140,22 @@ def created_at(value):
         return None
 
 
-def cleanup(builds, current_id):
-    """Remove old unlocked builds; the current build keeps its shared lease."""
+def unused_build(path):
+    """Probe the lease under the cache guard, which blocks new leases until deletion finishes."""
+    descriptor = private_file(os.path.join(path, ".lock"), os.O_RDWR | os.O_CREAT)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+    finally:
+        # NFS can keep an unlinked, open file in its directory until the last close.
+        os.close(descriptor)
+
+
+def cleanup_locked(builds, current_id):
+    """Remove old unlocked builds while ensure_build holds the cache guard."""
     candidates = []
     try:
         names = os.listdir(builds)
@@ -159,46 +173,23 @@ def cleanup(builds, current_id):
         if not BUILD_ID.match(name) or name == current_id:
             continue
         try:
-            if not stat.S_ISDIR(os.lstat(path).st_mode):
+            if not stat.S_ISDIR(os.lstat(path).st_mode) or not unused_build(path):
                 continue
-            lock = private_file(os.path.join(path, ".lock"), os.O_RDWR | os.O_CREAT)
-        except OSError:
+            manifest = json.loads(read_text(manifest_path(path)))
+        except (OSError, ValueError, UnicodeError):
             continue
-        try:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                continue
-            try:
-                manifest = json.loads(read_text(manifest_path(path)))
-            except (OSError, ValueError, UnicodeError):
-                continue
-            if not isinstance(manifest, dict) or manifest.get("format") != BUILD_FORMAT:
-                continue
-            when = created_at(manifest.get("created_at"))
-            if when is None:
-                continue
-            if time.time() - when > RETENTION_SECONDS:
-                shutil.rmtree(path)
-                continue
-            candidates.append((when, name))
-        finally:
-            os.close(lock)
+        if not isinstance(manifest, dict) or manifest.get("format") != BUILD_FORMAT:
+            continue
+        when = created_at(manifest.get("created_at"))
+        if when is None:
+            continue
+        if time.time() - when > RETENTION_SECONDS:
+            shutil.rmtree(path)
+            continue
+        candidates.append((when, name))
     candidates.sort(reverse=True)
     for _, name in candidates[KEEP_BUILDS:]:
-        path = os.path.join(builds, name)
-        try:
-            lock = private_file(os.path.join(path, ".lock"), os.O_RDWR | os.O_CREAT)
-        except OSError:
-            continue
-        try:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                continue
-            shutil.rmtree(path)
-        finally:
-            os.close(lock)
+        shutil.rmtree(os.path.join(builds, name))
 
 
 def ensure_build(payload):
@@ -224,21 +215,15 @@ def ensure_build(payload):
             if not isinstance(sources, dict):
                 raise RuntimeError("Remote build is missing and no sources were provided")
             if os.path.isdir(build_dir):
-                repair = private_file(os.path.join(build_dir, ".lock"), os.O_RDWR | os.O_CREAT)
-                try:
-                    try:
-                        fcntl.flock(repair, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        raise RuntimeError("Remote build is corrupt and currently in use")
-                    shutil.rmtree(build_dir)
-                finally:
-                    os.close(repair)
+                if not unused_build(build_dir):
+                    raise RuntimeError("Remote build is corrupt and currently in use")
+                shutil.rmtree(build_dir)
             install(build_dir, expected, sources, builds)
             if not verify(build_dir, expected):
                 raise RuntimeError("Remote build verification failed")
         lease = private_file(os.path.join(build_dir, ".lock"), os.O_RDWR | os.O_CREAT)
         fcntl.flock(lease, fcntl.LOCK_SH)
-        cleanup(builds, build_id)
+        cleanup_locked(builds, build_id)
         return build_dir, lease
     finally:
         fcntl.flock(guard, fcntl.LOCK_UN)

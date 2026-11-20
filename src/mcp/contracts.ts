@@ -10,11 +10,22 @@ const taskScope = { task_id: taskId };
 const workspaceId = z.string().refine((value) => /^ws_[a-f0-9]{8}$/.test(value), "Use the workspace_id returned by ssh_workspace_open")
   .describe("Workspace handle returned by ssh_workspace_open in this MCP instance.");
 const operationScope = { connection_id: connectionId.optional(), workspace_id: workspaceId.optional() };
+const fileScope = {
+  ...operationScope,
+  workspace_rules_ack: z.string().length(64).refine((value) => /^[a-f0-9]+$/.test(value),
+    "Use the workspace_rules_ack from WORKSPACE_RULES_CHANGED").optional()
+    .describe("After reviewing WORKSPACE_RULES_CHANGED, copy its workspace_rules_ack into the retry. Workspace mode only."),
+};
 const scopeMessage = "Provide exactly one connection_id or workspace_id";
+const fileScopeMessage = scopeMessage + ". workspace_rules_ack requires workspace_id";
 
 /** Keep a portable object schema; enforce scope exclusivity when validating the request. */
 function validOperationScope(value: { connection_id?: string | undefined; workspace_id?: string | undefined }): boolean {
   return (value.connection_id !== undefined) !== (value.workspace_id !== undefined);
+}
+
+function validFileScope(value: z.infer<z.ZodObject<typeof fileScope>>): boolean {
+  return validOperationScope(value) && (value.workspace_rules_ack === undefined || value.workspace_id !== undefined);
 }
 
 export const connectionContracts = {
@@ -78,7 +89,7 @@ const remotePath = cleanString.max(4096).describe("Remote path: absolute, ~/...,
 const localPath = cleanString.max(4096).describe("Absolute file path on the NeverSSH client host; restricted to localTransferRoots only when that list is nonempty.");
 const filePath = cleanString.max(4096).describe("Remote file path; relative to the workspace root or, with connection_id, remote HOME.");
 const transferScope = {
-  ...operationScope,
+  ...fileScope,
   cwd: remotePath.optional().describe("Remote working directory; defaults to the workspace root or remote HOME. localPath always stays local."),
 };
 const hash = z.string().refine((value) => /^[a-f0-9]{64}$/.test(value), "Use a lowercase hex SHA-256").optional();
@@ -91,36 +102,36 @@ export function createToolContracts(maxFileBytes: number) {
     ...workspaceContracts,
     ssh_read_file: {
       input: z.strictObject({
-        ...operationScope,
+        ...fileScope,
         file_path: filePath,
         offset: z.number().int().min(1).optional().describe("Starting text line, counted from 1; defaults to 1."),
         limit: z.number().int().min(1).optional().describe("Maximum text lines to return; defaults to 2000."),
-      }).refine(validOperationScope, scopeMessage),
+      }).refine(validFileScope, fileScopeMessage),
     },
     ssh_write_file: {
       input: z.strictObject({
-        ...operationScope, file_path: filePath,
+        ...fileScope, file_path: filePath,
         content: z.string().max(maxFileBytes),
-      }).refine(validOperationScope, scopeMessage),
+      }).refine(validFileScope, fileScopeMessage),
     },
     ssh_edit_file: {
       input: z.strictObject({
-        ...operationScope, file_path: filePath,
+        ...fileScope, file_path: filePath,
         old_string: cleanString.max(maxFileBytes),
         new_string: z.string().max(maxFileBytes),
         replace_all: z.boolean().default(false),
-      }).refine(validOperationScope, scopeMessage),
+      }).refine(validFileScope, fileScopeMessage),
     },
     ssh_upload: {
       input: z.strictObject({
         ...transferScope, localPath, remotePath,
         overwrite: z.boolean().default(false), expectedSha256: hash,
-      }).refine(validOperationScope, scopeMessage),
+      }).refine(validFileScope, fileScopeMessage),
     },
     ssh_download: {
       input: z.strictObject({
         ...transferScope, remotePath, localPath, overwrite: z.boolean().default(false),
-      }).refine(validOperationScope, scopeMessage),
+      }).refine(validFileScope, fileScopeMessage),
     },
   };
 }

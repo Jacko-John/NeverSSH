@@ -114,6 +114,36 @@ class FileCommitTests(unittest.TestCase):
         self.assertEqual(result["nextLine"], 4)
         self.assertLess(peak, 4 * size)
 
+    def test_text_pages_must_fit_in_full_and_budget_counts_encoded_line_endings(self):
+        # Four CRLF lines are exactly 256 KiB in UTF-8. The empty fifth line adds one byte.
+        line = "é" * 32767 + "\r\n"
+        target = self.root / "pages.txt"
+        target.write_bytes(("header\n" + line * 4 + "\ntail").encode("utf-8"))
+        for args in ({}, {"lineCount": 6}, {"lineCount": 100}):
+            with self.subTest(args=args), self.assertRaisesRegex(ValueError, "Whole-file read.*offset and limit"):
+                file_ops.dispatch(self.request("read", path=target.name, startLine=2, **args))
+        with self.assertRaisesRegex(ValueError, "narrower range.*rg through ssh_bash"):
+            file_ops.dispatch(self.request("read", path=target.name, startLine=2, lineCount=5))
+
+        page = file_ops.dispatch(self.request("read", path=target.name, startLine=2, lineCount=4))
+        self.assertEqual(page["content"], line * 4)
+        self.assertEqual((page["endLine"], page["nextLine"], page["totalLines"]), (5, 6, 7))
+        self.assertTrue(page["truncated"])
+        tail = file_ops.dispatch(self.request("read", path=target.name, startLine=6))
+        self.assertEqual(tail["content"], "\ntail")
+        self.assertFalse(tail["truncated"])
+
+        target.write_bytes(("header\n" + line * 4).encode("utf-8"))
+        exact = file_ops.dispatch(self.request("read", path=target.name, startLine=2))
+        self.assertEqual(exact["content"], line * 4)
+        self.assertFalse(exact["truncated"])
+
+    def test_one_oversized_line_in_a_subset_also_returns_the_range_error(self):
+        target = self.root / "long-line.txt"
+        target.write_bytes(b"header\n" + b"x" * (256 * 1024) + b"\nlast\n")
+        with self.assertRaisesRegex(ValueError, "narrower range.*rg through ssh_bash"):
+            file_ops.dispatch(self.request("read", path=target.name, startLine=2, lineCount=1))
+
     def test_pdf_paths_and_pdf_headers_are_refused_as_binary(self):
         for name, data in (("report.PDF", b"plain-looking bytes"),
                            ("report.txt", b"%PDF-1.4\n1 0 obj\n"),

@@ -170,23 +170,23 @@ def read_file(request):
         raise ValueError(paging_hint)
     text = text_from(data, lossy=True)
     total = line_count(text)
-    if oversized and count >= total:
+    end = min(start + count, total)
+    if oversized and end == total:
         raise ValueError(paging_hint)
     first = last = len(text)
-    end = min(start, total)
     remaining = args.get("maxBytes", read_formats.TEXT_READ_BYTES)
-    for left, _, right in itertools.islice(line_spans(text), end, min(start + count, total)):
+    for left, _, right in itertools.islice(line_spans(text), min(start, total), end):
         # A UTF-8 character occupies at least one byte. Avoid copying very long lines just to reject them.
         size = right - left
         if size <= remaining and not text.isascii():
             size = len(text[left:right].encode("utf-8"))
         if size > remaining:
-            if end == start:
-                raise ValueError("Line exceeds the read byte budget; read a narrower range or download the file")
-            break
+            if end == total:
+                raise ValueError(paging_hint)
+            raise ValueError("Selected range exceeds the read byte budget. Read a narrower range with "
+                             "offset and limit or search with rg through ssh_bash.")
         first = min(first, left)
         last = right
-        end += 1
         remaining -= size
     return {"path": filename, "content": text[first:last], "startLine": start + 1,
             "endLine": end, "totalLines": total, "truncated": end < total,

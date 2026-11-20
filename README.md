@@ -155,11 +155,11 @@ cp -R skills/neverssh ~/.claude/skills/
 
 项目文件默认直接在远端处理：用 `ssh_read_file` 读取，`ssh_write_file` 创建或整体写入，`ssh_edit_file` 做局部修改。批量变更和代码生成通过远端 `ssh_bash` 完成，再在远端测试和检查 diff。不要把“本地临时文件加上传”或“下载、本地编辑、再上传”当成默认开发流程。
 
-普通工作区操作从根目录向目标收集适用的 `AGENTS.md`，保留来源、适用目录和完整正文。例如，首次向带有独立规则的子目录写文件时，`ssh_write_file` 会先返回 `WORKSPACE_RULES_CHANGED` 和规则，文件保持原样。阅读后可直接重试。编辑和上传采用同样的流程，已交付的规则发生变更或删除时也会暂停。读取、下载和 Bash 会随结果返回适用的规则变化。文件路径限制、读取后编辑和版本冲突检查仍然生效。
+首次读取受 `AGENTS.md` 约束的文件时，工具先返回 `WORKSPACE_RULES_CHANGED`、规则正文和 `workspace_rules_ack` 确认值。读完规则，把确认值原样加入刚才的调用，才会收到文件内容。如果提示在传输中丢失，原样重试会再次收到完整提示。写入、编辑、上传和下载也遵循这个流程。已确认的规则有变更或被删除时，需要再次确认。
 
-客户端先收到操作结果，再收到有变化的工作区规则。读取单张图片会返回一个图片块，笔记本可以返回多个文本块和图片块，规则增量始终附在最后。Bash 即使以非零状态退出，也可能附上规则提示，命令已经运行，不要因此重新执行。执行文件或传输操作时发生的错误不交付规则。
+`ssh_bash` 在命令启动后随结果交付 `cwd` 的规则变化，非零退出的命令也可能附带规则。命令已运行，收到这类提示时无需重放。打开工作区和运行 Bash 都会展示规则，后续文件操作仍需单独确认。
 
-普通操作不重复返回未变化的规则、Skill 目录和 Git 状态。需要恢复根目录上下文、刷新 Git 状态或重新发现 skill 时，再次调用 `ssh_workspace_open`。相同连接、根目录和 skill 配置可以复用工作区 ID，但会重置已返回规则的记录并重建 skill 目录。打开时只返回根目录规则，子目录规则会随后随目标操作自动返回。Bash 的规则发现只覆盖 `cwd`；涉及其他目录时，可以在对应 `cwd` 操作或主动读取该目录的 `AGENTS.md`。连接模式不加载项目上下文。
+文件操作会复用当前工作区中已确认且未变化的规则。普通操作省略 Skill 目录和 Git 状态。需要恢复根目录上下文、刷新 Git 状态或重新发现 skill 时，再次调用 `ssh_workspace_open`。相同连接、根目录和 skill 配置可以复用工作区 ID，但会清除规则确认并重建 skill 目录。打开时只返回根目录规则，子目录规则会随后随目标操作自动返回。Bash 的规则发现只覆盖 `cwd`；涉及其他目录时，可以在对应 `cwd` 操作或主动读取该目录的 `AGENTS.md`。连接模式不加载项目上下文。
 
 默认只从工作区根目录下的 `.agents/skills` 和 `.claude/skills` 发现 skill，不支持随操作路径发现子目录 skill。进入子目录不会新增该子目录的 skill；`AGENTS.md` 仍按目标路径收集。`skill_directories` 可替换默认搜索目录：相对目录从工作区根解析一次，绝对路径和 `~/` 可指定远端共享或个人目录。
 
@@ -215,13 +215,13 @@ Connection: 7a2c9d4f
 
 文件工具对齐 Claude Code 的 Read / Write / Edit：`file_path` 是远端文件路径，文本读取使用 `offset` / `limit`，编辑使用 `old_string` / `new_string` / `replace_all`。目录列表、文件查找和内容搜索通过 `ssh_bash` 执行 `ls`、`find`、`rg`。
 
-编辑已有文件前，用 `ssh_read_file` 读完同一版本的全部内容，或在 `ssh_bash` 中用 `cat src/main.ts` 等命令查看单个文件。再次读取时，如果内容已在外部改变，工具会提示。精确编辑默认要求原文唯一，`replace_all=true` 可替换所有匹配。成功后会显示第一处替换附近的行号和正文。
+编辑已有文件前，用 `ssh_read_file` 读完同一版本的全部内容，或在 `ssh_bash` 中用 `cat src/main.ts` 等命令查看单个文件。查看命令的标准输出为零字节时不会建立读取记录；需要覆盖空文件时，可以先用 `ssh_read_file` 读取它。单文件搜索只有实际返回文件正文才算读取。无匹配、仅计数或仅列文件名的结果都不会建立读取记录。再次读取时，如果内容已在外部改变，工具会提示。精确编辑默认要求原文唯一，`replace_all=true` 可替换所有匹配。成功后会显示第一处替换附近的行号和正文。
 
-超过 256 KiB 的文本需要指定 `offset` 和较小的 `limit` 分页读取。读取 Jupyter `.ipynb` 会按顺序展示单元格和保存的输出。直接读取 PDF 会返回格式不支持的错误。远端已安装 `pdftotext` 时，可通过 `ssh_bash` 运行 `pdftotext report.pdf -` 提取正文。
+用 `offset` 和 `limit` 分页读取超过 256 KiB 的文本。一次选取的行超过 256 KiB 时，工具会提示缩小范围，也可以通过 `ssh_bash` 用 `rg` 搜索。读取 Jupyter `.ipynb` 会按顺序展示单元格和保存的输出。直接读取 PDF 会返回格式不支持的错误。远端已安装 `pdftotext` 时，可通过 `ssh_bash` 运行 `pdftotext report.pdf -` 提取正文。
 
 查看远端图片也直接调用 `ssh_read_file`，无需先下载到本地。工具按文件内容识别 PNG、JPEG、GIF 和 WebP，并完整返回图片，不写成本地文件，不依赖 SFTP；客户端需要支持 MCP 图片显示。`offset` / `limit` 只用于文本，图片不分页，仍受 `maxFileBytes` 限制（默认 4 MiB，最高 8 MiB）。SVG 按文本读取。遇到 XLSX、Parquet 或 ZIP 等二进制文件，使用对应格式的 skill 或在 `ssh_bash` 中调用专用工具。
 
-图片及附带规则的 MCP 结果序列化后另有 9 MiB 上限，不能按原始图片大小理解。超过该上限会返回文本错误，需缩小图片后重试；不会截断图片或自动下载到本地。
+含图片的 MCP 响应序列化后最多 9 MiB。若超限，工具返回文本错误，需缩小图片后重试，不会截断图片或自动下载到本地。工作区规则在前一次暂停响应中单独交付，不占图片响应的额度。
 
 `ssh_bash` 的短命令成功完成时，操作结果只有程序输出；后台运行、等待到期、输出截断或失败时再给出 `task_...` 任务 ID、状态、远端日志路径和字节数。工作区规则有变化时，在独立的第二个文本块中附上提示。后台任务只需 `task_id` 调用 `ssh_task_output` 查询或等待，使用 `ssh_task_stop` 停止，不再需要 `connection_id`。`ssh_task_list` 列出尚未被 `ssh_task_output` 读取输出的任务；读取后移除，新输出会让它重新出现。
 
@@ -282,8 +282,8 @@ JavaScript/TypeScript 使用 Bun。本地 Python 检查和测试解释器由 uv 
 推送 `v*` 标签会触发 GitHub Actions：
 
 ```sh
-git tag -a v0.6.0 -m "NeverSSH 0.6.0"
-git push origin v0.6.0
+git tag -a v0.7.0 -m "NeverSSH 0.7.0"
+git push origin v0.7.0
 ```
 
 工作流运行检查、测试和构建，并上传 `neverssh.js`、`neverssh` launcher 和 `neverssh.config.example.json` 到对应 Release。launcher 在后台解析 `releases/latest`，新标签在用户下一次启动时生效，无需修改 MCP 配置。

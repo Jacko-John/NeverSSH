@@ -1,6 +1,7 @@
 """Private command archives, shared disk budgets, and lock-aware fourteen-day retention."""
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import errno
 import fcntl
 import json
 import os
@@ -196,12 +197,24 @@ class ArchiveStore:
         if self.usage() + minimum_bytes > self.max_archive_bytes:
             raise ArchiveError("OUTPUT_LIMIT_REACHED", "Insufficient archive space to record the command; retained logs were not deleted")
 
+    def known_session(self, directory):
+        """Check session metadata before touching any task in its directory."""
+        try:
+            metadata = json.loads(read_metadata(os.path.join(directory, "session.json")))
+        except FileNotFoundError:
+            return True  # Older or interrupted sessions may not have session metadata.
+        except (OSError, ValueError, TypeError):
+            return False
+        return isinstance(metadata, dict) and metadata.get("format") in (None, FORMAT)
+
     def cleanup(self, now=None):
         """Delete expired inactive tasks, then prune empty sessions without active workers."""
         now = time.time() if now is None else now
         with self.guard():
             for session in os.scandir(self.root):
                 if not CONNECTION_ID.fullmatch(session.name) or not session.is_dir(follow_symlinks=False):
+                    continue
+                if not self.known_session(session.path):
                     continue
                 for entry in os.scandir(session.path):
                     if entry.name.endswith(".log") and TASK_ID.fullmatch(entry.name[:-4]) and entry.is_file(follow_symlinks=False):
@@ -237,13 +250,14 @@ class ArchiveStore:
                     return
             if now < expires:
                 return
-            for extension in (".log", ".meta.json", ".lock"):
-                try:
-                    os.unlink(prefix + extension)
-                except FileNotFoundError:
-                    pass
         finally:
             os.close(descriptor)
+        # The archive guard excludes new tasks while we remove the now-closed lock.
+        for extension in (".log", ".meta.json", ".lock"):
+            try:
+                os.unlink(prefix + extension)
+            except FileNotFoundError:
+                pass
 
     def prune_session(self, directory):
         """Never remove a session directory while a worker can still admit commands."""
@@ -253,20 +267,19 @@ class ArchiveStore:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return
-            session_file = os.path.join(directory, "session.json")
-            if os.path.exists(session_file):
-                try:
-                    metadata = json.loads(read_metadata(session_file))
-                    if isinstance(metadata, dict) and metadata.get("format") not in (None, FORMAT):
-                        return
-                except (OSError, ValueError, TypeError):
-                    return
-            if set(os.listdir(directory)) <= {".session.lock", "session.json"}:
-                for name in os.listdir(directory):
-                    os.unlink(os.path.join(directory, name))
-                os.rmdir(directory)
+            entries = os.listdir(directory)
+            if set(entries) - {".session.lock", "session.json"}:
+                return
         finally:
             os.close(descriptor)
+        # Keep the archive guard while deleting only the entries we checked.
+        for name in entries:
+            os.unlink(os.path.join(directory, name))
+        try:
+            os.rmdir(directory)
+        except OSError as error:
+            if error.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                raise
 
     def close(self):
         """Release this process's quota descriptor after all archive operations finish."""

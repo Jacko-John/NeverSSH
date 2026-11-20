@@ -31,6 +31,10 @@ exec(compile(payload["archiveSource"], "<neverssh-archive>", "exec"), archive_mo
 
 file_ops_module = types.ModuleType("neverssh_file_ops")
 exec(compile(payload["fileOpsSource"], "<neverssh-file-ops>", "exec"), file_ops_module.__dict__)
+sys.modules["file_ops"] = file_ops_module
+
+workspace_module = types.ModuleType("neverssh_workspace")
+exec(compile(payload["workspaceSource"], "<neverssh-workspace>", "exec"), workspace_module.__dict__)
 
 
 @dataclass
@@ -59,17 +63,20 @@ class ChildRequest:
 class FileRequest:
     """Run one short file request in a daemon thread while the worker keeps serving I/O."""
 
-    def __init__(self, execute, request):
+    def __init__(self, execute, request, cancel_event=None):
         self.execute = execute
         self.request = request
         self.done = False
         self.result = None
         self.error = None
         self.cancelled = False
+        self.cancel_event = cancel_event
+        self.stopping_at = None
         self.response_data = None
         self.response_offset = 0
         self.started_at = time.monotonic()
-        threading.Thread(target=self.run, daemon=True).start()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
 
     def run(self):
         """Capture both result and exception so the event loop only performs protocol writes."""
@@ -81,8 +88,12 @@ class FileRequest:
             self.done = True
 
     def stop(self):
-        """Abandon the response; short file I/O cannot be interrupted safely mid-syscall."""
+        """Abandon file results; workspace inspection additionally cancels its owned Git subprocess."""
         self.cancelled = True
+        if self.cancel_event is not None:
+            if self.stopping_at is None:
+                self.stopping_at = time.monotonic()
+            self.cancel_event.set()
 
 
 class Worker:
@@ -201,6 +212,11 @@ class Worker:
         if operation in ("read", "write", "edit", "stat", "hash", "mkdir", "probe", "commit_upload"):
             self.requests[request_id] = FileRequest(file_ops_module.dispatch, request_payload)
             return
+        if operation in ("workspace_open", "workspace_context", "workspace_skill_read"):
+            cancel_event = threading.Event()
+            request_payload["_cancel_event"] = cancel_event
+            self.requests[request_id] = FileRequest(workspace_module.dispatch, request_payload, cancel_event)
+            return
         if operation != "bash":
             self.reject_request(request_id, "Unsupported operation")
             return
@@ -273,7 +289,9 @@ class Worker:
         """Escalate slow cleanup and retire helpers only after both output pipes are drained."""
         for request_id, request in list(self.requests.items()):
             if isinstance(request, FileRequest):
-                if self.stopping and not request.done and time.monotonic() - request.started_at > 4:
+                deadline_start = request.started_at if request.cancel_event is None else request.stopping_at
+                expired = deadline_start is not None and time.monotonic() - deadline_start > 4
+                if self.stopping and not request.done and expired:
                     self.emit({"type": "close", "id": request_id, "code": 255})
                     del self.requests[request_id]
                     continue
@@ -294,6 +312,10 @@ class Worker:
                     request.force_killed = True
 
             if request.open_output_streams == 0 and request.process.poll() is not None:
+                # Exit 2 is reserved for explicit rejection before a command starts.
+                # Other abnormal exits do not prove cleanup or archive finalization ran.
+                if request.process.returncode not in (0, 2):
+                    self.cleanup_confirmed = False
                 if request.stdin_registered:
                     self.selector.unregister(request.process.stdin)
                 request.process.stdin.close()
@@ -433,6 +455,11 @@ class Worker:
         """Reap owned helpers after normal exit, malformed input, or a broken peer."""
         for request in self.requests.values():
             request.stop()
+        # All workspace Git polls observe cancellation within 50 ms; share one bounded join budget.
+        workspace_deadline = time.monotonic() + 0.25
+        for request in self.requests.values():
+            if isinstance(request, FileRequest) and request.cancel_event is not None:
+                request.thread.join(max(0, workspace_deadline - time.monotonic()))
         children = [request for request in self.requests.values() if isinstance(request, ChildRequest)]
         deadline = time.monotonic() + 4
         while any(request.process.poll() is None for request in children):

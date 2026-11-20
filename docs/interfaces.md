@@ -1,6 +1,6 @@
 # NeverSSH 工具接口
 
-连接时传入服务器地址、账号和端口。取得短 `connection_id` 后，命令和文件工具用它引用连接；任务工具使用 `ssh_bash` 在后台、等待到期、截断或失败时返回的 `task_id`。
+连接时传入服务器地址、账号和端口。取得短 `connection_id` 后，可以直接操作远端，也可以用 `ssh_workspace_open` 打开项目。命令和文件工具必须且只能填写 `connection_id` 或 `workspace_id` 中的一个；任务工具使用 `ssh_bash` 在后台、等待到期、截断或失败时返回的 `task_id`。
 
 | 工具 | 用途 |
 | --- | --- |
@@ -8,6 +8,8 @@
 | [ssh_connect](#ssh_connect) | 连接服务器 |
 | [ssh_sessions](#ssh_sessions) | 列出可用连接 |
 | [ssh_close](#ssh_close) | 强制关闭连接及其活动任务 |
+| [ssh_workspace_open](#ssh_workspace_open) | 打开远程项目并取得开发上下文 |
+| [ssh_skill_read](#ssh_skill_read) | 按需读取远端 skill 及其文本资源 |
 | [ssh_bash](#ssh_bash) | 运行 Bash，直接取得结果或转入后台 |
 | [ssh_task_output](#ssh_task_output) | 查询任务，或等待结束 |
 | [ssh_task_stop](#ssh_task_stop) | 停止任务及其普通子进程 |
@@ -22,11 +24,13 @@
 
 所有请求都是 MCP 参数对象，并拒绝未定义字段。所有工具仅返回可读的 MCP 文本内容块，不提供 `structuredContent` 或 `outputSchema`，也不把内部结果序列化成 JSON 文本。错误文本统一为 `Error: CODE` 加一句说明。远端命令自身打印的 JSON 保持原样。
 
-连接 ID 是 8 位小写十六进制，如 `7a2c9d4f`。任务 ID 带 `task_` 前缀，如 `task_b8e3a160`，在当前 MCP 实例内唯一，不能与连接 ID 混用。任务工具只需要 `task_id`。两个 ID 都只在当前 MCP 实例中有效；日志保留不延长连接或任务句柄的有效期。
+连接 ID 是 8 位小写十六进制，如 `7a2c9d4f`。工作区 ID 带 `ws_` 前缀，如 `ws_b8e3a160`，绑定连接和远端项目根目录。任务 ID 带 `task_` 前缀，如 `task_b8e3a160`。这些 ID 不能混用，只在当前 MCP 实例中有效；工作区还要求所属连接可用。日志保留不延长任何句柄的有效期。
 
-本文覆盖连接、Bash/任务、文件与传输工具。远端构建、版本校验和 A/B 说明见[版本与兼容](compatibility.md)。
+本文覆盖连接、工作区、Bash/任务、文件与传输工具。远端构建、版本校验和 A/B 说明见[版本与兼容](compatibility.md)。
 
 参数表由全部工具的输入 schema 按默认配置生成。文件写入和编辑的文本长度上限随 `maxFileBytes` 配置变化；字符数校验与远端文件的 UTF-8 字节数上限分别生效。
+
+支持两种 scope 的工具中，`connection_id` 和 `workspace_id` 各自标记为非必填，但组合必须恰好填写一个；同时提供或全部省略都在执行前拒绝。
 
 ## ssh_discover
 
@@ -219,13 +223,143 @@ Closed 7a2c9d4f (remote cleanup confirmed).
 
 已完成的写入不会回滚。已收集的任务输出仍可通过原任务 ID 查询。
 
-成功文本表示本地连接已释放。`remote cleanup confirmed` 表示远端已确认本连接管理的资源清理完成；断网、清理超时或强制结束远端 helper 时，结果为 `unconfirmed`。
+成功文本表示本地连接已释放。`remote cleanup confirmed` 表示远端已确认本连接管理的资源清理完成；断网、清理超时或远端 helper 异常退出时，结果为 `unconfirmed`。启动命令前已明确拒绝的请求不会被当成清理失败。
 
 已关闭且仍有记录的 ID 可以重复关闭。并发关闭同一条连接时，共用一次关闭过程并返回相同结果。
 
 | 错误码 | 原因 | 处理方式 |
 | --- | --- | --- |
 | `CONNECTION_NOT_FOUND` | ID 不存在，或记录已移除 | 用 ssh_sessions 查看现有连接 |
+
+## ssh_workspace_open
+
+在现有连接上打开远程项目，返回工作区 ID 和根目录的开发上下文。后续文件路径相对项目根目录解析，命令默认在根目录执行。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `connection_id` | string | 是 | 无 | 打开项目所用的远端连接 ID。 |
+| `path` | string | 是 | 无 | 已存在的远端项目目录；支持绝对路径、~/ 和相对于远端 HOME 的路径。最长 4096 个字符。 |
+| `skill_directories` | string[] | 否 | `[".agents/skills",".claude/skills"]` | 替换默认远端 skill 搜索目录，统一从工作区根目录解析一次；默认 .agents/skills 和 .claude/skills，不支持随目标路径发现子目录 skill。绝对路径和 ~/ 指向远端共享目录；空数组关闭发现。最多 16 项。 |
+
+### 返回
+
+返回可读的工作区标识、远端根目录、Git 状态、项目入口文件、适用的 `AGENTS.md` 正文和 skill 目录。规则标明来源和适用目录；skill 目录列出可调用名称和描述，正文按需读取。Git 信息是当前状态快照，不会自动区分用户已有改动和本次任务的改动。
+
+### 示例
+
+#### 请求
+
+```json
+{
+  "connection_id": "7a2c9d4f",
+  "path": "/srv/app"
+}
+```
+
+#### 返回
+
+```text
+Workspace: ws_b8e3a160
+Connection: 7a2c9d4f
+Remote root: /srv/app
+Context paths: /srv/app
+Project guidance applies to its stated paths, subject to the user's instructions. All paths and skill execution below are remote.
+No AGENTS.md instructions apply to these paths.
+```
+
+### 行为和失败情况
+
+`path` 必须是已存在的远端目录，规范化后的目录就是工作区根目录。打开时只返回根目录的 `AGENTS.md`，不会遍历所有子目录，也不会自动套用更大 Git 仓库或其他客户端的规则机制。后续工作区操作按目标路径从根向下收集适用规则。
+
+工作区操作固定使用准备阶段已校验的真实目标，同时保留原路径及链接目标适用的规则。准备后再修改入口符号链接，不会改变本次已选定的目标。
+
+默认只在工作区根目录的 `.agents/skills` 和 `.claude/skills` 下发现包含 `SKILL.md` 的直接子目录，不支持随目标路径发现项目子目录的 skill。`skill_directories` 替换默认列表：所有相对目录只从工作区根目录解析一次，绝对路径或 `~/` 可用于远端共享或个人 skill。空数组关闭发现。不会自动安装依赖或运行 skill 脚本。
+
+规则、目录扫描和 Git 输出都有资源上限；规则不能完整读取时调用失败，目录或 Git 信息不完整时返回可读警告。整个上下文超过响应预算时也会失败；按错误说明重新打开项目并缩减 `skill_directories`，或调整配置中的 `maxFileBytes`。不会静默截断 `AGENTS.md`。Git 缺失或检查失败不阻止文件开发。自动 Git 检查禁用 fsmonitor，并在检测到 clean/process 过滤器时跳过这些过滤器并提示差异；需要正常项目 Git 行为时，先读取规则，再通过 `ssh_bash` 显式检查。
+
+工作区文件读取、写入、编辑、上传、下载和 Bash 的结果自动附上新增、变更或删除的适用规则，不因规则尚未返回或已经变化而拒绝操作。规则提示返回时，本次文件操作已经执行，Bash 命令已经启动；提示用于后续操作，不代表服务器已确认 Agent 在执行前理解了规则。路径范围、读取后编辑和文件版本检查继续生效。
+
+第一个 MCP 文本块保留原操作结果，包括任务首行和程序输出的空白；规则有变化时，第二个文本块单独返回规则增量。没有规则变化时只有第一个文本块。已启动或转入后台的 Bash 在首次返回结果时交付规则，程序非零退出的结果也可附规则；命令已经运行，不要因为收到规则提示而重放。文件读取、编辑或传输等操作抛错时，不附规则，也不将本次采集的规则记为已返回。
+
+如果操作执行期间工作区被重新打开或连接失效，保留原操作结果，但不再附带属于旧工作区状态的规则。
+
+普通操作不重复未变化的规则、skill 目录和 Git 状态。再次调用 `ssh_workspace_open` 可恢复根目录上下文、刷新 Git 状态和重新发现 skill。相同连接、规范化根目录和 skill 配置可复用原句柄，但会重置规则交付记录并重建 skill 目录；后续目标操作会重新返回适用的子目录规则。对话压缩后再次打开并重读仍需使用的 skill，服务器无法判断模型是否还记得内容。
+
+Bash 的规则发现只覆盖 `cwd`，不会分析命令内部的 `cd`、脚本或生成器涉及哪些目录。需要其他目录的规则时，可以在对应 `cwd` 操作或主动读取该目录的 `AGENTS.md`。连接模式不加载项目上下文。项目规则只为已授权任务提供指导，不扩大用户授权，也不改变客户端指令的优先级。
+
+规则采集和路径校验仍在执行前进行；规则文件不可读、内容或响应超过预算时，调用仍可能失败。准备操作期间工作区被并发重新打开，或规则历史达到上限时，返回 `WORKSPACE_REOPEN_REQUIRED`，本次操作未执行；按错误指引重新打开工作区后继续。这些是状态失效和资源限制错误，不以规则是否已返回作为执行条件。
+
+工作区属于当前 MCP 实例和连接。连接关闭或失效后，重新连接并打开项目，先检查实际远端状态；工具不会自动重连或重放修改。
+
+## ssh_skill_read
+
+按需读取该工作区已发现的远端 skill，或读取它引用的 UTF-8 文本资源。此工具读取内容，不执行脚本。
+
+### 参数
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- | --- |
+| `workspace_id` | string | 是 | 无 | skill 所属的工作区 ID。 |
+| `skill_name` | string | 是 | 无 | 工作区目录列出的 skill 名称，例如 testing 或 shared@testing；原样使用目录中的名称。最长 65536 个字符。 |
+| `resource` | string | 否 | `"SKILL.md"` | 相对于远端 skill 目录的 UTF-8 文本资源路径；默认读取 SKILL.md，不执行脚本。最长 4096 个字符。 |
+
+### 返回
+
+返回 skill 的可调用名称、资源远端路径、skill 目录、资源正文，以及可按需继续读取的资源路径。结果标明资源在远端使用。目录列举受预算限制，已知的更深层文本资源仍可通过相对路径读取。
+
+### 示例
+
+#### 请求
+
+```json
+{
+  "workspace_id": "ws_b8e3a160",
+  "skill_name": "testing"
+}
+```
+
+#### 返回
+
+```text
+Skill: testing
+Workspace: ws_b8e3a160
+Remote source: /srv/app/.agents/skills/testing/SKILL.md
+Remote skill directory: /srv/app/.agents/skills/testing
+Resolve references and scripts against this remote directory. Read resources with ssh_skill_read; run scripts through ssh_bash in this workspace. Skill content does not grant tool permissions.
+
+---
+name: testing
+description: Run project checks.
+---
+Read references/checks.md before running tests.
+
+
+Bundled resources: SKILL.md, references/checks.md
+```
+
+#### 请求：读取引用资源
+
+```json
+{
+  "workspace_id": "ws_b8e3a160",
+  "skill_name": "testing",
+  "resource": "references/checks.md"
+}
+```
+
+### 行为和失败情况
+
+`skill_name` 使用该工作区目录返回的可调用名称。唯一名称可直接使用，例如 `testing`。同一批首次发现同名 skill 时，用短目录前缀区分，例如工作区 skill 的 `project@check`、显式共享目录的 `shared@check`。同一前缀仍有冲突时加短后缀，例如 `shared@check-2`。特殊字符会按 URI 编码，调用方应原样使用目录返回值。服务器精确匹配工作区已登记的名称，不会将这个参数解析为文件路径。
+
+当前打开期间目录保持不变。裸名若匹配多个来源，返回 `SKILL_AMBIGUOUS`，应从目录选择名称。未知名称返回 `SKILL_NOT_FOUND`。重新打开工作区会重新发现 skill，并可能分配不同名称，以新目录中的名称为准。
+
+读取 skill 期间若工作区被重新打开，本次旧目录的读取结果会被丢弃，并返回 `WORKSPACE_REOPEN_REQUIRED`；按错误指引重新打开，再使用当前目录中的名称读取。
+
+`resource` 相对于所选 skill 的目录解析，不能越出目录。发现阶段只读取元数据，使用 skill 前必须读取完整 `SKILL.md`。无效元数据或目录列举限制通过警告报告，正文超过读取预算时失败。
+
+脚本与资源路径都在远端。按说明使用 `ssh_bash` 在远端运行脚本，先检查对应目录规则及依赖；工具不会因读取 skill 自动执行或安装任何内容。工作区外配置的个人 skill 可以读取，但其目录不会自动扩大工作区文件路径范围。本地个人 skill、客户端专用工具和 hooks 仍由客户端管理。
 
 ## ssh_bash
 
@@ -235,19 +369,20 @@ Closed 7a2c9d4f (remote cleanup confirmed).
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
-| `connection_id` | string | 是 | 无 | 执行命令的连接 ID。 |
+| `connection_id` | string | 否 | 无 | 远端连接 ID；与 workspace_id 必须且只能填写一个。 |
+| `workspace_id` | string | 否 | 无 | 远端工作区 ID；与 connection_id 必须且只能填写一个。 |
 | `command` | string | 是 | 无 | 交给远端 Bash 执行的命令。不允许 NUL；环境变量可直接写在命令中。最长 131072 个字符。 |
-| `cwd` | string | 否 | 无 | 本次命令的远端工作目录。省略时使用远端 HOME；支持绝对路径、~/ 和相对于 HOME 的路径。最长 4096 个字符。 |
+| `cwd` | string | 否 | 无 | 本次命令的远端工作目录。工作区模式默认项目根目录，相对路径基于根目录；连接模式默认远端 HOME。最长 4096 个字符。 |
 | `run_in_background` | boolean | 否 | `false` | 启动确认后立即返回；为 true 时不使用 wait_seconds。 |
 | `wait_seconds` | number | 否 | `120` | 前台最多等待多少秒，支持小数。到期只交还控制权，原任务继续运行。0 表示启动后立即返回。取值 0～300。 |
 
 不提供命令 `timeout_seconds`，也不设命令运行时限。等待到期不会杀进程；需要终止时调用 `ssh_task_stop`。建连工具的 `timeout_seconds` 仍只用于连接准备。
 
-每条命令使用独立的 Bash，参数为 `--noprofile --norc -c`，不分配 PTY，stdin 默认为 EOF。`cwd` 默认是远端 HOME；命令中的 `cd`、变量和 Shell 状态不延续到下一条命令。环境变量直接写入命令，例如 `CI=1 make test`。
+每条命令使用独立的 Bash，参数为 `--noprofile --norc -c`，不分配 PTY，stdin 默认为 EOF。连接模式的 `cwd` 默认是远端 HOME，工作区模式默认是项目根目录；命令中的 `cd`、变量和 Shell 状态不延续到下一条命令。环境变量直接写入命令，例如 `CI=1 make test`。
 
 ### 返回
 
-普通前台命令成功完成时只返回程序输出；stdout 与 stderr 分别展示，stderr 带一行标记。后台运行、前台等待到期、输出被截断、断线或失败时，结果前增加精简的 Task、Status、Exit code 和 Log 信息。日志路径、字节数和完整性只在需要继续跟进时出现。
+普通前台命令成功完成时，操作结果只有程序输出；stdout 与 stderr 分别展示，stderr 带一行标记。后台运行、前台等待到期、输出被截断、断线或失败时，操作结果前增加精简的 Task、Status、Exit code 和 Log 信息。日志路径、字节数和完整性只在需要继续跟进时出现。工作区规则有变化时，在独立的第二个文本块中返回增量，不改变原操作结果；程序非零退出仍可附规则，命令已经运行。
 
 内联预览只展示程序输出，最多保留最近 64 KiB 或 4096 个片段。日志先记录原始命令，再合并两个输出流；不保证两个流之间精确的原始写入顺序。预览可能从行中间开始。
 
@@ -421,7 +556,7 @@ task_b8e3a160  running  7a2c9d4f  /home/developer/.neverssh/sessions/7a2c9d4f/ta
 
 ## 文件与传输
 
-文件工具使用 `connection_id`；`file_path` 是远端文件路径，推荐传绝对路径，相对路径按远端 HOME 解析。读取返回带行号的文本，并记录文件版本；编辑前必须读取或写入该文件。目录列表、文件查找和内容搜索通过 `ssh_bash` 执行 `ls`、`find`、`rg`，与 Claude Code 在 macOS/Linux 上的默认工作方式一致。
+文件工具必须且只能选择 `connection_id` 或 `workspace_id`。`file_path` 是远端路径：连接模式相对远端 HOME 解析，工作区模式相对项目根目录解析。读取返回带行号的文本，并按真实目标路径记录文件版本；符号链接与已读取的其他路径拼写共享该版本，编辑前必须读取或写入该文件。工作区文件和传输操作在结果中附加新增、变更或删除的适用规则，规则变化不阻止操作；恢复根目录上下文使用再次 `ssh_workspace_open`。连接模式不加载项目上下文。目录列表、文件查找和内容搜索通过 `ssh_bash` 执行 `ls`、`find`、`rg`。
 
 远端写入、上传和下载会自动创建缺失的父目录；本地父目录仍不能通过符号链接逃出传输根目录。`ssh_upload` / `ssh_download` 使用 SFTP，复用当前连接的 ControlMaster；其他工具走 worker。SSH 压缩默认开启（`compression: true`），可通过本地配置关闭。文件工具直接返回带行号的内容或操作结果；文件版本由服务端内部记录。
 
@@ -433,14 +568,15 @@ task_b8e3a160  running  7a2c9d4f  /home/developer/.neverssh/sessions/7a2c9d4f/ta
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
-| `connection_id` | string | 是 | 无 | 连接 ID。 |
-| `file_path` | string | 是 | 无 | 远端文件路径；推荐绝对路径，相对路径按远端 HOME 解析。最长 4096 个字符。 |
+| `connection_id` | string | 否 | 无 | 远端连接 ID；与 workspace_id 必须且只能填写一个。 |
+| `workspace_id` | string | 否 | 无 | 远端工作区 ID；与 connection_id 必须且只能填写一个。 |
+| `file_path` | string | 是 | 无 | 远端文件路径；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。最长 4096 个字符。 |
 | `offset` | integer | 否 | `1` | 起始行号，从 1 开始。不小于 1。 |
 | `limit` | integer | 否 | `2000` | 最多读取多少行。不小于 1。 |
 
 ### 返回
 
-正常读取只返回带行号的文本，使用 `cat -n` 风格：
+读取正文返回带行号的文本，使用 `cat -n` 风格；工作区规则增量另放第二个文本块：
 
 ```text
      1	import { createServer } from "node:http";
@@ -488,8 +624,9 @@ PARTIAL view: showing lines 1-2000 of 5000. Use offset=2001 to continue.
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
-| `connection_id` | string | 是 | 无 | 连接 ID。 |
-| `file_path` | string | 是 | 无 | 目标远端文件；推荐绝对路径，相对路径按远端 HOME 解析。最长 4096 个字符。 |
+| `connection_id` | string | 否 | 无 | 远端连接 ID；与 workspace_id 必须且只能填写一个。 |
+| `workspace_id` | string | 否 | 无 | 远端工作区 ID；与 connection_id 必须且只能填写一个。 |
+| `file_path` | string | 是 | 无 | 目标远端文件；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。最长 4096 个字符。 |
 | `content` | string | 是 | 无 | 完整文件内容；字符数上限随 maxFileBytes 配置，远端另按 UTF-8 字节数校验。最长 4194304 个字符。 |
 
 ### 返回
@@ -538,8 +675,9 @@ File created successfully at: /srv/app/notes.txt
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
-| `connection_id` | string | 是 | 无 | 连接 ID。 |
-| `file_path` | string | 是 | 无 | 要编辑的远端文件；推荐绝对路径，相对路径按远端 HOME 解析。最长 4096 个字符。 |
+| `connection_id` | string | 否 | 无 | 远端连接 ID；与 workspace_id 必须且只能填写一个。 |
+| `workspace_id` | string | 否 | 无 | 远端工作区 ID；与 connection_id 必须且只能填写一个。 |
+| `file_path` | string | 是 | 无 | 要编辑的远端文件；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。最长 4096 个字符。 |
 | `old_string` | string | 是 | 无 | 要替换的原文；不能为空，且不能含 NUL。字符数上限随 maxFileBytes 配置。最长 4194304 个字符。 |
 | `new_string` | string | 是 | 无 | 替换后的文本；字符数上限随 maxFileBytes 配置，结果另受远端文件字节上限约束。最长 4194304 个字符。 |
 | `replace_all` | boolean | 否 | `false` | 为 true 时替换所有匹配；否则必须恰好匹配一次。 |
@@ -583,8 +721,9 @@ The file /srv/app/notes.txt has been updated successfully.
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
-| `connection_id` | string | 是 | 无 | 连接 ID。 |
-| `cwd` | string | 否 | 无 | 远端工作目录；省略时使用远端 HOME。最长 4096 个字符。 |
+| `connection_id` | string | 否 | 无 | 远端连接 ID；与 workspace_id 必须且只能填写一个。 |
+| `workspace_id` | string | 否 | 无 | 远端工作区 ID；与 connection_id 必须且只能填写一个。 |
+| `cwd` | string | 否 | 无 | 远端工作目录；默认使用工作区根目录或连接的远端 HOME。最长 4096 个字符。 |
 | `localPath` | string | 是 | 无 | 本地绝对路径，必须位于 localTransferRoots 内。最长 4096 个字符。 |
 | `remotePath` | string | 是 | 无 | 目标远端路径；支持绝对路径、~/ 和相对于 cwd 的路径。最长 4096 个字符。 |
 | `overwrite` | boolean | 否 | `false` | 显式允许覆盖已存在的远端文件。 |
@@ -620,7 +759,9 @@ SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 
 `localTransferRoots` 默认空，本地传输关闭。`localPath` 必须是根目录内的绝对路径，打开时拒绝符号链接和非常规文件；本地文件不超过 `maxFileBytes`（默认 4 MiB，可配置到 8 MiB）。
 
-上传通过 SFTP 复用当前连接的 ControlMaster；SFTP 不可用时直接返回 `SFTP_UNAVAILABLE`，不回退 worker 传输。先通过 SFTP 写远端临时文件，再由 worker 校验并提交；父目录自动创建。已有远端文件需要 `expectedSha256` 或 `overwrite=true`。提交时重新校验 `expectedSha256`；未允许覆盖时以原子的创建操作提交，拒绝覆盖上传期间出现的文件。同一 worker 对同一文件的文本写入、编辑和上传提交会串行执行，哈希校验不构成跨进程事务锁。上传内容会校验 sha256。SFTP 上传不保证保留远端原文件的 mode 和所有者；成功后记录新版本，可在同一连接下用 `ssh_edit_file` 继续编辑文本内容。
+上传通过 SFTP 复用当前连接的 ControlMaster；SFTP 不可用时直接返回 `SFTP_UNAVAILABLE`，不回退 worker 传输。本地源必须是传输根目录内的普通文件，SFTP 准备完成后会再次校验本地边界，再读取有大小上限的内容快照。远端目标固定使用检查时解析的真实路径；最终符号链接指向尚不存在的文件时，也按该真实目标创建并保留链接。
+
+先通过 SFTP 写同目录的短名称临时文件，再由 worker 校验并提交；父目录自动创建。已有远端文件需要 `expectedSha256` 或 `overwrite=true`，覆盖也不能替换目录或 FIFO 等特殊文件。暂存文件必须是普通文件，不能是符号链接；提交时校验 sha256 并重新校验 `expectedSha256`。未允许覆盖时以原子的创建操作提交，拒绝覆盖上传期间出现的文件。同一 worker 对同一文件的文本写入、编辑和上传提交会串行执行，哈希校验不构成跨进程事务锁。SFTP 上传不保证保留远端原文件的 mode 和所有者；成功后记录新版本，可在同一连接下用 `ssh_edit_file` 继续编辑文本内容。
 
 ## ssh_download
 
@@ -630,8 +771,9 @@ SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- | --- |
-| `connection_id` | string | 是 | 无 | 连接 ID。 |
-| `cwd` | string | 否 | 无 | 远端工作目录；省略时使用远端 HOME。最长 4096 个字符。 |
+| `connection_id` | string | 否 | 无 | 远端连接 ID；与 workspace_id 必须且只能填写一个。 |
+| `workspace_id` | string | 否 | 无 | 远端工作区 ID；与 connection_id 必须且只能填写一个。 |
+| `cwd` | string | 否 | 无 | 远端工作目录；默认使用工作区根目录或连接的远端 HOME。最长 4096 个字符。 |
 | `remotePath` | string | 是 | 无 | 要下载的远端路径；支持绝对路径、~/ 和相对于 cwd 的路径。最长 4096 个字符。 |
 | `localPath` | string | 是 | 无 | 本地绝对路径，必须位于 localTransferRoots 内。最长 4096 个字符。 |
 | `overwrite` | boolean | 否 | `false` | 显式允许覆盖已存在的本地文件。 |
@@ -666,7 +808,11 @@ SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 
 `localTransferRoots` 默认空，本地传输关闭。`localPath` 必须是根目录内的绝对路径；缺失的本地父目录会在根目录内创建，创建前会解析最深的已存在祖先，符号链接不能逃出根目录。目标是符号链接、非常规文件或已存在且未设置 `overwrite=true` 时拒绝写入。
 
-远端文件必须是常规文件且不超过 `maxFileBytes`；先用 worker `stat` 检查存在性和大小，再通过 SFTP 复用当前连接的 ControlMaster 下载到本地私有临时文件，计算 sha256 后原子提交。SFTP 不可用时直接返回 `SFTP_UNAVAILABLE`，不回退 worker 传输；提交前会再次校验传输根目录。
+远端文件必须是普通文件且不超过 `maxFileBytes`；先用 worker `stat` 检查存在性和大小，并固定真实目标，再通过 SFTP 下载。本地接收内容始终位于同父目录下的 0700 私有临时目录中。传输后按文件描述符复查类型与大小，以有上限的读取计算实际收到内容的 sha256，并将文件权限设为 0600 后原子提交。源文件在检查后增长超限时拒绝提交；失败时保留原目标并清理临时目录。SFTP 不可用时直接返回 `SFTP_UNAVAILABLE`，不回退 worker 传输。
+
+提交前会再次校验传输根目录，并在最后一次路径检查后复核取消状态。已取消的调用在入口就退出，不创建下载目录。并发禁止覆盖的下载以原子创建保证只有一个成功；`overwrite=true` 才允许替换已有普通文件。
+
+共享的 SFTP 可用性探测独立处理每个调用者的取消。传输取消或超时后，工具会停止并回收 SFTP 进程组再返回；连接关闭也等待其活动传输收尾。连接已经丢失或清理请求失败时，远端上传暂存文件的清理可能无法确认，应检查实际远端状态，避免直接重传。
 
 ## 文件和传输错误
 
@@ -678,6 +824,8 @@ SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 | `CONNECTION_LOST` | SSH 连接已失效 | 重新连接，并先检查远端实际状态。 |
 | `REMOTE_OPERATION_FAILED` | 远端文件或写入失败；消息包含具体原因 | 根据消息检查路径、权限或远端环境。 |
 | `FILE_NOT_READ` | 编辑前没有读取或写入该文件 | 先调用 `ssh_read_file` 或 `ssh_write_file`。 |
+| `WORKSPACE_NOT_FOUND` | 工作区 ID 无效或不再可用 | 确认连接可用后重新打开项目。 |
+| `WORKSPACE_REOPEN_REQUIRED` | 准备操作期间工作区被重新打开、规则历史达到上限，或 skill 读取结果所属的目录已失效 | 按具体错误指引重新打开工作区；准备阶段失败时操作未执行，过期 skill 的结果会被丢弃。 |
 | `OPERATION_FAILED` | 本地传输边界、本地文件或参数处理失败 | 检查 `localTransferRoots`、路径和本地权限。 |
 | `OPERATION_CANCELLED` / `OPERATION_INTERRUPTED` | 调用被取消，或远端操作超时 | 写入结果可能未知，先检查目标再重试。 |
 | `SFTP_UNAVAILABLE` | 本地 `sftp` 或远端 SFTP 子系统不可用 | 安装 OpenSSH `sftp` 客户端，或在远端启用 SFTP 子系统。 |
@@ -688,7 +836,7 @@ SHA-256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
 
 ## 日志归档与清理
 
-这里的 session 指 SSH 连接，目录名直接使用 `connection_id`，不增加第三种 ID。所有输出文件位于远端用户目录：
+这里的 session 指 SSH 连接，目录名直接使用 `connection_id`，不另设日志会话 ID。所有输出文件位于远端用户目录：
 
 ```text
 ~/.neverssh/
@@ -713,6 +861,8 @@ ready
 ```
 
 元数据同时保留原始 command 和输出起点 output_offset（字节），用于准确区分命令与输出。会话和任务元数据带 `format: 1`；新版本只清理已知格式，未知格式保留。返回的大小及日志预算包含命令头；只有程序输出进入内联预览。
+
+进程清理报错时，helper 仍会尝试完成归档，保留已收到的输出和已知退出状态，并将输出标为不完整；原始错误继续上报。归档已完成收尾不代表所有命令进程都已确认停止，远端清理状态仍可能为 `unconfirmed`。归档写入本身失败时也会明确报错。
 
 目录权限为 700，文件权限为 600。元数据和锁是内部文件，不作为模型输出。目录和日志使用独占创建，遇到历史 ID 冲突时更换尚未公开的 ID，不覆盖旧日志。
 

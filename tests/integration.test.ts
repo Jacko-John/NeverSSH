@@ -70,6 +70,19 @@ async function logOutput(text: string): Promise<string> {
   return (await readFile(path)).subarray(metadata.output_offset).toString("utf8");
 }
 
+/** Retain bounded wire evidence without changing the fixture's normal pipe consumers. */
+function captureWorkers(source: SshFixture) {
+  let workerRecords = "";
+  let workerStderr = "";
+  const workerExits: Array<{ pid: number | undefined; code: number | null; signal: NodeJS.Signals | null }> = [];
+  for (const worker of source.commands) {
+    worker.stdout.on("data", (chunk: Buffer) => { workerRecords = (workerRecords + chunk.toString()).slice(-32768); });
+    worker.stderr.on("data", (chunk: Buffer) => { workerStderr = (workerStderr + chunk.toString()).slice(-8192); });
+    worker.once("close", (code, signal) => { workerExits.push({ pid: worker.pid, code, signal }); });
+  }
+  return () => ({ workerRecords, workerStderr, workerExits });
+}
+
 beforeAll(async () => {
   await fixture.start();
   transport = new StdioClientTransport({
@@ -90,14 +103,14 @@ afterAll(async () => {
 describe("MCP and connections", () => {
   test("discovers candidates without connecting and publishes strict connection contracts", async () => {
     const listing = await client.listTools();
-    expect(listing.tools).toHaveLength(13);
+    expect(listing.tools).toHaveLength(15);
     expect(listing.tools.some((tool) => tool.name === "ssh_disconnect")).toBe(false);
     for (const tool of listing.tools) expect(tool.outputSchema, tool.name).toBeUndefined();
     for (const name of ["ssh_exec", "ssh_poll", "ssh_input", "ssh_cancel", "ssh_jobs"]) {
       expect(listing.tools.some((tool) => tool.name === name)).toBe(false);
     }
     expect(Object.keys(listing.tools.find((tool) => tool.name === "ssh_bash")?.inputSchema.properties ?? {}))
-      .toEqual(["connection_id", "command", "cwd", "run_in_background", "wait_seconds"]);
+      .toEqual(["connection_id", "workspace_id", "command", "cwd", "run_in_background", "wait_seconds"]);
     expect(Object.keys(listing.tools.find((tool) => tool.name === "ssh_task_stop")?.inputSchema.properties ?? {}))
       .toEqual(["task_id"]);
     for (const name of ["ssh_discover", "ssh_sessions"]) {
@@ -105,15 +118,20 @@ describe("MCP and connections", () => {
     }
     expect(Object.keys(listing.tools.find((tool) => tool.name === "ssh_close")?.inputSchema.properties ?? {})).toEqual(["connection_id"]);
     expect(listing.tools.find((tool) => tool.name === "ssh_close")?.annotations?.destructiveHint).toBe(true);
-    for (const tool of listing.tools.filter((tool) => !["ssh_discover", "ssh_connect", "ssh_sessions", "ssh_task_output", "ssh_task_stop", "ssh_task_list"].includes(tool.name))) {
-      expect(tool.inputSchema.required).toContain("connection_id");
+    for (const name of ["ssh_close", "ssh_workspace_open"]) {
+      expect(listing.tools.find((tool) => tool.name === name)?.inputSchema.required).toContain("connection_id");
+    }
+    for (const tool of listing.tools.filter((tool) => ["ssh_bash", "ssh_read_file", "ssh_write_file", "ssh_edit_file", "ssh_upload", "ssh_download"].includes(tool.name))) {
+      expect(tool.inputSchema.properties).toHaveProperty("connection_id");
+      expect(tool.inputSchema.properties).toHaveProperty("workspace_id");
+      expect(tool.inputSchema.required ?? []).not.toContain("connection_id");
       expect(tool.inputSchema.properties).not.toHaveProperty("target");
     }
     expect(listing.tools.find((tool) => tool.name === "ssh_read_file")?.annotations?.readOnlyHint).toBe(true);
     const properties = (name: string) => Object.keys(listing.tools.find((tool) => tool.name === name)?.inputSchema.properties ?? {});
-    expect(properties("ssh_read_file")).toEqual(["connection_id", "file_path", "offset", "limit"]);
-    expect(properties("ssh_write_file")).toEqual(["connection_id", "file_path", "content"]);
-    expect(properties("ssh_edit_file")).toEqual(["connection_id", "file_path", "old_string", "new_string", "replace_all"]);
+    expect(properties("ssh_read_file")).toEqual(["connection_id", "workspace_id", "file_path", "offset", "limit"]);
+    expect(properties("ssh_write_file")).toEqual(["connection_id", "workspace_id", "file_path", "content"]);
+    expect(properties("ssh_edit_file")).toEqual(["connection_id", "workspace_id", "file_path", "old_string", "new_string", "replace_all"]);
     expect(properties("ssh_task_list")).toEqual(["connection_id"]);
     // Some model providers reject the JSON Schema `pattern` keyword with a 400.
     for (const tool of listing.tools) {
@@ -300,6 +318,24 @@ describe("remote files", () => {
       connection_id: dev, file_path: "revision-alias.txt", old_string: "absolute write", new_string: "final edit",
     });
     expect(await readFile(path, "utf8")).toBe("final edit");
+  });
+
+  test("reading a symlink shares its revision with the target and other aliases", async () => {
+    const id = connectionId(await call("ssh_connect", { host: "fixture" }));
+    const target = join(fixture.workspace, "canonical-revision.txt");
+    const alias = join(fixture.workspace, "revision-link.txt");
+    const otherAlias = join(fixture.workspace, "other-revision-link.txt");
+    await writeFile(target, "original");
+    await symlink(target, alias);
+    await symlink(target, otherAlias);
+    await call("ssh_read_file", { connection_id: id, file_path: alias });
+    await call("ssh_edit_file", { connection_id: id, file_path: target, old_string: "original", new_string: "first edit" });
+
+    await writeFile(target, "external update");
+    await call("ssh_read_file", { connection_id: id, file_path: otherAlias });
+    await call("ssh_edit_file", { connection_id: id, file_path: alias, old_string: "external update", new_string: "final edit" });
+    expect(await readFile(target, "utf8")).toBe("final edit");
+    expect((await lstat(alias)).isSymbolicLink()).toBe(true);
   });
 
   test("large file responses cross worker protocol chunks", async () => {
@@ -637,7 +673,7 @@ describe("Bash tasks and archives", () => {
     const manifest = JSON.parse(await readFile(join(build, "manifest.json"), "utf8"));
     expect(manifest.build_id).toBe(BUILD_ID);
     expect(manifest.protocol).toBe(1);
-    for (const name of ["worker.py", "file_ops.py", "helper.py", "archive.py", "build_cache.py"]) {
+    for (const name of ["worker.py", "file_ops.py", "helper.py", "archive.py", "build_cache.py", "workspace.py"]) {
       expect((await lstat(join(build, name))).isFile()).toBe(true);
     }
     const before = (await lstat(join(build, "worker.py"))).mtimeMs;
@@ -660,6 +696,7 @@ describe("Bash tasks and archives", () => {
   });
 
   test("MCP stdio closure stops owned processes while preserving logs and metadata", async () => {
+    const workers = captureWorkers(fixture);
     const running = await call("ssh_bash", {
       connection_id: dev, command: "printf retained; (sleep 3; touch eof-leak) & wait", wait_seconds: 0.1,
     });
@@ -681,7 +718,7 @@ describe("Bash tasks and archives", () => {
       } catch { /* the atomic metadata replace may still be in flight */ }
       await delay(50);
     }
-    expect(metadata).toHaveProperty("finished_at");
+    expect(metadata, JSON.stringify({ metadata, stderr, ...workers() })).toHaveProperty("finished_at");
   }, 12000);
 });
 
@@ -763,6 +800,7 @@ describe("MCP wire lifecycle", () => {
         expect(connection.result.structuredContent).toBeUndefined();
         const id = connectionId(connection.result.content.map((item: { type: string; text?: string }) =>
           item.type === "text" ? item.text : "").join("\n"));
+        const workers = captureWorkers(epipeFixture);
         const started = await rpc("tools/call", {
           name: "ssh_bash", arguments: {
             connection_id: id,
@@ -786,7 +824,7 @@ describe("MCP wire lifecycle", () => {
         expect(epipeFixture.connections.size).toBe(0);
         expect(await logOutput(running)).toBe("retained");
         const metadata = JSON.parse(await readFile(logPath(running).replace(".log", ".meta.json"), "utf8"));
-        expect(metadata).toHaveProperty("finished_at");
+        expect(metadata, JSON.stringify({ metadata, diagnostic, ...workers() })).toHaveProperty("finished_at");
         await delay(3100);
         expect(await readdir(epipeFixture.workspace)).not.toContain("epipe-leak");
       } finally {

@@ -17,6 +17,7 @@ type ConnectionSummary = { connection_id: string; host: string; user: string; po
 const MAX_CONNECTIONS = 64;
 const CLOSE_TIMEOUT_MS = 10_000;
 const SHUTDOWN_TIMEOUT_MS = 6_000;
+const SFTP_STOP_TIMEOUT_MS = 2_000;
 
 type Connection = {
   id: string;
@@ -28,11 +29,20 @@ type Connection = {
   master: ChildProcess;
   worker: WorkerClient;
   cleanup: CleanupStatus;
+  sftpLifetime: AbortController;
+  sftpRequests: Set<Promise<void>>;
   closing?: Promise<void>;
 };
 
 type PendingConnection = {
   promise: Promise<Connection>;
+  controller: AbortController;
+  waiters: number;
+  done: boolean;
+};
+
+type SftpCheck = {
+  promise: Promise<void>;
   controller: AbortController;
   waiters: number;
   done: boolean;
@@ -48,7 +58,7 @@ export class SshTransport {
   private connections = new Map<string, Connection>();
   private reusable = new Map<string, Connection>();
   private pending = new Map<string, PendingConnection>();
-  private readonly sftpChecks = new Map<string, Promise<void>>();
+  private readonly sftpChecks = new Map<string, SftpCheck>();
   private readonly ids = new ShortIds();
   private directory = mkdtemp("/tmp/neverssh-");
   private lifetime = new AbortController();
@@ -179,6 +189,8 @@ export class SshTransport {
         id, key, target, endpoint, socket, master, worker,
         state: "ready",
         cleanup: "unconfirmed",
+        sftpLifetime: new AbortController(),
+        sftpRequests: new Set(),
       };
       master.once("exit", () => this.lost(connection, "SSH transport disconnected"));
       await worker.initialize(this.config, signal);
@@ -235,8 +247,9 @@ export class SshTransport {
     }
   }
 
-  /** Remove a connection from reuse without displacing a newer connection with the same key. */
+  /** Stop owned SFTP processes and retire reuse without displacing a newer connection. */
   private retire(connection: Connection): void {
+    connection.sftpLifetime.abort(new ToolError("CONNECTION_LOST", `Connection is ${connection.state}; SFTP stopped`));
     this.sftpChecks.delete(connection.id);
     if (this.reusable.get(connection.key) === connection) this.reusable.delete(connection.key);
   }
@@ -269,61 +282,107 @@ export class SshTransport {
     return this.get(id).worker.home;
   }
 
-  /** Probe the SFTP subsystem once per connection so transfers fail fast and clearly. */
+  /** Share subsystem discovery while each caller cancels only its own wait. */
   async prepareSftp(id: string, signal?: AbortSignal): Promise<void> {
-    const existing = this.sftpChecks.get(id);
-    if (existing) return existing;
-    const check = this.sftp(id, ["pwd"], signal).then(() => undefined).catch((error) => {
-      this.sftpChecks.delete(id);
-      if (error instanceof ToolError &&
-          ["SFTP_UNAVAILABLE", "SFTP_TIMEOUT", "OPERATION_CANCELLED"].includes(error.code)) {
-        throw error;
+    this.ready(id);
+    checkAbort(signal);
+    let check = this.sftpChecks.get(id);
+    if (!check) {
+      const controller = new AbortController();
+      const pending: SftpCheck = {
+        controller, waiters: 0, done: false,
+        promise: this.sftp(id, ["pwd"], controller.signal).catch((error) => {
+          if (this.sftpChecks.get(id) === pending) this.sftpChecks.delete(id);
+          if (error instanceof ToolError &&
+              ["SFTP_UNAVAILABLE", "SFTP_TIMEOUT", "OPERATION_CANCELLED", "CONNECTION_LOST"].includes(error.code)) {
+            throw error;
+          }
+          throw new ToolError("SFTP_UNAVAILABLE",
+            "SFTP is unavailable on this connection; enable the remote SFTP subsystem");
+        }),
+      };
+      void pending.promise.finally(() => { pending.done = true; }).catch(() => {});
+      this.sftpChecks.set(id, pending);
+      check = pending;
+    }
+
+    check.waiters++;
+    let rejectAbort!: (error: unknown) => void;
+    const cancelled = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+    const abort = () => {
+      try { checkAbort(signal); }
+      catch (error) { rejectAbort(error); }
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      checkAbort(signal);
+      await Promise.race([check.promise, cancelled]);
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      check.waiters--;
+      if (!check.waiters && !check.done) {
+        if (this.sftpChecks.get(id) === check) this.sftpChecks.delete(id);
+        check.controller.abort();
+        await check.promise.catch(() => {});
       }
-      throw new ToolError("SFTP_UNAVAILABLE",
-        "SFTP is unavailable on this connection; enable the remote SFTP subsystem");
-    });
-    this.sftpChecks.set(id, check);
-    return check;
+    }
   }
 
   /** Run a batch of SFTP commands over the existing ControlMaster instead of the worker protocol. */
   async sftp(id: string, commands: string[], signal?: AbortSignal, timeoutMs = 120000): Promise<void> {
     const connection = this.ready(id);
-    checkAbort(signal);
+    const combined = AbortSignal.any([this.lifetime.signal, connection.sftpLifetime.signal, ...(signal ? [signal] : [])]);
+    checkAbort(combined);
     const child = spawn("sftp", [
       ...sftpOptions(this.config, connection.target, connection.socket),
       "-q", "-b", "-", connection.target.host,
-    ], { stdio: ["pipe", "pipe", "pipe"], env: sshEnvironment() });
+    ], { stdio: ["pipe", "pipe", "pipe"], env: sshEnvironment(), detached: true });
     let stderr = "";
     child.stderr!.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-8192); });
     child.stdout!.on("data", () => {});
     child.stdin!.on("error", () => {});
 
-    child.stdin!.end(commands.join("\n") + "\n");
-    let settled = false;
-    await new Promise<void>((resolve, reject) => {
-      const finish = (error?: Error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        signal?.removeEventListener("abort", abort);
-        if (error) reject(error); else resolve();
+    const completion = new Promise<void>((resolve, reject) => {
+      let failure: Error | undefined;
+      let settled = false;
+      let escalation: ReturnType<typeof setTimeout> | undefined;
+      const kill = (kind: NodeJS.Signals) => {
+        if (child.pid !== undefined) {
+          try { process.kill(-child.pid, kind); return; }
+          catch { /* The process may have exited before receiving the signal. */ }
+        }
+        child.kill(kind);
+      };
+      const stop = (error: Error) => {
+        if (settled || failure) return;
+        failure = error;
+        kill("SIGTERM");
+        escalation = setTimeout(() => kill("SIGKILL"), SFTP_STOP_TIMEOUT_MS);
       };
       const abort = () => {
-        child.kill("SIGTERM");
-        finish(new ToolError("OPERATION_CANCELLED", "SFTP transfer cancelled"));
+        try { checkAbort(combined); }
+        catch (error) { stop(error instanceof Error ? error : new ToolError("OPERATION_CANCELLED", "SFTP transfer cancelled")); }
       };
-      const timer = setTimeout(() => {
-        child.kill("SIGKILL");
-        finish(new ToolError("SFTP_TIMEOUT", "SFTP transfer exceeded its time limit"));
-      }, timeoutMs);
-      child.once("error", (error) => finish(new ToolError("SFTP_UNAVAILABLE", error.message)));
-      child.once("close", (code) => finish(code === 0
-        ? undefined
-        : new ToolError("SFTP_FAILED", stderr.trim() || `sftp exited with code ${code}`)));
-      signal?.addEventListener("abort", abort, { once: true });
-      if (signal?.aborted) abort();
+      const timer = setTimeout(() => stop(new ToolError("SFTP_TIMEOUT", "SFTP transfer exceeded its time limit")), timeoutMs);
+      child.once("error", (error) => { failure ??= new ToolError("SFTP_UNAVAILABLE", error.message); });
+      child.once("close", (code) => {
+        settled = true;
+        // A failed parent may exit before its SSH child; do not leave that process group running.
+        if (failure || code !== 0) kill("SIGKILL");
+        clearTimeout(timer);
+        clearTimeout(escalation);
+        combined.removeEventListener("abort", abort);
+        if (failure) reject(failure);
+        else if (code === 0) resolve();
+        else reject(new ToolError("SFTP_FAILED", stderr.trim() || `sftp exited with code ${code}`));
+      });
+      combined.addEventListener("abort", abort, { once: true });
+      if (combined.aborted) abort();
+      child.stdin!.end(commands.join("\n") + "\n");
     });
+    connection.sftpRequests.add(completion);
+    try { await completion; }
+    finally { connection.sftpRequests.delete(completion); }
   }
 
   /** Expose the compact public identity, keeping process and protocol details internal. */
@@ -367,6 +426,7 @@ export class SshTransport {
     try {
       connection.cleanup = await connection.worker.shutdown(timeout);
     } finally {
+      await Promise.allSettled([...connection.sftpRequests]);
       connection.worker.disconnect("Connection closed");
       connection.master.kill("SIGTERM");
       connection.state = "closed";

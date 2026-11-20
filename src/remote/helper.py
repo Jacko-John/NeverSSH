@@ -149,12 +149,22 @@ def command_session():
         output_complete = False
         raise
     finally:
+        cleanup_error = None
         if child is not None:
-            if not kill_sent:
-                send_signal(signal.SIGKILL)
-            child.wait()
-            child.stdout.close()
-            child.stderr.close()
+            try:
+                if not kill_sent:
+                    send_signal(signal.SIGKILL)
+                child.wait()
+            except OSError as error:
+                # Darwin may reject signals to a group containing only zombies.
+                # Preserve the failure without abandoning the archive's terminal record.
+                cleanup_error = error
+                reason = reason or "failed"
+                output_complete = False
+                child.poll()
+            finally:
+                child.stdout.close()
+                child.stderr.close()
         selector.close()
         if archive is not None:
             try:
@@ -163,9 +173,12 @@ def command_session():
                 reason = reason or "output_error"
                 output_complete = False
                 message = "Cannot finalize command archive: " + str(error)
+                cleanup_error = cleanup_error or error
         store.close()
         for sig, handler in previous.items():
             signal.signal(sig, handler)
+        if cleanup_error is not None:
+            raise cleanup_error
     emit({"event": "exit", "exitCode": child.returncode, "reason": reason,
           "message": message, "outputBytes": archive.bytes,
           "outputComplete": output_complete})
@@ -181,6 +194,8 @@ try:
     os.chdir(os.path.expanduser(request["cwd"]))
     command_session()
 except Exception as error:
-    emit({"ok": False, "error": {"code": getattr(error, "code", type(error).__name__),
+    code = getattr(error, "code", type(error).__name__)
+    emit({"ok": False, "error": {"code": code,
                                  "message": str(error)}})
-    sys.exit(1)
+    # Exit 2 tells the worker this explicit rejection happened before Bash existed.
+    sys.exit(2 if code in ("TASK_ID_EXISTS", "BASH_UNAVAILABLE") else 1)

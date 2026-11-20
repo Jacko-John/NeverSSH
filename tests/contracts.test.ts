@@ -3,17 +3,27 @@ import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Client, InMemoryTransport, type Tool } from "@modelcontextprotocol/client";
 import { z } from "zod";
 import { configSchema } from "../src/config";
-import { commandContracts, connectionContracts, createToolContracts } from "../src/mcp/contracts";
+import { commandContracts, connectionContracts, createToolContracts, workspaceContracts } from "../src/mcp/contracts";
 import { errorText, ToolError } from "../src/errors";
 import * as format from "../src/mcp/operation-text";
 import { createServer } from "../src/mcp/server";
 import { Runtime } from "../src/runtime";
+import { contextText, skillText } from "../src/workspaces/text";
+import type { WorkspaceContext } from "../src/workspaces/types";
 
 const config = configSchema.parse({});
 const toolContracts = createToolContracts(config.maxFileBytes);
 const runtime = new Runtime(config);
 const client = new Client({ name: "neverssh-contract-test", version: "1.0.0" });
 let tools: Tool[];
+const scopedRequests = [
+  { name: "ssh_bash", args: { command: "true" } },
+  { name: "ssh_read_file", args: { file_path: "src/main.ts" } },
+  { name: "ssh_write_file", args: { file_path: "src/main.ts", content: "" } },
+  { name: "ssh_edit_file", args: { file_path: "src/main.ts", old_string: "old", new_string: "new" } },
+  { name: "ssh_upload", args: { localPath: "/tmp/in", remotePath: "assets/in" } },
+  { name: "ssh_download", args: { remotePath: "assets/out", localPath: "/tmp/out" } },
+] as const;
 
 beforeAll(async () => {
   const [local, remote] = InMemoryTransport.createLinkedPair();
@@ -36,10 +46,74 @@ test("interface document covers every registered tool", async () => {
   const source = await Bun.file(new URL("../docs/interfaces.md", import.meta.url)).text();
   const headings = source.split(/^## /m).slice(1).map((section) => section.slice(0, section.indexOf("\n")));
   expect(Object.keys(toolContracts).sort()).toEqual(tools.map(({ name }) => name).sort());
-  expect(Object.keys(toolContracts)).toHaveLength(13);
+  expect(Object.keys(toolContracts)).toHaveLength(15);
+  expect(headings.filter((heading) => heading.startsWith("ssh_")).sort()).toEqual(tools.map(({ name }) => name).sort());
   for (const { name, outputSchema } of tools) {
     expect(headings.filter((heading) => heading === name), name).toHaveLength(1);
     expect(outputSchema, name).toBeUndefined();
+  }
+});
+
+test("project operations accept exactly one scope and retain strict portable input schemas", () => {
+  for (const { name, args } of scopedRequests) {
+    const input = toolContracts[name].input;
+    expect(input.safeParse({ ...args, connection_id: "1234abcd" }).success, name).toBe(true);
+    expect(input.safeParse({ ...args, workspace_id: "ws_abcd1234" }).success, name).toBe(true);
+    expect(input.safeParse(args).success, name).toBe(false);
+    expect(input.safeParse({ ...args, connection_id: "1234abcd", workspace_id: "ws_abcd1234" }).success, name).toBe(false);
+    expect(input.safeParse({ ...args, workspace_id: "abcd1234" }).success, name).toBe(false);
+    expect(input.safeParse({ ...args, workspace_id: "ws_abcd1234", host: "other" }).success, name).toBe(false);
+  }
+  for (const { name, inputSchema } of tools) {
+    expect(inputSchema.type, name).toBe("object");
+    expect(JSON.stringify(inputSchema), name).not.toMatch(/"pattern"\s*:/);
+    expect(inputSchema.additionalProperties, name).toBe(false);
+  }
+});
+
+test("MCP rejects ambiguous scopes before execution and workspace failures remain text-only", async () => {
+  for (const { name, args } of scopedRequests) {
+    for (const scope of [{}, { connection_id: "1234abcd", workspace_id: "ws_abcd1234" }]) {
+      const response = await client.callTool({ name, arguments: { ...args, ...scope } });
+      expect(response.isError, name).toBe(true);
+      expect(response.structuredContent, name).toBeUndefined();
+      expect(response.content.every((item) => item.type === "text"), name).toBe(true);
+      expect(response.content.map((item) => item.type === "text" ? item.text : "").join("\n"), name).toContain("exactly one");
+    }
+  }
+  for (const { name, args } of [
+    { name: "ssh_workspace_open", args: { connection_id: "1234abcd", path: "/srv/app" } },
+    { name: "ssh_skill_read", args: { workspace_id: "ws_abcd1234", skill_name: "testing" } },
+  ]) {
+    const response = await client.callTool({ name, arguments: args });
+    expect(response.isError, name).toBe(true);
+    expect(response.structuredContent, name).toBeUndefined();
+    expect(response.content.every((item) => item.type === "text"), name).toBe(true);
+    expect(response.content.map((item) => item.type === "text" ? item.text : "").join("\n"), name).toMatch(/^Error: (?:CONNECTION_NOT_FOUND|WORKSPACE_NOT_FOUND)\n/);
+  }
+});
+
+test("workspace contracts validate handles, defaults, bounded lists, and unknown fields", () => {
+  const open = workspaceContracts.ssh_workspace_open.input;
+  const read = workspaceContracts.ssh_skill_read.input;
+  const scope = { workspace_id: "ws_abcd1234" };
+  expect(open.parse({ connection_id: "1234abcd", path: "/srv/app" })).toEqual({
+    connection_id: "1234abcd", path: "/srv/app", skill_directories: [".agents/skills", ".claude/skills"],
+  });
+  expect(open.safeParse({ connection_id: "1234abcd", path: "/srv/app", skill_directories: [] }).success).toBe(true);
+  expect(open.safeParse({ connection_id: "1234abcd", path: "/srv/app", skill_directories: Array(17).fill("skills") }).success).toBe(false);
+  expect(open.safeParse({ connection_id: "1234abcd", path: "/srv/app", workspace_id: scope.workspace_id }).success).toBe(false);
+  const skill = { ...scope, skill_name: "testing" };
+  expect(read.parse(skill)).toEqual({ ...skill, resource: "SKILL.md" });
+  expect(read.safeParse({ ...skill, resource: "references/checks.md" }).success).toBe(true);
+  expect(read.safeParse({ ...skill, resource: "" }).success).toBe(false);
+  expect(read.safeParse({ ...skill, skill_name: "" }).success).toBe(false);
+  expect(read.safeParse({ ...skill, skill_name: "x".repeat(65537) }).success).toBe(false);
+  expect(read.safeParse({ ...skill, skill_name: "shared@testing" }).success).toBe(true);
+  expect(read.safeParse({ ...skill, skill_id: "skill_0123456789abcdef" }).success).toBe(false);
+  expect(read.safeParse({ ...skill, execute: true }).success).toBe(false);
+  for (const workspace_id of ["abcd1234", "ws_ABCD1234", "task_abcd1234"]) {
+    expect(read.safeParse({ ...skill, workspace_id }).success).toBe(false);
   }
 });
 
@@ -146,6 +220,30 @@ test("connection, file, and transfer return examples match their text formatters
     ssh_edit_file: format.editText({ path: "/srv/app/notes.txt" }),
     ssh_upload: format.uploadText({ path: "/srv/app/assets/logo.png", localPath: "/Users/me/transfer/logo.png", bytesWritten: 2048, sha256 }),
     ssh_download: format.downloadText({ path: "/srv/app/build/app.tar.gz", localPath: "/Users/me/transfer/app.tar.gz", size: 4096, sha256 }),
+  };
+  for (const [name, expected] of Object.entries(examples)) {
+    const section = source.split(/^## /m).find((section) => section.startsWith(`${name}\n`))!;
+    const output = section.split(/^#### 返回[^\n]*\n/m)[1]!;
+    const text = /^\x60\x60\x60text\n([\s\S]*?)\x60\x60\x60/m.exec(output)?.[1];
+    expect(text, name).toBe(expected + "\n");
+  }
+});
+
+test("workspace and skill return examples match their typed text formatters", async () => {
+  const source = await Bun.file(new URL("../docs/interfaces.md", import.meta.url)).text();
+  const base: WorkspaceContext = {
+    workspace_id: "ws_b8e3a160", connection_id: "7a2c9d4f", root: "/srv/app", paths: ["/srv/app"],
+    instructions: [], skills: [], project_files: [], git: null, warnings: [],
+  };
+  const examples = {
+    ssh_workspace_open: contextText(base),
+    ssh_skill_read: skillText({
+      workspace_id: base.workspace_id, connection_id: base.connection_id, name: "testing",
+      path: "/srv/app/.agents/skills/testing/SKILL.md", directory: "/srv/app/.agents/skills/testing", execution: "remote",
+      sha256: "8106f68136f6187738e3ecb429a8c94e31ed763e9dd40cf57ef7e64aa5421504",
+      content: "---\nname: testing\ndescription: Run project checks.\n---\nRead references/checks.md before running tests.\n",
+      resources: ["SKILL.md", "references/checks.md"], warnings: [],
+    }),
   };
   for (const [name, expected] of Object.entries(examples)) {
     const section = source.split(/^## /m).find((section) => section.startsWith(`${name}\n`))!;

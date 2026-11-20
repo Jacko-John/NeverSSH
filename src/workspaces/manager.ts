@@ -1,0 +1,283 @@
+/** Bind project context to explicit remote handles without changing the client's local workspace. */
+import { posix } from "node:path";
+import { z } from "zod";
+import { cleanString } from "../config";
+import { checkAbort, ToolError } from "../errors";
+import { ShortIds } from "../ids";
+import type { SshTransport } from "../ssh/transport";
+import type { Instruction, InstructionDelta, PreparedScope, SkillRead, SkillSummary, WorkspaceContext, WorkspaceScope } from "./types";
+
+const MAX_WORKSPACES = 128;
+const MAX_KNOWN_RULES = 2048;
+const absolutePath = cleanString.max(4096).refine((value) => posix.isAbsolute(value), "Expected an absolute remote path");
+const digest = z.string().regex(/^[a-f0-9]{64}$/);
+const warnings = z.array(z.string().max(8192)).max(2048);
+const remoteContextSchema = z.strictObject({
+  root: absolutePath,
+  paths: z.array(absolutePath).min(1).max(64),
+  instructions: z.array(z.strictObject({ path: absolutePath, scope: absolutePath, sha256: digest, content: z.string().max(131072) })).max(MAX_KNOWN_RULES),
+  skill_files: z.array(z.strictObject({ path: absolutePath, scope: absolutePath, content: z.string().max(65536) })).max(128),
+  project_files: z.array(absolutePath).max(8192),
+  git: z.strictObject({ root: absolutePath.nullable(), branch: z.string().nullable(), status: z.string().max(65536), truncated: z.boolean() }).nullable(),
+  warnings,
+});
+const remoteSkillSchema = z.strictObject({
+  path: absolutePath, directory: absolutePath, content: z.string().max(131072), sha256: digest,
+  resources: z.array(cleanString.max(4096)).max(128), warnings,
+});
+const metadataSchema = z.object({ name: cleanString.trim().min(1).max(64), description: cleanString.trim().min(1).max(1024) });
+type RemoteContext = z.infer<typeof remoteContextSchema>;
+type WorkspaceTransport = Pick<SshTransport, "run" | "cwd"> & {
+  sessions(): { sessions: { connection_id: string }[] };
+  get(id: string): unknown;
+};
+type KnownRule = Pick<Instruction, "scope" | "sha256">;
+type Workspace = {
+  id: string; connectionId: string; root: string; skillDirectories: string[]; epoch: number;
+  rules: Map<string, KnownRule>; skills: Map<string, SkillSummary>; rulesOverflow: boolean;
+};
+type PendingDelivery = { workspace: Workspace; epoch: number; catalog: boolean };
+type ContextDetails = Omit<WorkspaceContext, "workspace_id" | "connection_id">;
+type OperationScope = { connection_id: string; workspace_id?: undefined } | { connection_id?: undefined; workspace_id: string };
+
+/** Compare remote POSIX ancestry without claiming an operating-system sandbox. */
+function within(root: string, path: string): boolean {
+  const relative = posix.relative(root, path);
+  return relative !== ".." && !relative.startsWith("../") && !posix.isAbsolute(relative);
+}
+
+/** Keep names printable and reserve the namespace separator without changing ordinary names. */
+function shortSkillName(skill: SkillSummary): string {
+  return encodeURIComponent(skill.name);
+}
+
+/** Distinguish same-named project and shared skills without exposing storage paths. */
+function scopedSkillName(root: string, skill: SkillSummary): string {
+  const scope = within(root, skill.directory) ? "project" : "shared";
+  return `${scope}@${shortSkillName(skill)}`;
+}
+
+/** Build one bounded catalog before publishing or replacing any workspace state. */
+function skillCatalog(root: string, files: RemoteContext["skill_files"], warnings: string[]): SkillSummary[] {
+  const skills: SkillSummary[] = [];
+  for (const file of files) {
+    try {
+      const metadata = metadataSchema.parse(Bun.YAML.parse(file.content));
+      skills.push({ ...metadata, callName: "", path: file.path, directory: posix.dirname(file.path), scope: file.scope });
+    } catch {
+      warnings.push(`Skill metadata is invalid or missing name/description: ${file.path}`);
+    }
+  }
+  const counts = new Map<string, number>();
+  for (const skill of skills) {
+    const name = shortSkillName(skill);
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  const names = new Set<string>();
+  for (const skill of skills) {
+    const name = shortSkillName(skill);
+    const base = (counts.get(name) ?? 0) > 1 ? scopedSkillName(root, skill) : name;
+    let candidate = base;
+    let suffix = 2;
+    while (names.has(candidate)) candidate = `${base}-${suffix++}`;
+    names.add(candidate);
+    skill.callName = candidate;
+  }
+  return skills;
+}
+
+/** Validate remote context and parse skill metadata without changing delivery history. */
+function contextDetails(remote: RemoteContext, root: string, catalog: boolean): ContextDetails {
+  if (remote.root !== root || remote.paths.some((path) => !within(root, path))) {
+    throw new ToolError("WORKSPACE_PATH_CHANGED", "Workspace paths changed; reopen the project with ssh_workspace_open before continuing");
+  }
+  const { skill_files, ...details } = remote;
+  const warnings = [...details.warnings];
+  const skills = catalog ? skillCatalog(root, skill_files, warnings) : [];
+  return { ...details, skills, warnings };
+}
+
+/** Own bounded project state for one MCP process; reconnecting requires opening a new handle. */
+export class WorkspaceManager {
+  private readonly workspaces = new Map<string, Workspace>();
+  private readonly ids = new ShortIds();
+  private readonly pending = new WeakMap<WorkspaceContext, PendingDelivery>();
+
+  constructor(private readonly ssh: WorkspaceTransport) {}
+
+  /** Reject retired connections without assuming their transport records still exist. */
+  private assertReady(connectionId: string): void {
+    if (!this.ssh.sessions().sessions.some((connection) => connection.connection_id === connectionId)) {
+      throw new ToolError("CONNECTION_LOST", "Reconnect and reopen the project with ssh_workspace_open");
+    }
+  }
+
+  private get(id: string): Workspace {
+    const workspace = this.workspaces.get(id);
+    if (!workspace) throw new ToolError("WORKSPACE_NOT_FOUND", "Open the project with ssh_workspace_open");
+    this.assertReady(workspace.connectionId);
+    return workspace;
+  }
+
+  /** Discover the canonical project before publishing its handle; formatting owns delivery. */
+  async open(connectionId: string, path: string, skillDirectories: string[], signal?: AbortSignal): Promise<WorkspaceContext> {
+    checkAbort(signal);
+    this.ssh.get(connectionId);
+    const remote = remoteContextSchema.parse(await this.ssh.run(connectionId, "workspace_open", {
+      path, skillDirectories,
+    }, undefined, signal));
+    checkAbort(signal);
+    this.assertReady(connectionId);
+    const details = contextDetails(remote, remote.root, true);
+    const available = new Set(this.ssh.sessions().sessions.map((connection) => connection.connection_id));
+    for (const [id, workspace] of this.workspaces) {
+      if (!available.has(workspace.connectionId)) this.workspaces.delete(id);
+    }
+    let workspace = [...this.workspaces.values()].find((entry) =>
+      entry.connectionId === connectionId && entry.root === remote.root &&
+      entry.skillDirectories.length === skillDirectories.length &&
+      entry.skillDirectories.every((directory, index) => directory === skillDirectories[index]));
+    if (!workspace) {
+      if (this.workspaces.size >= MAX_WORKSPACES) throw new ToolError("WORKSPACE_LIMIT", "Close an unused connection before opening more workspaces");
+      workspace = { id: `ws_${this.ids.next()}`, connectionId, root: remote.root, skillDirectories: [...skillDirectories], epoch: 0,
+        rules: new Map(), skills: new Map(), rulesOverflow: false };
+    }
+    // Everything that can reject the discovered context has completed; publish the reset together.
+    workspace.epoch++;
+    workspace.rules.clear();
+    workspace.skills.clear();
+    workspace.rulesOverflow = false;
+    this.workspaces.set(workspace.id, workspace);
+    return this.contextResult(workspace, details, true);
+  }
+
+  /** Resolve the project path and collect guidance for the operation's eventual response. */
+  async prepare(scope: WorkspaceScope, path: string, signal?: AbortSignal): Promise<PreparedScope> {
+    this.validateScope(scope);
+    checkAbort(signal);
+    if (scope.connection_id !== undefined) {
+      this.ssh.get(scope.connection_id);
+      return { connectionId: scope.connection_id, path };
+    }
+    const workspace = this.get(scope.workspace_id);
+    const epoch = workspace.epoch;
+    const remote = remoteContextSchema.parse(await this.ssh.run(workspace.connectionId, "workspace_context", {
+      root: workspace.root, paths: [path],
+    }, workspace.root, signal));
+    checkAbort(signal);
+    this.assertCurrent(workspace, epoch,
+      "The workspace was reopened during preparation. Reopen it with ssh_workspace_open, then retry. Nothing was executed.");
+    if (workspace.rulesOverflow) {
+      throw new ToolError("WORKSPACE_REOPEN_REQUIRED", "Instruction delivery history is full. Reopen the project with ssh_workspace_open before continuing. Nothing was executed.");
+    }
+    const context = this.contextResult(workspace, contextDetails(remote, workspace.root, false), false);
+    // The worker returns the lexical path followed by its checked canonical target, if different.
+    return { connectionId: workspace.connectionId, path: context.paths.at(-1)!, context };
+  }
+
+  /** Resolve cwd without changing other calls' defaults; the remote inspection checks symlinks. */
+  path(scope: WorkspaceScope, path: string, cwd?: string): string {
+    this.validateScope(scope);
+    if (scope.workspace_id === undefined) return path;
+    const workspace = this.get(scope.workspace_id);
+    const home = this.ssh.cwd(workspace.connectionId);
+    const expand = (value: string) => value === "~" ? home : value.startsWith("~/") ? posix.join(home, value.slice(2)) : value;
+    return posix.resolve(workspace.root, expand(cwd ?? "."), expand(path));
+  }
+
+  /** Preserve completed operation results while suppressing guidance from retired workspace state. */
+  guidance(context: WorkspaceContext): InstructionDelta {
+    const pending = this.currentDelivery(context);
+    return pending ? this.instructionDelta(pending.workspace, context) : { updated: [], removed: [] };
+  }
+
+  /** Remember applicable state after successful delivery; unchanged rules were delivered earlier. */
+  delivered(context: WorkspaceContext): void {
+    const pending = this.currentDelivery(context);
+    this.pending.delete(context);
+    if (!pending) return;
+    const { workspace, catalog } = pending;
+    const current = new Set(context.instructions.map((rule) => rule.path));
+    for (const [path, rule] of workspace.rules) {
+      if (context.paths.some((target) => within(rule.scope, target)) && !current.has(path)) workspace.rules.delete(path);
+    }
+    for (const rule of context.instructions) {
+      if (!workspace.rules.has(rule.path) && workspace.rules.size >= MAX_KNOWN_RULES) {
+        // Forgetting an old rule could miss its later deletion. Require reopening instead.
+        workspace.rulesOverflow = true;
+        continue;
+      }
+      workspace.rules.set(rule.path, { scope: rule.scope, sha256: rule.sha256 });
+    }
+    if (catalog) {
+      for (const skill of context.skills) workspace.skills.set(skill.callName, skill);
+    }
+  }
+
+  /** Read one catalogued skill or a contained resource; content never grants tool permissions. */
+  async skill(id: string, selected: string, resource: string, signal?: AbortSignal): Promise<SkillRead> {
+    checkAbort(signal);
+    const workspace = this.get(id);
+    const epoch = workspace.epoch;
+    const skill = workspace.skills.get(selected);
+    if (!skill) {
+      const matches = [...workspace.skills.values()].filter((entry) => shortSkillName(entry) === selected);
+      if (matches.length > 1) {
+        const choices = matches.slice(0, 8).map((entry) => entry.callName).join(", ");
+        throw new ToolError("SKILL_AMBIGUOUS", `Use a skill name from the catalog: ${choices}`);
+      }
+      throw new ToolError("SKILL_NOT_FOUND", "Reopen the project with ssh_workspace_open and use a skill name from its catalog");
+    }
+    const value = remoteSkillSchema.parse(await this.ssh.run(workspace.connectionId, "workspace_skill_read", {
+      path: skill.path, resource,
+    }, workspace.root, signal));
+    checkAbort(signal);
+    this.assertCurrent(workspace, epoch,
+      "The workspace was reopened while this skill was being read. Its result was discarded; reopen the project with ssh_workspace_open and use its current catalog.");
+    if (value.directory !== skill.directory || !within(skill.directory, value.path)) {
+      throw new ToolError("SKILL_PATH_CHANGED", "The skill directory changed; reopen the project with ssh_workspace_open before reading it");
+    }
+    return { ...value, workspace_id: id, connection_id: workspace.connectionId, name: selected, execution: "remote" };
+  }
+
+  private validateScope(scope: WorkspaceScope): asserts scope is OperationScope {
+    if ((scope.connection_id !== undefined) === (scope.workspace_id !== undefined)) {
+      throw new ToolError("INVALID_SCOPE", "Provide exactly one of connection_id or workspace_id");
+    }
+  }
+
+  /** Reopening retires in-flight context and skill reads, even when the handle is reused. */
+  private assertCurrent(workspace: Workspace, epoch: number, message: string): void {
+    this.assertReady(workspace.connectionId);
+    if (workspace.epoch !== epoch) {
+      throw new ToolError("WORKSPACE_REOPEN_REQUIRED", message);
+    }
+  }
+
+  /** A late operation may report its result but must not present or acknowledge obsolete guidance. */
+  private currentDelivery(context: WorkspaceContext): PendingDelivery | undefined {
+    const pending = this.pending.get(context);
+    if (!pending) return;
+    const { workspace, epoch } = pending;
+    if (this.workspaces.get(workspace.id) !== workspace || workspace.epoch !== epoch) return;
+    if (!this.ssh.sessions().sessions.some((connection) => connection.connection_id === workspace.connectionId)) return;
+    return pending;
+  }
+
+  /** Bind fully built context to its delivery generation; presentation owns acknowledgment. */
+  private contextResult(workspace: Workspace, details: ContextDetails, catalog: boolean): WorkspaceContext {
+    const context = { ...details, workspace_id: workspace.id, connection_id: workspace.connectionId };
+    this.pending.set(context, { workspace, epoch: workspace.epoch, catalog });
+    return context;
+  }
+
+  /** Return only rule changes that need presentation in the operation result. */
+  private instructionDelta(workspace: Workspace, context: WorkspaceContext): InstructionDelta {
+    const current = new Set(context.instructions.map((rule) => rule.path));
+    const updated = context.instructions.filter((rule) => workspace.rules.get(rule.path)?.sha256 !== rule.sha256);
+    const removed = [...workspace.rules].filter(([path, rule]) =>
+      context.paths.some((target) => within(rule.scope, target)) && !current.has(path))
+      .map(([path, rule]) => ({ path, scope: rule.scope }));
+    return { updated, removed };
+  }
+}

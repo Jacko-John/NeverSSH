@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 ### Breaking changes
 
@@ -8,7 +8,29 @@
 
 ### Maintenance
 
-- Organize local code by MCP, SSH, task, and file responsibilities, with runtime ownership separate from MCP registration and remote bundle metadata beside its sources. Consolidate registration and all 13 input contracts, including configuration-dependent file limits, without changing public inputs or text formats.
+- Organize local code by MCP, SSH, task, file, and workspace responsibilities, with runtime ownership separate from MCP registration and remote bundle metadata beside its sources. Consolidate registration and all 15 input contracts, including configuration-dependent file limits.
+
+### Features
+
+- Open remote project workspaces and load scoped `AGENTS.md`, project entry files, Git status, and skill catalogs through text-only MCP tools. Discover skills only from the configured roots, defaulting to the workspace root's `.agents/skills` and `.claude/skills`; target paths do not enable subdirectory skill discovery. Read skill bodies and referenced text resources on demand by their catalogued names, using short source prefixes for collisions.
+- Add workspace scope to Bash, file, and transfer tools while preserving connection mode. Return applicable rule changes with operation results without blocking execution for previously unread, added, changed, or removed rules.
+- Reopen a workspace to recover root guidance, refresh Git state, and rediscover skills; opening resets rule delivery and rebuilds the skill catalog. Ordinary workspace operations return rule deltas in a separate text block after the original result, without repeating unchanged guidance, skill catalogs, or Git status. Guidance returned after an operation informs subsequent work; it does not establish that the agent understood it before execution.
+- Document the remote development workflow, including reading rules and code, making edits, running checks remotely, reviewing Git changes, and recovering context after conversation compaction or reconnecting.
+
+### Fixes
+
+- Share file revisions between symbolic links and their canonical targets, so reading through one spelling permits a fresh edit through another.
+- Execute workspace operations against their checked canonical target rather than following a changed entry symlink again.
+- Discard obsolete skill reads and rule attachments after a workspace is reopened, while retaining the results of operations that have already run.
+- Preserve the existing workspace state when a reopening response fails validation.
+- Skip automatic Git status when configured content filters cannot be safely disabled, preserving project guidance and other opening results.
+- Stop owned Git subprocesses when inspection completes, is cancelled, times out, or fails.
+- Keep download staging private throughout SFTP, bound local snapshot reads, and check cancellation immediately before atomic publication. Failed downloads preserve existing destination files and clean their private staging directories.
+- Pin checked upload and download targets, handle missing symlink targets consistently, reject non-regular transfer files and symlink upload staging, and recheck local upload boundaries after subsystem discovery.
+- Use short upload staging filenames so valid destination names near filesystem limits remain usable.
+- Isolate cancellation between shared SFTP discovery callers, wait for stopped SFTP process groups to exit, and include active transfers in connection cleanup.
+- Finalize retained command archives even when process-group cleanup raises an OS error, including Darwin's zombie-group `EPERM` race. Preserve the original error and mark incomplete output instead of omitting terminal metadata.
+- Report remote cleanup as unconfirmed after abnormal helper termination; explicit rejections before a command starts remain safe to retry and do not invalidate cleanup confirmation.
 
 ## 0.2.3
 

@@ -17,11 +17,17 @@ type Schema = {
   minimum?: number;
   maximum?: number;
   maxLength?: number;
+  minItems?: number;
+  maxItems?: number;
 };
 
 /** Describe caller-visible meaning here; types, defaults, and bounds come from the MCP schemas. */
 const taskScope = {
   task_id: "ssh_bash 返回的 task_ 加 8 位十六进制任务 ID。",
+};
+const operationScope = {
+  connection_id: "远端连接 ID；与 workspace_id 必须且只能填写一个。",
+  workspace_id: "远端工作区 ID；与 connection_id 必须且只能填写一个。",
 };
 const descriptions: Record<string, Record<string, string>> = {
   "ssh_connect.input": {
@@ -34,9 +40,9 @@ const descriptions: Record<string, Record<string, string>> = {
     connection_id: "要关闭的连接 ID。",
   },
   "ssh_bash.input": {
-    connection_id: "执行命令的连接 ID。",
+    ...operationScope,
     command: "交给远端 Bash 执行的命令。不允许 NUL；环境变量可直接写在命令中。",
-    cwd: "本次命令的远端工作目录。省略时使用远端 HOME；支持绝对路径、~/ 和相对于 HOME 的路径。",
+    cwd: "本次命令的远端工作目录。工作区模式默认项目根目录，相对路径基于根目录；连接模式默认远端 HOME。",
     run_in_background: "启动确认后立即返回；为 true 时不使用 wait_seconds。",
     wait_seconds: "前台最多等待多少秒，支持小数。到期只交还控制权，原任务继续运行。0 表示启动后立即返回。",
   },
@@ -48,35 +54,45 @@ const descriptions: Record<string, Record<string, string>> = {
   "ssh_task_list.input": {
     connection_id: "只列出该连接的任务；省略时列出全部连接。",
   },
+  "ssh_workspace_open.input": {
+    connection_id: "打开项目所用的远端连接 ID。",
+    path: "已存在的远端项目目录；支持绝对路径、~/ 和相对于远端 HOME 的路径。",
+    skill_directories: "替换默认远端 skill 搜索目录，统一从工作区根目录解析一次；默认 .agents/skills 和 .claude/skills，不支持随目标路径发现子目录 skill。绝对路径和 ~/ 指向远端共享目录；空数组关闭发现。",
+  },
+  "ssh_skill_read.input": {
+    workspace_id: "skill 所属的工作区 ID。",
+    skill_name: "工作区目录列出的 skill 名称，例如 testing 或 shared@testing；原样使用目录中的名称。",
+    resource: "相对于远端 skill 目录的 UTF-8 文本资源路径；默认读取 SKILL.md，不执行脚本。",
+  },
   "ssh_read_file.input": {
-    connection_id: "连接 ID。",
-    file_path: "远端文件路径；推荐绝对路径，相对路径按远端 HOME 解析。",
+    ...operationScope,
+    file_path: "远端文件路径；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。",
     offset: "起始行号，从 1 开始。",
     limit: "最多读取多少行。",
   },
   "ssh_write_file.input": {
-    connection_id: "连接 ID。",
-    file_path: "目标远端文件；推荐绝对路径，相对路径按远端 HOME 解析。",
+    ...operationScope,
+    file_path: "目标远端文件；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。",
     content: "完整文件内容；字符数上限随 maxFileBytes 配置，远端另按 UTF-8 字节数校验。",
   },
   "ssh_edit_file.input": {
-    connection_id: "连接 ID。",
-    file_path: "要编辑的远端文件；推荐绝对路径，相对路径按远端 HOME 解析。",
+    ...operationScope,
+    file_path: "要编辑的远端文件；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。",
     old_string: "要替换的原文；不能为空，且不能含 NUL。字符数上限随 maxFileBytes 配置。",
     new_string: "替换后的文本；字符数上限随 maxFileBytes 配置，结果另受远端文件字节上限约束。",
     replace_all: "为 true 时替换所有匹配；否则必须恰好匹配一次。",
   },
   "ssh_upload.input": {
-    connection_id: "连接 ID。",
-    cwd: "远端工作目录；省略时使用远端 HOME。",
+    ...operationScope,
+    cwd: "远端工作目录；默认使用工作区根目录或连接的远端 HOME。",
     localPath: "本地绝对路径，必须位于 localTransferRoots 内。",
     remotePath: "目标远端路径；支持绝对路径、~/ 和相对于 cwd 的路径。",
     overwrite: "显式允许覆盖已存在的远端文件。",
     expectedSha256: "期望的远端文件 SHA-256，小写十六进制；用于冲突检查。",
   },
   "ssh_download.input": {
-    connection_id: "连接 ID。",
-    cwd: "远端工作目录；省略时使用远端 HOME。",
+    ...operationScope,
+    cwd: "远端工作目录；默认使用工作区根目录或连接的远端 HOME。",
     remotePath: "要下载的远端路径；支持绝对路径、~/ 和相对于 cwd 的路径。",
     localPath: "本地绝对路径，必须位于 localTransferRoots 内。",
     overwrite: "显式允许覆盖已存在的本地文件。",
@@ -94,6 +110,8 @@ function displayType(schema: Schema): string {
 
 /** Express numeric and length constraints in words alongside the field's meaning. */
 function displayBounds(schema: Schema): string {
+  if (schema.minItems !== undefined && schema.maxItems !== undefined) return `包含 ${schema.minItems}～${schema.maxItems} 项。`;
+  if (schema.maxItems !== undefined) return `最多 ${schema.maxItems} 项。`;
   const minimum = schema.minimum === Number.MIN_SAFE_INTEGER ? undefined : schema.minimum;
   const maximum = schema.maximum === Number.MAX_SAFE_INTEGER ? undefined : schema.maximum;
   if (minimum !== undefined && maximum !== undefined) {

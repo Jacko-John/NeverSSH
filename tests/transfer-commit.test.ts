@@ -2,7 +2,7 @@
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { SshTransport } from "../src/ssh/transport";
 import { download, upload } from "../src/files/transfers";
 import { SshFixture } from "./fixture";
@@ -33,7 +33,7 @@ function beforeUpload(action: () => Promise<void>) {
 
 /** Check that successful and failed commits both remove their remote staged files. */
 async function stagedFiles(remote: string): Promise<string[]> {
-  return (await readdir(dirname(remote))).filter((name) => name.startsWith(`${basename(remote)}.neverssh-`));
+  return (await readdir(dirname(remote))).filter((name) => name.startsWith(".neverssh-upload-"));
 }
 
 test("upload refuses to overwrite a file created while SFTP is being prepared", async () => {

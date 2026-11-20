@@ -5,8 +5,9 @@ import buildCacheSource from "./build_cache.py" with { type: "text" };
 import fileOpsSource from "./file_ops.py" with { type: "text" };
 import helperSource from "./helper.py" with { type: "text" };
 import workerSource from "./worker.py" with { type: "text" };
+import workspaceSource from "./workspace.py" with { type: "text" };
 
-export const SERVER_VERSION = "0.2.3";
+export const SERVER_VERSION = "0.3.0";
 export const PROTOCOL_VERSION = 1;
 export const MIN_PYTHON = "3.8";
 export const ARCHIVE_FORMAT = 1;
@@ -18,6 +19,7 @@ export const BUILD_SOURCES = {
   "file_ops.py": fileOpsSource,
   "helper.py": helperSource,
   "worker.py": workerSource,
+  "workspace.py": workspaceSource,
 };
 
 export const SOURCE_HASHES = Object.fromEntries(

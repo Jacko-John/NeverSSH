@@ -8,6 +8,15 @@ const taskId = z.string().refine((value) => /^task_[a-f0-9]{8}$/.test(value), "U
   .describe("Prefixed task_id returned by ssh_bash; unique within this MCP instance.");
 const taskScope = { task_id: taskId };
 const waitSeconds = z.number().min(0).max(300);
+const workspaceId = z.string().refine((value) => /^ws_[a-f0-9]{8}$/.test(value), "Use the workspace_id returned by ssh_workspace_open")
+  .describe("Workspace handle returned by ssh_workspace_open in this MCP instance.");
+const operationScope = { connection_id: connectionId.optional(), workspace_id: workspaceId.optional() };
+const scopeMessage = "Provide exactly one connection_id or workspace_id";
+
+/** Keep a portable object schema; enforce scope exclusivity when validating the request. */
+function validOperationScope(value: { connection_id?: string | undefined; workspace_id?: string | undefined }): boolean {
+  return (value.connection_id !== undefined) !== (value.workspace_id !== undefined);
+}
 
 export const connectionContracts = {
   ssh_discover: {
@@ -28,12 +37,12 @@ export const connectionContracts = {
 export const commandContracts = {
   ssh_bash: {
     input: z.strictObject({
-      connection_id: connectionId,
+      ...operationScope,
       command: cleanString.max(131072),
-      cwd: cleanString.max(4096).optional(),
+      cwd: cleanString.max(4096).optional().describe("Remote working directory, relative to the workspace root or remote HOME; defaults to that root."),
       run_in_background: z.boolean().default(false),
       wait_seconds: waitSeconds.default(120),
-    }),
+    }).refine(validOperationScope, scopeMessage),
   },
   ssh_task_output: {
     input: z.strictObject({ ...taskScope, wait_seconds: waitSeconds.default(30) }),
@@ -46,11 +55,31 @@ export const commandContracts = {
   },
 };
 
+export const workspaceContracts = {
+  ssh_workspace_open: {
+    input: z.strictObject({
+      connection_id: connectionId,
+      path: cleanString.max(4096).describe("Remote project directory; canonicalized when opened. Relative paths resolve against remote HOME."),
+      skill_directories: z.array(cleanString.max(4096)).max(16).default([".agents/skills", ".claude/skills"])
+        .describe("Remote skill directories, resolved once from the workspace root. Defaults are .agents/skills and .claude/skills; nested directory discovery is unsupported. Absolute and ~/ paths may select shared remote skills. Use [] to disable discovery."),
+    }),
+  },
+  ssh_skill_read: {
+    input: z.strictObject({
+      workspace_id: workspaceId,
+      skill_name: cleanString.max(65536)
+        .describe("Skill name from the workspace catalog, such as testing or shared@testing. Copy the listed name to select its source."),
+      resource: cleanString.max(4096).default("SKILL.md")
+        .describe("Text resource relative to the discovered remote skill directory; defaults to its SKILL.md. Does not execute scripts."),
+    }),
+  },
+};
+
 const remotePath = cleanString.max(4096).describe("Remote path: absolute, ~/..., or relative to cwd.");
-const filePath = cleanString.max(4096).describe("Remote file path; absolute paths are recommended, relative paths resolve against the remote home directory.");
+const filePath = cleanString.max(4096).describe("Remote file path; relative to the workspace root or, with connection_id, remote HOME.");
 const transferScope = {
-  connection_id: connectionId,
-  cwd: remotePath.optional().describe("Remote working directory; defaults to this connection's remote home directory."),
+  ...operationScope,
+  cwd: remotePath.optional().describe("Remote working directory; defaults to the workspace root or remote HOME. localPath always stays local."),
 };
 const hash = z.string().refine((value) => /^[a-f0-9]{64}$/.test(value), "Use a lowercase hex SHA-256").optional();
 
@@ -59,37 +88,38 @@ export function createToolContracts(maxFileBytes: number) {
   return {
     ...connectionContracts,
     ...commandContracts,
+    ...workspaceContracts,
     ssh_read_file: {
       input: z.strictObject({
-        connection_id: connectionId, file_path: filePath,
+        ...operationScope, file_path: filePath,
         offset: z.number().int().min(1).default(1),
         limit: z.number().int().min(1).default(2000),
-      }),
+      }).refine(validOperationScope, scopeMessage),
     },
     ssh_write_file: {
       input: z.strictObject({
-        connection_id: connectionId, file_path: filePath,
+        ...operationScope, file_path: filePath,
         content: z.string().max(maxFileBytes),
-      }),
+      }).refine(validOperationScope, scopeMessage),
     },
     ssh_edit_file: {
       input: z.strictObject({
-        connection_id: connectionId, file_path: filePath,
+        ...operationScope, file_path: filePath,
         old_string: cleanString.max(maxFileBytes),
         new_string: z.string().max(maxFileBytes),
         replace_all: z.boolean().default(false),
-      }),
+      }).refine(validOperationScope, scopeMessage),
     },
     ssh_upload: {
       input: z.strictObject({
         ...transferScope, localPath: cleanString.max(4096), remotePath,
         overwrite: z.boolean().default(false), expectedSha256: hash,
-      }),
+      }).refine(validOperationScope, scopeMessage),
     },
     ssh_download: {
       input: z.strictObject({
         ...transferScope, remotePath, localPath: cleanString.max(4096), overwrite: z.boolean().default(false),
-      }),
+      }).refine(validOperationScope, scopeMessage),
     },
   };
 }

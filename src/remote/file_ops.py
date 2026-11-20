@@ -1,5 +1,6 @@
 """File operations executed inside the persistent worker using only the standard library."""
 import base64
+import errno
 import hashlib
 import os
 import shutil
@@ -23,9 +24,17 @@ def path_for(value, cwd):
     return os.path.abspath(os.path.join(cwd, os.path.expanduser(value)))
 
 
-def load_bytes(filename, limit):
+def load_bytes(filename, limit, follow_symlinks=True):
     """Read one bounded regular file; refuse devices, FIFOs, and files that grow past the limit."""
-    descriptor = os.open(filename, os.O_RDONLY | os.O_NONBLOCK)
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    if not follow_symlinks:
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(filename, flags)
+    except OSError as error:
+        if not follow_symlinks and error.errno == errno.ELOOP:
+            raise ValueError("Expected a regular file, not a symlink") from None
+        raise
     with os.fdopen(descriptor, "rb") as handle:
         info = os.fstat(handle.fileno())
         if not stat.S_ISREG(info.st_mode):
@@ -104,7 +113,7 @@ def atomic_write(filename, data, original, expected, limit):
 def read_file(request):
     """Return complete UTF-8 lines within a byte budget, plus the full-file revision."""
     args = request.get("args", {})
-    filename = path_for(args["path"], request["cwd"])
+    filename = os.path.realpath(path_for(args["path"], request["cwd"]))
     data, _ = load_bytes(filename, request["maxFileBytes"])
     lines = text_from(data).splitlines(keepends=True)
     start = args.get("startLine", 1) - 1
@@ -182,11 +191,17 @@ def commit_upload(request):
     try:
         with mutation_lock(filename):
             # Verify before changing the destination; a failed transfer never becomes visible.
-            data, _ = load_bytes(temporary, request["maxFileBytes"])
+            data, _ = load_bytes(temporary, request["maxFileBytes"], follow_symlinks=False)
             revision = digest(data)
             if revision != args["sha256"]:
                 raise ValueError("Upload size or SHA-256 verification failed")
             expected = args.get("expectedSha256")
+            try:
+                destination = os.lstat(filename)
+            except FileNotFoundError:
+                destination = None
+            if destination is not None and not stat.S_ISREG(destination.st_mode):
+                raise ValueError("Upload destination must be a regular file")
             if expected is not None:
                 try:
                     current, _ = load_bytes(filename, request["maxFileBytes"])
@@ -204,26 +219,29 @@ def commit_upload(request):
             fsync_directory(os.path.dirname(filename))
             return {"path": filename, "bytesWritten": len(data), "sha256": revision}
     finally:
-        if os.path.exists(temporary):
+        if os.path.lexists(temporary):
             os.unlink(temporary)
 
 
 def stat_file(request):
-    """Report existence and metadata for upload conflict checks."""
+    """Pin one canonical regular-file target for transfer checks, including missing files."""
     args = request.get("args", {})
     filename = path_for(args["path"], request["cwd"])
+    canonical = os.path.realpath(filename)
     try:
-        info = os.stat(filename)
+        info = os.stat(canonical)
     except FileNotFoundError:
-        return {"path": filename, "exists": False}
+        return {"path": filename, "exists": False, "realpath": canonical}
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("Expected a regular file")
     return {"path": filename, "exists": True, "size": info.st_size,
-            "realpath": os.path.realpath(filename)}
+            "realpath": canonical}
 
 
 def hash_file(request):
     """Hash an existing remote file without transferring its contents."""
     args = request.get("args", {})
-    filename = path_for(args["path"], request["cwd"])
+    filename = os.path.realpath(path_for(args["path"], request["cwd"]))
     data, _ = load_bytes(filename, request["maxFileBytes"])
     return {"path": filename, "size": len(data), "sha256": digest(data)}
 

@@ -1,6 +1,8 @@
 """Exercise same-worker revision conflicts with real files and deterministic commit gates."""
 import base64
+import os
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import threading
@@ -122,6 +124,86 @@ class FileCommitTests(unittest.TestCase):
             file_ops.dispatch(request)
         self.assertEqual(target.read_bytes(), b"original")
         self.assertFalse(staged.exists())
+
+    def test_transfer_stat_rejects_nonregular_files_and_their_aliases(self):
+        directory = self.root / "directory"
+        directory.mkdir()
+        fifo = self.root / "fifo"
+        os.mkfifo(fifo)
+        for target in (directory, fifo):
+            alias = self.root / (target.name + "-alias")
+            alias.symlink_to(target)
+            for path in (target, alias):
+                with self.subTest(path=path), self.assertRaisesRegex(ValueError, "regular file"):
+                    file_ops.dispatch(self.request("stat", path=str(path)))
+
+    def test_transfer_stat_keeps_the_canonical_target_of_a_dangling_alias(self):
+        target = self.root / "missing-parent/target"
+        alias = self.root / "alias"
+        alias.symlink_to(target)
+
+        result = file_ops.dispatch(self.request("stat", path=str(alias)))
+
+        self.assertFalse(result["exists"])
+        self.assertEqual(result["realpath"], str(target.resolve()))
+
+    def test_hash_returns_the_canonical_path_of_a_regular_file(self):
+        target = self.root / "target"
+        target.write_bytes(b"contents")
+        alias = self.root / "alias"
+        alias.symlink_to(target)
+
+        result = file_ops.dispatch(self.request("hash", path=str(alias)))
+
+        self.assertEqual(result["path"], str(target.resolve()))
+        self.assertEqual(result["sha256"], file_ops.digest(b"contents"))
+
+    def test_upload_cannot_replace_a_nonregular_destination(self):
+        target = self.root / "target"
+        os.mkfifo(target)
+        staged = self.root / "upload.staged"
+        staged.write_bytes(b"upload")
+
+        with self.assertRaisesRegex(ValueError, "regular file"):
+            file_ops.dispatch(self.request("commit_upload", path=str(target), temporary=str(staged),
+                                           overwrite=True, sha256=file_ops.digest(b"upload")))
+
+        self.assertTrue(stat.S_ISFIFO(target.lstat().st_mode))
+        self.assertFalse(staged.exists())
+
+    def test_upload_rejects_symlinked_staging_files_without_moving_their_targets(self):
+        source = self.root / "source"
+        source.write_bytes(b"upload")
+        for overwrite in (False, True):
+            with self.subTest(overwrite=overwrite):
+                target = self.root / ("target-%s" % overwrite)
+                if overwrite:
+                    target.write_bytes(b"original")
+                staged = self.root / ("upload-%s.staged" % overwrite)
+                staged.symlink_to(source)
+
+                with self.assertRaisesRegex(ValueError, "regular file"):
+                    file_ops.dispatch(self.request("commit_upload", path=str(target), temporary=str(staged),
+                                                   overwrite=overwrite, sha256=file_ops.digest(b"upload")))
+
+                self.assertFalse(os.path.lexists(staged))
+                self.assertEqual(source.read_bytes(), b"upload")
+                if overwrite:
+                    self.assertEqual(target.read_bytes(), b"original")
+                else:
+                    self.assertFalse(os.path.lexists(target))
+
+    def test_upload_cleans_a_broken_staging_symlink_after_rejecting_it(self):
+        target = self.root / "target"
+        staged = self.root / "upload.staged"
+        staged.symlink_to(self.root / "absent")
+
+        with self.assertRaisesRegex(ValueError, "regular file"):
+            file_ops.dispatch(self.request("commit_upload", path=str(target), temporary=str(staged),
+                                           overwrite=True, sha256=file_ops.digest(b"upload")))
+
+        self.assertFalse(os.path.lexists(staged))
+        self.assertFalse(target.exists())
 
 
 if __name__ == "__main__":

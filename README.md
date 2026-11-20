@@ -1,6 +1,6 @@
 # NeverSSH
 
-让本地 Agent 通过 MCP 发现和操作 SSH 远程环境。Agent、模型连接和 MCP 服务运行在本地；远端使用现有 `sshd` 和 Python 标准库，无需部署模型或 Agent 服务。
+让本地 Agent 通过 MCP 连接远程项目，读取项目规则和 skill，完成读代码、修改、测试和 diff 检查。Agent、模型连接和 MCP 服务运行在本地；远端使用现有 `sshd` 和 Python 标准库，无需部署模型或 Agent 服务。
 
 ```mermaid
 flowchart LR
@@ -11,7 +11,7 @@ flowchart LR
     Worker --> Commands[独立命令 helper 及其子进程]
 ```
 
-Agent 可以调用 `ssh_discover({})` 一次获取全部候选入口，也可以直接提交目标地址。`ssh_connect` 在远端 worker 就绪后返回短 `connection_id`，命令和文件操作通过该 ID 引用连接；任务工具使用 `ssh_bash` 在需要跟进时返回的 `task_id`。默认沿用本机 SSH 能力；用户可以屏蔽目标或只开放指定目标。
+Agent 可以调用 `ssh_discover({})` 一次获取全部候选入口，也可以直接提交目标地址。`ssh_connect` 在远端 worker 就绪后返回短 `connection_id`；开发项目时用 `ssh_workspace_open` 打开目录，取得 `workspace_id` 和项目上下文。命令和文件操作选择其中一个 ID，任务工具使用 `ssh_bash` 在需要跟进时返回的 `task_id`。默认沿用本机 SSH 能力；用户可以屏蔽目标或只开放指定目标。
 
 连接和命令工具的参数、返回值和调用示例见 [工具接口](docs/interfaces.md)；构建缓存、版本和兼容策略见 [版本与兼容](docs/compatibility.md)，变更记录见 [CHANGELOG](CHANGELOG.md)。
 
@@ -22,6 +22,7 @@ Agent 可以调用 `ssh_discover({})` 一次获取全部候选入口，也可以
 - 上传和下载需要远端启用 SFTP 子系统；SFTP 不可用时工具直接报错，不回退。
 - 本机已有可用的非交互 SSH 认证和经过核实的主机密钥记录。工具使用 `BatchMode=yes`、`StrictHostKeyChecking=yes`。
 - 远端 `rg` 可选；需要内容搜索时通过 `ssh_bash` 使用。
+- 远端 Git 可选；工作区用它检查分支和已有改动。Git 不可用时仍可读取项目规则、skill 和文件。
 
 首次连接会把内容寻址的 worker 源码安装到远端 `~/.neverssh/builds/<buildId>/`，后续连接复用；不安装依赖、不监听端口、没有独立后台服务。活动 worker 对构建持有共享锁，默认保留当前构建和最近 2 个未锁定构建；超过 30 天的未锁定构建也会清理。worker 随连接退出；文件读写编辑由常驻 worker 直接执行，Bash 使用独立 helper 进程。A/B、回滚和版本校验见[版本与兼容](docs/compatibility.md)。
 
@@ -67,7 +68,7 @@ cp neverssh.config.example.json neverssh.config.json
 
 `host` 匹配请求入口和 OpenSSH 求值后的主机名，不区分大小写；`user` 匹配实际账号，区分大小写。两者支持 `*`、`?` 通配符。规则按名字匹配，不会把 DNS 名、IP 和其他别名自动认作同一台服务器；屏蔽实际端点时应填写对应主机名或地址。规则控制最终操作目标，跳板继续由 SSH 配置管理。
 
-端口、身份文件、证书和跳板等继续使用 SSH 配置。可用顶层 `sshConfig` 指定自定义配置文件。`--config` 和 `NEVERSSH_CONFIG` 显式指定的配置文件必须存在。旧版 `targets` 配置已移除；远端项目目录改为操作时传入 `cwd`。
+端口、身份文件、证书和跳板等继续使用 SSH 配置。可用顶层 `sshConfig` 指定自定义配置文件。`--config` 和 `NEVERSSH_CONFIG` 显式指定的配置文件必须存在。旧版 `targets` 配置已移除；远端项目目录通过工作区指定，也可在连接模式下按次传入 `cwd`。
 
 CLI 可以只列出候选，或者诊断指定目标；诊断会报告远端 Python 版本、平台、Bash 路径和 HOME 文件系统类型。归档锁假设本地 Linux 文件系统，NFS/SMB 上的锁和配额需要额外验证：
 
@@ -132,14 +133,46 @@ launcher 需要本机有 `curl`、`bun` 1.3+ 和 OpenSSH 客户端。有缓存�
 
 需要自定义配置时，在 `args` 中增加 `--config` 和配置文件绝对路径。
 
-MCP 无法重定向客户端自带的本地 shell、编辑器或搜索工具。仓库内的 [Agent skill](skills/neverssh/SKILL.md) 覆盖安装、目标选择、命令与文件操作流程。以 Claude Code 为例，复制到用户级 skill 目录即可使用：
+工作区通过普通 MCP 工具提供上下文；MCP 无法重定向客户端自带的本地 shell、编辑器或搜索工具，也不能保证客户端自动加载规则。仓库内的 [Agent skill](skills/neverssh/SKILL.md) 覆盖安装、工作区上下文和远端开发流程。以 Claude Code 为例，复制到用户级 skill 目录即可使用：
 
 ```sh
 mkdir -p ~/.claude/skills
 cp -R skills/neverssh ~/.claude/skills/
 ```
 
-skill 会在需要远端操作时触发；安装与排错细节见 `skills/neverssh/references/installation.md`。
+安装后，支持该格式的客户端可以按 skill 说明选择远端工具；加载和触发方式由客户端决定。安装与排错细节见 `skills/neverssh/references/installation.md`。
+
+## 开发远程项目
+
+连接后，用 `ssh_workspace_open` 打开项目目录：
+
+```json
+{"connection_id":"7a2c9d4f","path":"/srv/app"}
+```
+
+返回工作区 ID（例如 `ws_b8e3a160`）、远端项目根目录、Git 状态、项目入口文件，以及根目录的 `AGENTS.md` 正文和可用 skill 目录。先检查规则和已有改动，再通过这个工作区操作项目。相对文件路径和 `cwd` 基于项目根目录，命令默认在根目录执行。
+
+普通工作区操作从根目录向目标收集适用的 `AGENTS.md`，保留来源、适用目录和完整正文。文件读取、写入、编辑、上传、下载和 Bash 的结果会自动附上新增、变更或删除的适用规则，不因规则尚未返回或已经变化而拒绝操作。返回这些规则时，本次文件操作已经执行，Bash 命令已经启动；规则用于指导后续操作，服务器不保证 Agent 在本次操作前已理解它们。文件路径限制、读取后编辑和版本冲突检查仍然生效。
+
+操作结果保持在第一个 MCP 文本块中，规则增量另放第二个文本块；规则无变化时只有操作结果。Bash 即使以非零状态退出，也可能附上规则提示，命令已经运行，不要因此重新执行。真正失败的文件或传输操作不附带规则；规则采集、路径校验和资源限制仍可能在执行前报错。
+
+普通操作不重复返回未变化的规则、Skill 目录和 Git 状态。需要恢复根目录上下文、刷新 Git 状态或重新发现 skill 时，再次调用 `ssh_workspace_open`。相同连接、根目录和 skill 配置可以复用工作区 ID，但会重置已返回规则的记录并重建 skill 目录。打开时只返回根目录规则，子目录规则会随后随目标操作自动返回。Bash 的规则发现只覆盖 `cwd`；涉及其他目录时，可以在对应 `cwd` 操作或主动读取该目录的 `AGENTS.md`。连接模式不加载项目上下文。
+
+默认只从工作区根目录下的 `.agents/skills` 和 `.claude/skills` 发现 skill，不支持随操作路径发现子目录 skill。进入子目录不会新增该子目录的 skill；`AGENTS.md` 仍按目标路径收集。`skill_directories` 可替换默认搜索目录：相对目录从工作区根解析一次，绝对路径和 `~/` 可指定远端共享或个人目录。
+
+skill 目录列出可调用名称和描述；使用时通过 `ssh_skill_read({workspace_id,skill_name:"testing"})` 读取完整 `SKILL.md`，再按需读取引用资源。名称唯一时直接使用 `testing`；名称冲突时用短目录前缀区分，例如 `project@check`、`shared@check`，仍有冲突时加短后缀。当前打开期间名称保持原来源；再次打开后以新目录中的名称为准。原样使用目录返回的名称；服务器精确匹配已登记名称，不把名称解析为文件路径。工具不会自动安装依赖或执行脚本；skill 的脚本在远端运行，本地个人 skill 继续由客户端管理。
+
+项目操作使用现有工具，且每次必须只填 `workspace_id` 或 `connection_id` 中的一个：
+
+```json
+{"workspace_id":"ws_b8e3a160","file_path":"src/main.ts"}
+```
+
+读代码、修改后，在远端运行项目要求的测试和检查，再查看相关 `git diff`、`git diff --check` 和 `git status --short`。初始 Git 状态只是快照，不能将所有脏文件自动归属到当前任务；保留用户已有改动，提交和推送遵循用户授权。
+
+工作区管理远端路径和项目上下文，没有把项目挂载到本地 IDE，也不是命令沙箱。文件路径和规则收集范围限制在项目根目录内，Bash 仍具有 SSH 账号的权限。当前规则支持 `AGENTS.md`，不模拟各客户端的专用规则、hooks 或原生编辑器集成。
+
+对话压缩后再次打开工作区，恢复根目录上下文并重读仍需使用的 skill；后续目标操作会重新返回适用的子目录规则。服务器无法判断模型是否还记得内容。断线后重新连接并打开工作区，先检查远端实际状态，不自动重放命令或修改。
 
 ## 工具使用
 
@@ -172,6 +205,7 @@ Connection: 7a2c9d4f
 | 能力 | 工具 |
 | --- | --- |
 | 发现与连接 | `ssh_discover`、`ssh_connect`、`ssh_sessions`、`ssh_close` |
+| 项目上下文 | `ssh_workspace_open`、`ssh_skill_read` |
 | 命令和任务 | `ssh_bash`、`ssh_task_output`、`ssh_task_stop`、`ssh_task_list` |
 | 文件 | `ssh_read_file`、`ssh_write_file`、`ssh_edit_file` |
 | 二进制传输 | `ssh_upload`、`ssh_download` |
@@ -180,11 +214,11 @@ Connection: 7a2c9d4f
 
 编辑前先用 `ssh_read_file` 读取文件；`ssh_read_file` 和 `ssh_write_file` 会记录文件版本，`ssh_edit_file` 自动用它拒绝过期修改。`old_string` 默认必须唯一匹配；设置 `replace_all=true` 替换全部匹配。读取结果带行号，默认最多 2000 行。写入和上传会自动创建远端父目录。
 
-`ssh_bash` 的短命令成功完成时只返回输出；后台运行、等待到期、输出截断或失败时再给出 `task_...` 任务 ID、状态、远端日志路径和字节数。后台任务只需 `task_id` 调用 `ssh_task_output` 查询或等待，使用 `ssh_task_stop` 停止，不再需要 `connection_id`。`ssh_task_list` 列出尚未被 `ssh_task_output` 读取输出的任务；读取后移除，新输出会让它重新出现。
+`ssh_bash` 的短命令成功完成时，操作结果只有程序输出；后台运行、等待到期、输出截断或失败时再给出 `task_...` 任务 ID、状态、远端日志路径和字节数。工作区规则有变化时，在独立的第二个文本块中附上提示。后台任务只需 `task_id` 调用 `ssh_task_output` 查询或等待，使用 `ssh_task_stop` 停止，不再需要 `connection_id`。`ssh_task_list` 列出尚未被 `ssh_task_output` 读取输出的任务；读取后移除，新输出会让它重新出现。
 
 `wait_seconds` 默认 120 秒，查询默认 30 秒，上限均为 300 秒，支持小数。等待到期只返回控制权，原进程继续运行；不提供命令运行时限参数。设置 `run_in_background=true` 可在启动后立即返回。
 
-每次命令使用独立的 Bash，stdin 默认为 EOF，没有 PTY。`cwd` 默认是远端 HOME；`cd` 和变量不会延续到下一条命令。环境变量可直接写进命令，例如 `CI=1 make test`。
+每次命令使用独立的 Bash，stdin 默认为 EOF，没有 PTY。连接模式的 `cwd` 默认是远端 HOME，工作区模式默认是项目根目录；`cd` 和变量不会延续到下一条命令。环境变量可直接写进命令，例如 `CI=1 make test`。
 
 日志包含原始命令及其输出，位于远端 `~/.neverssh/sessions/<connection_id>/<task_id>.log`，从任务结束起保留 14 天。关闭连接或退出 MCP 会停止任务并保留日志。预览未显示完整输出时，工具才给出读取提醒。大日志用 `ssh_bash` 执行 `tail`、限定范围的 `sed` 或针对性 `rg`，避免整份加载进上下文。清理器跳过活动任务；离线期间过期的日志在下次连接时补清理。
 
@@ -213,7 +247,7 @@ NeverSSH 不调用模型 API。远端命令自身的网络请求仍来自远端�
 
 ## 开发验证
 
-源码按职责组织：`src/mcp/` 管理工具接口和通用结果文本，`src/ssh/` 管理连接与 worker 请求协议，`src/tasks/` 管理 Bash 任务和预览，`src/files/` 管理文件修订与传输。`src/remote/` 保存 Python 远端运行时及本地 bundle 定义；`src/runtime.ts` 统一持有状态，`src/index.ts` 负责 CLI 和 stdio 生命周期。开发规范和正反示例见[项目开发 skill](.agents/skills/neverssh-development/SKILL.md)。
+源码按职责组织：`src/mcp/` 管理工具接口和通用结果文本，`src/ssh/` 管理连接与 worker 请求协议，`src/tasks/` 管理 Bash 任务和预览，`src/files/` 管理文件修订与传输，`src/workspaces/` 管理工作区与项目上下文。`src/remote/` 保存 Python 远端运行时及本地 bundle 定义；`src/runtime.ts` 统一持有状态，`src/index.ts` 负责 CLI 和 stdio 生命周期。开发规范和正反示例见[项目开发 skill](.agents/skills/neverssh-development/SKILL.md)。
 
 ```sh
 bun run check
@@ -222,7 +256,7 @@ bun test
 bun run build
 ```
 
-全部 13 个工具的输入 schema 集中在 `src/mcp/contracts.ts`，按当前 `maxFileBytes` 构建。修改 schema 后运行 `bun run docs:sync` 更新字段表，并同步行为说明和示例。字段表使用默认配置；测试会检查全部工具的覆盖、字段表同步及示例是否通过实际 schema 校验。
+全部 15 个工具的输入 schema 集中在 `src/mcp/contracts.ts`，按当前 `maxFileBytes` 构建。修改 schema 后运行 `bun run docs:sync` 更新字段表，并同步行为说明和示例。字段表使用默认配置；测试会检查全部工具的覆盖、字段表同步及示例是否通过实际 schema 校验。
 
 JavaScript/TypeScript 使用 Bun。本地 Python 检查和测试解释器由 uv 执行。集成测试创建临时 SSH 密钥和仅监听回环地址的 SSH 测试服务，使用系统 OpenSSH 和 MCP stdio 验证工具，不修改用户 SSH 配置。
 
@@ -233,8 +267,8 @@ JavaScript/TypeScript 使用 Bun。本地 Python 检查和测试解释器由 uv 
 推送 `v*` 标签会触发 GitHub Actions：
 
 ```sh
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 工作流运行检查、测试和构建，并上传 `neverssh.js`、`neverssh` launcher 和 `neverssh.config.example.json` 到对应 Release。launcher 在后台解析 `releases/latest`，新标签在用户下一次启动时生效，无需修改 MCP 配置。

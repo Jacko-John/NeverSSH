@@ -2,9 +2,9 @@
 
 NeverSSH 不安装远端服务。远端 Python 源码由本地包提供，首次连接写入内容寻址的构建缓存，后续连接复用。
 
-## 0.3.0 接口调整
+## 0.3.1 接口调整
 
-从 `0.3.0` 起，所有 MCP 工具统一只返回可读文本，不再提供 `structuredContent` 或 `outputSchema`。已有工具的参数、文本格式和远端执行行为保持兼容；依赖结构化结果的程序调用方需要改为读取文本内容。
+从 `0.3.1` 起，所有 MCP 工具统一只返回可读文本，不再提供 `structuredContent` 或 `outputSchema`。已有工具的参数、文本格式和远端执行行为保持兼容；依赖结构化结果的程序调用方需要改为读取文本内容。
 
 远端项目新增工作区打开和 skill 读取工具，共 15 个工具。Bash、文件和传输支持互斥的 `connection_id` / `workspace_id`，原有连接模式继续可用；两种 scope 的互斥由运行时校验，公开 schema 保持普通对象形式。工作区句柄只属于当前 MCP 实例和连接，不持久化或自动恢复，也不会把本地客户端的 skill 同步到远端。
 
@@ -18,7 +18,7 @@ skill 默认只从工作区根目录的 `.agents/skills`、`.claude/skills` 发�
 
 | 维度 | 当前值 | 兼容规则 |
 | --- | --- | --- |
-| MCP 服务版本 | `0.3.0` | `0.x` 阶段不兼容接口调整升 minor；`1.0` 起按 semver 升 major |
+| MCP 服务版本 | `0.3.1` | `0.x` 阶段不兼容接口调整升 minor；`1.0` 起按 semver 升 major |
 | worker 协议 | `1` | 只在 wire 不兼容时递增；客户端校验，不匹配返回 `PROTOCOL_INCOMPATIBLE` |
 | 构建 ID | 源码内容哈希 | 本地与远端必须完全一致；不匹配返回 `BUILD_MISMATCH` |
 | 最低 Python | `3.8` | 在加载任何源码前检查；过旧返回 `RUNTIME_UNSUPPORTED` |

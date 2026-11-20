@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0
+## 0.3.1
 
 ### Breaking changes
 
@@ -8,6 +8,7 @@
 
 ### Maintenance
 
+- Isolate Git inspection tests from machine-wide Git configuration.
 - Organize local code by MCP, SSH, task, file, and workspace responsibilities, with runtime ownership separate from MCP registration and remote bundle metadata beside its sources. Consolidate registration and all 15 input contracts, including configuration-dependent file limits.
 
 ### Features

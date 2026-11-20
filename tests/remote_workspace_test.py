@@ -19,6 +19,13 @@ class WorkspaceTests(unittest.TestCase):
     """Keep project files, external skills, and Git settings within a temporary tree."""
 
     def setUp(self):
+        # Runner-wide filters can exhaust tiny inspection budgets before status is read.
+        # Keep repository-local settings available for the filter/fsmonitor safety cases.
+        git_environment = patch.dict(os.environ, {"GIT_CONFIG_NOSYSTEM": "1",
+                                                  "GIT_CONFIG_SYSTEM": os.devnull,
+                                                  "GIT_CONFIG_GLOBAL": os.devnull})
+        git_environment.start()
+        self.addCleanup(git_environment.stop)
         self.temporary = tempfile.TemporaryDirectory(prefix="neverssh-workspace-")
         self.home = Path(self.temporary.name).resolve()
         self.root = self.home / "project"

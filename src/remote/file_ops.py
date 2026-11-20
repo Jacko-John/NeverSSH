@@ -147,26 +147,17 @@ def read_file(request):
     args = request.get("args", {})
     filename = os.path.realpath(path_for(args["path"], request["cwd"]))
     data, _ = load_bytes(filename, request["maxFileBytes"])
-    # Workspace validation follows symlinks; the user's filename can still identify the format.
-    requested = args.get("requestedPath", args["path"])
-    suffix = os.path.splitext(requested)[1].lower()
-    if suffix not in (".ipynb", ".pdf"):
-        suffix = os.path.splitext(filename)[1].lower()
-    if "pages" in args and suffix != ".pdf":
-        raise ValueError("The pages parameter is for PDF files; use offset and limit for text")
     mime_type = read_formats.image_mime_type(data)
     if mime_type is not None:
         return {"kind": "image", "mimeType": mime_type,
                 "base64": base64.b64encode(data).decode("ascii"),
                 "path": filename, "size": len(data), "sha256": digest(data)}
-    if suffix in (".ipynb", ".pdf"):
-        if suffix == ".ipynb":
-            result = read_formats.read_notebook(data, request["maxFileBytes"])
-        else:
-            result = read_formats.read_pdf(data, request)
+    # Workspace validation follows symlinks; the user's filename can still identify the format.
+    extension = read_formats.file_format(data, args.get("requestedPath", args["path"]), filename)
+    if extension == ".ipynb":
+        result = read_formats.read_notebook(data, request["maxFileBytes"])
         result.update(path=filename, size=len(data), sha256=digest(data))
         return result
-    extension = read_formats.binary_extension(requested) or read_formats.binary_extension(filename)
     if extension:
         raise ValueError("Binary file (%s): use a format-specific skill or inspect it with an appropriate "
                          "reader through ssh_bash" % extension)
@@ -218,10 +209,9 @@ def write_file(request):
                 raise ValueError("Content conflict: expected file does not exist")
         if original is not None:
             if expected is None:
-                binary = read_formats.binary_extension(filename) or b"\x00" in current
-                readable_media = (read_formats.image_mime_type(current) or current.startswith((b"\xff\xfe", b"\xfe\xff"))
-                                  or filename.lower().endswith(".pdf"))
-                if binary and not readable_media:
+                extension = read_formats.file_format(current, args["path"], filename)
+                nul_binary = b"\x00" in current and not current.startswith((b"\xff\xfe", b"\xfe\xff"))
+                if (extension not in ("", ".ipynb") or nul_binary) and not read_formats.image_mime_type(current):
                     raise ValueError("Binary file: use ssh_upload with overwrite=true to replace it, "
                                      "or use a format-specific command through ssh_bash.")
                 raise ValueError("File exists: read it with ssh_read_file first, through the last page. "

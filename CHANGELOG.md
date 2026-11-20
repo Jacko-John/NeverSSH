@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.0
+
+### Breaking changes
+
+- Removed PDF rendering and the `pages` parameter from `ssh_read_file`. For PDF text, use an available remote reader through `ssh_bash`.
+
 ## 0.5.0
 
 ### Upgrade notes

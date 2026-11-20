@@ -6,7 +6,7 @@ const MAX_PAGE_RANGES = 32;
 
 type Revision = { sha256: string };
 type PageRange = [first: number, last: number];
-type PartialRead = { unit: "page" | "line"; total: number; ranges: PageRange[] };
+type PartialRead = { total: number; ranges: PageRange[] };
 type FileState = Revision & { observation: number; partial?: PartialRead };
 type Remembered = { kind: "revision"; value: FileState } | { kind: "alias"; canonicalKey: string; observation: number };
 
@@ -15,9 +15,8 @@ function partialRead(previous: FileState | undefined, result: Record<string, unk
   const { startLine: start, endLine: end, totalLines: total } = result;
   if (typeof start !== "number" || typeof end !== "number" || typeof total !== "number" || !total) return;
   if (previous && !previous.partial) return;
-  const unit = result.kind === "document" ? "page" : "line";
   const existing = previous?.partial;
-  const ranges: PageRange[] = existing?.unit === unit && existing.total === total ? [...existing.ranges] : [];
+  const ranges: PageRange[] = existing?.total === total ? [...existing.ranges] : [];
   if (start <= end) ranges.push([start, end]);
   ranges.sort((left, right) => left[0] - right[0]);
   const merged: PageRange[] = [];
@@ -27,7 +26,7 @@ function partialRead(previous: FileState | undefined, result: Record<string, unk
     else merged.push([first, last]);
   }
   if (merged[0]?.[0] === 1 && merged[0][1] >= total) return;
-  return { unit, total, ranges: merged.slice(0, MAX_PAGE_RANGES) };
+  return { total, ranges: merged.slice(0, MAX_PAGE_RANGES) };
 }
 
 /** Resolve request aliases to one revision per canonical path, within a shared entry budget. */
@@ -64,9 +63,9 @@ export class FileRevisions {
     const partial = partialRead(sameBytes, result);
     if (observation < latest) {
       // Late pages may extend coverage of identical bytes without changing a newer
-      // revision, view format, or alias binding.
+      // revision or alias binding.
       if (sameBytes && !partial) delete sameBytes.partial;
-      else if (partial && sameBytes?.partial?.unit === partial.unit && sameBytes.partial.total === partial.total) {
+      else if (partial && sameBytes?.partial?.total === partial.total) {
         sameBytes.partial = partial;
       }
       return;

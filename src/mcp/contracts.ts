@@ -95,9 +95,6 @@ export function createToolContracts(maxFileBytes: number) {
         file_path: filePath,
         offset: z.number().int().min(1).optional().describe("Starting text line, counted from 1; defaults to 1."),
         limit: z.number().int().min(1).optional().describe("Maximum text lines to return; defaults to 2000."),
-        pages: z.string().max(32).refine((value) => /^[1-9]\d*(?:-[1-9]\d*)?$/.test(value),
-          "Use a PDF page number or an inclusive range such as 2-5").optional()
-          .describe("PDF page or inclusive range, at most 20 pages. Required for PDFs over 10 pages."),
       }).refine(validOperationScope, scopeMessage),
     },
     ssh_write_file: {

@@ -69,7 +69,6 @@ const descriptions: Record<string, Record<string, string>> = {
     file_path: "远端文件路径；工作区模式相对项目根目录解析，连接模式相对远端 HOME 解析。",
     offset: "文本起始行号，省略时从第 1 行开始。",
     limit: "最多读取的文本行数，省略时为 2000 行。",
-    pages: "PDF 页码或闭区间，例如 2 或 2-5，每次最多 20 页。超过 10 页的 PDF 必填。",
   },
   "ssh_write_file.input": {
     ...operationScope,

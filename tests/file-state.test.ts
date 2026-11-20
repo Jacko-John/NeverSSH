@@ -48,18 +48,16 @@ test("overlapping and out-of-order pages cover only the observed revision", () =
   expect(files.get("id", "/file")).toEqual({ sha256: "new" });
 });
 
-test("partial coverage keeps rendered PDF pages, source lines, and different totals separate", () => {
+test("partial reads with different line totals cannot combine to authorize editing", () => {
   const files = new FileRevisions();
-  const part = (kind: string, startLine: number, endLine: number, totalLines: number) =>
-    files.remember("id", kind === "document" ? "/manual.pdf" : "/asset", {
-      path: "/asset", sha256: "same", kind, startLine, endLine, totalLines,
+  const part = (startLine: number, endLine: number, totalLines: number) =>
+    files.remember("id", "/asset", {
+      path: "/asset", sha256: "same", startLine, endLine, totalLines,
     });
-  part("text", 1, 10, 20);
-  part("document", 11, 20, 20);
+  part(1, 10, 20);
+  part(11, 30, 30);
   expect(files.get("id", "/asset")).toBeUndefined();
-  part("document", 1, 10, 30);
-  expect(files.get("id", "/asset")).toBeUndefined();
-  part("document", 11, 30, 30);
+  part(1, 10, 30);
   expect(files.get("id", "/asset")).toEqual({ sha256: "same" });
 });
 

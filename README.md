@@ -157,7 +157,7 @@ cp -R skills/neverssh ~/.claude/skills/
 
 普通工作区操作从根目录向目标收集适用的 `AGENTS.md`，保留来源、适用目录和完整正文。例如，首次向带有独立规则的子目录写文件时，`ssh_write_file` 会先返回 `WORKSPACE_RULES_CHANGED` 和规则，文件保持原样。阅读后可直接重试。编辑和上传采用同样的流程，已交付的规则发生变更或删除时也会暂停。读取、下载和 Bash 会随结果返回适用的规则变化。文件路径限制、读取后编辑和版本冲突检查仍然生效。
 
-客户端先收到操作结果，再收到有变化的工作区规则。文本或单张图片占一个内容块，笔记本和 PDF 可以返回多个内容块，规则增量始终附在最后。Bash 即使以非零状态退出，也可能附上规则提示，命令已经运行，不要因此重新执行。执行文件或传输操作时发生的错误不交付规则。
+客户端先收到操作结果，再收到有变化的工作区规则。读取单张图片会返回一个图片块，笔记本可以返回多个文本块和图片块，规则增量始终附在最后。Bash 即使以非零状态退出，也可能附上规则提示，命令已经运行，不要因此重新执行。执行文件或传输操作时发生的错误不交付规则。
 
 普通操作不重复返回未变化的规则、Skill 目录和 Git 状态。需要恢复根目录上下文、刷新 Git 状态或重新发现 skill 时，再次调用 `ssh_workspace_open`。相同连接、根目录和 skill 配置可以复用工作区 ID，但会重置已返回规则的记录并重建 skill 目录。打开时只返回根目录规则，子目录规则会随后随目标操作自动返回。Bash 的规则发现只覆盖 `cwd`；涉及其他目录时，可以在对应 `cwd` 操作或主动读取该目录的 `AGENTS.md`。连接模式不加载项目上下文。
 
@@ -179,7 +179,7 @@ skill 目录列出可调用名称和描述；使用时通过 `ssh_skill_read({wo
 
 ## 工具使用
 
-工具返回可读文本。`ssh_read_file` 还可以用原生 MCP `image` 内容块展示图片、笔记本图形输出和 PDF 页面。所有工具都不提供 `structuredContent` 或 `outputSchema`。请求仍是严格校验的 MCP 参数对象；远端命令打印的内容保持原样。
+工具返回可读文本。`ssh_read_file` 还可以用原生 MCP `image` 内容块展示图片和笔记本中保存的图形输出。所有工具都不提供 `structuredContent` 或 `outputSchema`。请求仍是严格校验的 MCP 参数对象；远端命令打印的内容保持原样。
 
 连接：
 
@@ -217,7 +217,7 @@ Connection: 7a2c9d4f
 
 编辑已有文件前，用 `ssh_read_file` 读完同一版本的全部内容，或在 `ssh_bash` 中用 `cat src/main.ts` 等命令查看单个文件。再次读取时，如果内容已在外部改变，工具会提示。精确编辑默认要求原文唯一，`replace_all=true` 可替换所有匹配。成功后会显示第一处替换附近的行号和正文。
 
-超过 256 KiB 的文本需要指定 `offset` 和较小的 `limit` 分页读取。读取 Jupyter `.ipynb` 会按顺序展示单元格和保存的输出。读取 PDF 需要远端安装 Poppler，10 页以内可一次读取，更长的 PDF 用 `pages` 指定页码，例如 `"2-5"`，每次最多 20 页。
+超过 256 KiB 的文本需要指定 `offset` 和较小的 `limit` 分页读取。读取 Jupyter `.ipynb` 会按顺序展示单元格和保存的输出。直接读取 PDF 会返回格式不支持的错误。远端已安装 `pdftotext` 时，可通过 `ssh_bash` 运行 `pdftotext report.pdf -` 提取正文。
 
 查看远端图片也直接调用 `ssh_read_file`，无需先下载到本地。工具按文件内容识别 PNG、JPEG、GIF 和 WebP，并完整返回图片，不写成本地文件，不依赖 SFTP；客户端需要支持 MCP 图片显示。`offset` / `limit` 只用于文本，图片不分页，仍受 `maxFileBytes` 限制（默认 4 MiB，最高 8 MiB）。SVG 按文本读取。遇到 XLSX、Parquet 或 ZIP 等二进制文件，使用对应格式的 skill 或在 `ssh_bash` 中调用专用工具。
 
@@ -282,8 +282,8 @@ JavaScript/TypeScript 使用 Bun。本地 Python 检查和测试解释器由 uv 
 推送 `v*` 标签会触发 GitHub Actions：
 
 ```sh
-git tag -a v0.5.0 -m "NeverSSH 0.5.0"
-git push origin v0.5.0
+git tag -a v0.6.0 -m "NeverSSH 0.6.0"
+git push origin v0.6.0
 ```
 
 工作流运行检查、测试和构建，并上传 `neverssh.js`、`neverssh` launcher 和 `neverssh.config.example.json` 到对应 Release。launcher 在后台解析 `releases/latest`，新标签在用户下一次启动时生效，无需修改 MCP 配置。

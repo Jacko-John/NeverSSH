@@ -159,12 +159,12 @@ export function createServer(runtime: Runtime): McpServer {
   registerTool("ssh_task_list", "List tasks whose output has not been read by ssh_task_output. Optional connection_id filter.",
     contracts.ssh_task_list.input, true, (args) => textResult(taskListText(runtime.tasks.list(args.connection_id))));
 
-  registerTool("ssh_read_file", "Read numbered text, images, Jupyter cells and outputs, or rendered PDF pages. Page large text with offset/limit and PDFs over 10 pages with pages (up to 20 at a time).",
+  registerTool("ssh_read_file", "Read numbered text, images, or Jupyter notebook cells and saved outputs. Use offset and limit to read large text files in sections.",
     contracts.ssh_read_file.input, true, async (args, context) => {
       const prepared = await prepareOperation(args, args.file_path, context);
       const observation = runtime.files.nextObservation();
       const value = await runtime.ssh.run(prepared.connectionId, "read", {
-        path: prepared.path, requestedPath: args.file_path, startLine: args.offset, lineCount: args.limit, pages: args.pages,
+        path: prepared.path, requestedPath: args.file_path, startLine: args.offset, lineCount: args.limit,
       }, undefined, context.mcpReq.signal);
       let response: CallToolResult;
       if (value.kind === "document") {

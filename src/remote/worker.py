@@ -92,7 +92,7 @@ class FileRequest:
             self.done = True
 
     def stop(self):
-        """Abandon file results and cancel subprocesses owned by reads or workspace inspection."""
+        """Abandon file results; workspace inspection additionally cancels its owned Git subprocess."""
         self.cancelled = True
         if self.cancel_event is not None:
             if self.stopping_at is None:
@@ -213,14 +213,13 @@ class Worker:
             "connectionId": self.connection_id,
             **self.archive_limits,
         }
-        if operation in ("write", "edit", "stat", "hash", "mkdir", "probe", "commit_upload"):
+        if operation in ("read", "write", "edit", "stat", "hash", "mkdir", "probe", "commit_upload"):
             self.requests[request_id] = FileRequest(file_ops_module.dispatch, request_payload)
             return
-        if operation in ("read", "workspace_open", "workspace_context", "workspace_skill_read"):
+        if operation in ("workspace_open", "workspace_context", "workspace_skill_read"):
             cancel_event = threading.Event()
             request_payload["_cancel_event"] = cancel_event
-            dispatch = file_ops_module.dispatch if operation == "read" else workspace_module.dispatch
-            self.requests[request_id] = FileRequest(dispatch, request_payload, cancel_event)
+            self.requests[request_id] = FileRequest(workspace_module.dispatch, request_payload, cancel_event)
             return
         if operation != "bash":
             self.reject_request(request_id, "Unsupported operation")

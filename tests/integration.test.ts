@@ -140,7 +140,7 @@ describe("MCP and connections", () => {
     }
     expect(listing.tools.find((tool) => tool.name === "ssh_read_file")?.annotations?.readOnlyHint).toBe(true);
     const properties = (name: string) => Object.keys(listing.tools.find((tool) => tool.name === name)?.inputSchema.properties ?? {});
-    expect(properties("ssh_read_file")).toEqual(["connection_id", "workspace_id", "file_path", "offset", "limit", "pages"]);
+    expect(properties("ssh_read_file")).toEqual(["connection_id", "workspace_id", "file_path", "offset", "limit"]);
     expect(properties("ssh_write_file")).toEqual(["connection_id", "workspace_id", "file_path", "content"]);
     expect(properties("ssh_edit_file")).toEqual(["connection_id", "workspace_id", "file_path", "old_string", "new_string", "replace_all"]);
     expect(properties("ssh_task_list")).toEqual(["connection_id"]);
@@ -480,13 +480,23 @@ describe("remote files", () => {
     }
     const page = await call("ssh_read_file", { connection_id, file_path, limit: 2 });
     expect(page).toContain("PARTIAL view: showing lines 1-2 of 3000.");
-    for (const ext of ["xlsx", "PARQUET", "heic", "zip"]) {
+    for (const ext of ["xlsx", "PARQUET", "heic", "zip", "PDF"]) {
       const binary = "binary-data." + ext;
       await writeFile(join(fixture.workspace, binary), "pk");
       expect(await call("ssh_read_file", { connection_id, file_path: binary }, true)).toContain("ssh_bash");
     }
     await symlink(file_path, join(fixture.workspace, "snapshot.xlsx"));
     expect(await call("ssh_read_file", { connection_id, file_path: "snapshot.xlsx" }, true)).toContain("Binary file (.xlsx)");
+  });
+
+  test("refuses PDF content and the removed page selector without granting a file revision", async () => {
+    const file_path = "unlabelled-document";
+    const args = { connection_id: dev, file_path };
+    await writeFile(join(fixture.workspace, file_path), "%PDF-1.4\n1 0 obj\n");
+    expect(await call("ssh_read_file", { ...args, pages: "1" }, true)).toContain("pages");
+    expect(await call("ssh_read_file", args, true)).toContain("Binary file (.pdf)");
+    expect(await call("ssh_edit_file", { ...args, old_string: "obj", new_string: "changed" }, true))
+      .toContain("FILE_NOT_READ");
   });
 
   test("renders notebook sources, streams and visualizations in cell order", async () => {

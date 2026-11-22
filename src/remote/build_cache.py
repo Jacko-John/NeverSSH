@@ -121,6 +121,8 @@ def install(build_dir, expected, sources, builds):
         manifest = dict(expected)
         manifest["created_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         write_file(manifest_path(temporary), json.dumps(manifest, sort_keys=True).encode("utf-8"))
+        if not verify(temporary, expected):
+            raise RuntimeError("Remote build verification failed")
         try:
             os.rename(temporary, build_dir)
         except OSError:
@@ -192,8 +194,8 @@ def cleanup_locked(builds, current_id):
         shutil.rmtree(os.path.join(builds, name))
 
 
-def ensure_build(payload):
-    """Return the verified build directory and hold a shared lease for this process."""
+def ensure_build(payload, sources=None):
+    """Lease a verified build, or return None when installation needs the bundle."""
     home = os.path.expanduser("~")
     base = os.path.join(home, ".neverssh")
     builds = os.path.join(base, "builds")
@@ -211,16 +213,13 @@ def ensure_build(payload):
     try:
         fcntl.flock(guard, fcntl.LOCK_EX)
         if not verify(build_dir, expected):
-            sources = payload.get("sources")
-            if not isinstance(sources, dict):
-                raise RuntimeError("Remote build is missing and no sources were provided")
+            if os.path.isdir(build_dir) and not unused_build(build_dir):
+                raise RuntimeError("Remote build is corrupt and currently in use")
+            if sources is None:
+                return None
             if os.path.isdir(build_dir):
-                if not unused_build(build_dir):
-                    raise RuntimeError("Remote build is corrupt and currently in use")
                 shutil.rmtree(build_dir)
             install(build_dir, expected, sources, builds)
-            if not verify(build_dir, expected):
-                raise RuntimeError("Remote build verification failed")
         lease = private_file(os.path.join(build_dir, ".lock"), os.O_RDWR | os.O_CREAT)
         fcntl.flock(lease, fcntl.LOCK_SH)
         cleanup_locked(builds, build_id)
@@ -230,12 +229,29 @@ def ensure_build(payload):
         os.close(guard)
 
 
+def acquire_build(payload):
+    """Request missing sources outside the cache guard, then recheck under the guard."""
+    bootstrap = payload.pop("bootstrap")
+    build = ensure_build(payload)
+    if build is not None:
+        return build
+
+    print('{"type":"need_sources"}', flush=True)
+    sources = json.loads(sys.stdin.buffer.readline())
+    if not isinstance(sources, dict):
+        raise ValueError("Invalid remote build sources")
+    sources["build_cache.py"] = bootstrap
+    if sources.keys() != payload["manifest"]["sources"].keys():
+        raise ValueError("Remote build sources do not match manifest")
+    return ensure_build(payload, sources)
+
+
 def main(payload):
     """Check the interpreter, install/verify the build, then execute the worker."""
     if sys.version_info < (3, 8):
         fail(2, "NeverSSH requires Python 3.8 or newer; found " + sys.version.split()[0])
     try:
-        build_dir, lease = ensure_build(payload)
+        build_dir, lease = acquire_build(payload)
         payload["buildDir"] = build_dir
         payload["fileOpsSource"] = read_text(os.path.join(build_dir, "file_ops.py"))
         payload["readFormatsSource"] = read_text(os.path.join(build_dir, "read_formats.py"))

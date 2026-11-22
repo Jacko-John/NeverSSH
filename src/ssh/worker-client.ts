@@ -4,15 +4,19 @@ import { RemoteChannel, type RemoteResult } from "./request-channel";
 import type { Config } from "../config";
 import { bounded, checkAbort, ToolError } from "../errors";
 import { JsonLines } from "./json-lines";
+import { WaitQueue, type WaitBudget } from "./wait-queue";
 import { ARCHIVE_FORMAT, BUILD_ID, BUILD_MANIFEST, BUILD_SOURCES, PROTOCOL_VERSION, SERVER_VERSION } from "../remote/bundle";
 
-export const WORKER_BOOTSTRAP = 'import json,sys; payload=json.loads(sys.stdin.buffer.readline()); exec(compile(payload["sources"]["build_cache.py"],"<neverssh-build-cache>","exec"))';
+const { "build_cache.py": cacheLoader, ...workerSources } = BUILD_SOURCES;
+export const WORKER_BOOTSTRAP = 'import json,sys; payload=json.loads(sys.stdin.buffer.readline()); exec(compile(payload["bootstrap"],"<neverssh-build-cache>","exec"))';
 export type CleanupStatus = "confirmed" | "unconfirmed";
 
 type WorkerMessage =
+  | { type: "need_sources" }
   | { type: "hello"; protocol: number; version: string; build_id: string; archive_format: number; python_version: string; home: string }
   | { type: "startup_error"; code: string; message: string }
   | { type: "bye"; cleanup_confirmed: boolean }
+  | { type: "stdout_text"; id: string; text: string }
   | { type: "stdout" | "stderr"; id: string; base64: string }
   | { type: "close"; id: string; code: number };
 
@@ -30,7 +34,7 @@ function deferred<T>() {
 /** Bound active requests and queue admission independently from SSH transport channels. */
 class RequestSlots {
   private active = 0;
-  private waiters: Array<() => void> = [];
+  constructor(private readonly waiters: WaitQueue) {}
 
   /** Transfer a released slot directly to the next waiter; release is idempotent. */
   async acquire(signal: AbortSignal): Promise<() => void> {
@@ -38,60 +42,27 @@ class RequestSlots {
     if (this.active < 8) {
       this.active++;
     } else {
-      if (this.waiters.length >= 64) {
-        throw new ToolError("CONNECTION_BUSY", "Too many queued operations");
-      }
-      await this.waitForSlot(signal);
+      await this.waiters.wait(signal);
     }
 
     let released = false;
     return () => {
       if (released) return;
       released = true;
-      const next = this.waiters.shift();
-      if (next) next();
-      else this.active--;
+      if (!this.waiters.wakeOne()) this.active--;
     };
-  }
-
-  /** Cancel only this waiter, preserving the order of other queued requests. */
-  private waitForSlot(signal: AbortSignal): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const cleanup = () => {
-        clearTimeout(timer);
-        signal.removeEventListener("abort", abort);
-      };
-      const wake = () => {
-        cleanup();
-        resolve();
-      };
-      const remove = (error: Error) => {
-        this.waiters = this.waiters.filter((waiter) => waiter !== wake);
-        cleanup();
-        reject(error);
-      };
-      const abort = () => remove(signal.reason instanceof ToolError
-        ? signal.reason
-        : new ToolError("OPERATION_CANCELLED", "Operation cancelled while queued"));
-      const timer = setTimeout(() => {
-        remove(new ToolError("CONNECTION_BUSY", "Timed out waiting for an operation slot"));
-      }, 30000);
-
-      this.waiters.push(wake);
-      signal.addEventListener("abort", abort, { once: true });
-    });
   }
 }
 
 export class WorkerClient {
   home = "~";
-  private initialized = false;
+  private startup: "verifying" | "installing" | "ready" = "verifying";
   private accepting = true;
   private cleanup: CleanupStatus = "unconfirmed";
   private diagnostics = "";
   private sequence = 0;
   private requests = new Map<string, RemoteChannel>();
-  private slots = new RequestSlots();
+  private readonly slots: RequestSlots;
   private lifetime = new AbortController();
   private hello = deferred<void>();
   private goodbye = deferred<void>();
@@ -101,19 +72,21 @@ export class WorkerClient {
     private readonly child: ChildProcessWithoutNullStreams,
     private readonly connectionId: string,
     private readonly onDisconnect: (diagnostic: string) => void,
+    budget: WaitBudget,
   ) {
+    this.slots = new RequestSlots(new WaitQueue(budget));
     this.attach();
   }
 
-  /** Load bundled sources once and wait until the worker confirms its protocol and home directory. */
+  /** Supply the cache verifier first. A warm remote can start without another exchange. */
   async initialize(config: Pick<Config, "maxFileBytes" | "maxTaskOutputBytes" | "maxArchiveBytes">, signal: AbortSignal): Promise<void> {
     const { maxFileBytes, maxTaskOutputBytes, maxArchiveBytes } = config;
-    this.child.stdin.write(JSON.stringify({
-      buildId: BUILD_ID, manifest: BUILD_MANIFEST, sources: BUILD_SOURCES,
+    this.send({
+      buildId: BUILD_ID, manifest: BUILD_MANIFEST, bootstrap: cacheLoader,
       serverVersion: SERVER_VERSION, protocol: PROTOCOL_VERSION, archiveFormat: ARCHIVE_FORMAT,
       connectionId: this.connectionId,
       maxFileBytes, maxTaskOutputBytes, maxArchiveBytes,
-    }) + "\n");
+    });
     await bounded(this.hello.promise, 30000, "CONNECT_TIMEOUT", "Remote worker handshake timed out", signal);
   }
 
@@ -139,7 +112,7 @@ export class WorkerClient {
     });
     this.child.once("close", (code) => {
       this.exited.resolve();
-      if (!this.initialized) this.hello.reject(this.startupFailure(code));
+      if (this.startup !== "ready") this.hello.reject(this.startupFailure(code));
       this.onDisconnect("Remote worker disconnected");
     });
   }
@@ -147,8 +120,13 @@ export class WorkerClient {
   /** Keep handshake, control, and per-request messages visibly separate. */
   private receive(message: WorkerMessage): void {
     switch (message.type) {
+      case "need_sources":
+        if (this.startup !== "verifying") throw new Error("Unexpected build source request");
+        this.startup = "installing";
+        this.send(workerSources);
+        return;
       case "hello":
-        if (this.initialized) throw new Error("Unexpected worker protocol record");
+        if (this.startup === "ready") throw new Error("Unexpected worker protocol record");
         if (message.protocol !== PROTOCOL_VERSION) {
           throw new ToolError("PROTOCOL_INCOMPATIBLE", "Remote worker protocol is incompatible");
         }
@@ -157,7 +135,7 @@ export class WorkerClient {
         }
         if (typeof message.home !== "string") throw new Error("Invalid worker hello");
         this.home = message.home;
-        this.initialized = true;
+        this.startup = "ready";
         this.hello.resolve();
         return;
       case "startup_error":
@@ -166,6 +144,10 @@ export class WorkerClient {
       case "bye":
         if (message.cleanup_confirmed === true) this.cleanup = "confirmed";
         this.goodbye.resolve();
+        return;
+      case "stdout_text":
+        if (typeof message.text !== "string") throw new Error("Invalid worker stream record");
+        this.requests.get(message.id)?.stdout.write(message.text);
         return;
       case "stdout":
       case "stderr":

@@ -10,12 +10,14 @@ import stat
 import sys
 import tempfile
 import threading
+from contextlib import contextmanager
 
 import read_formats
 
 
 # Fixed lock striping bounds memory while aliases of one canonical path share admission.
 PATH_LOCKS = tuple(threading.Lock() for _ in range(64))
+FILE_BLOCK_BYTES = 128 * 1024
 # Match str.splitlines(), including CRLF as a single line boundary.
 LINE_BREAKS = "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
 LINE_BOUNDARY = re.compile("\r\n|[" + LINE_BREAKS + "]")
@@ -31,27 +33,60 @@ def path_for(value, cwd):
     return os.path.abspath(os.path.join(cwd, os.path.expanduser(value)))
 
 
-def load_bytes(filename, limit, follow_symlinks=True):
-    """Read one bounded regular file; refuse devices, FIFOs, and files that grow past the limit."""
-    flags = os.O_RDONLY | os.O_NONBLOCK
-    if not follow_symlinks:
-        flags |= os.O_NOFOLLOW
+@contextmanager
+def open_regular_file(filename, limit, follow_symlinks=True):
+    """Check type and size on the opened descriptor before reading it."""
+    def opener(path, flags):
+        return os.open(path, flags | os.O_NONBLOCK | (0 if follow_symlinks else os.O_NOFOLLOW))
+
     try:
-        descriptor = os.open(filename, flags)
+        # open owns the descriptor even if creating the stream fails (e.g. for a directory).
+        stream = open(filename, "rb", buffering=8192, opener=opener)
     except OSError as error:
         if not follow_symlinks and error.errno == errno.ELOOP:
             raise ValueError("Expected a regular file, not a symlink") from None
         raise
-    with os.fdopen(descriptor, "rb") as handle:
+    with stream as handle:
         info = os.fstat(handle.fileno())
         if not stat.S_ISREG(info.st_mode):
             raise ValueError("Expected a regular file")
         if info.st_size > limit:
             raise ValueError("File exceeds maxFileBytes; inspect or convert it on the remote host with ssh_bash")
-        data = handle.read(limit + 1)
-        if len(data) > limit:
+        yield handle, info
+
+
+def bounded_chunks(handle, limit, first_read):
+    """Read at most one byte past the limit, even if the file grows or reports a size of zero."""
+    remaining = limit
+    size = first_read
+    while True:
+        requested = min(size, remaining + 1)
+        chunk = handle.read(requested)
+        if len(chunk) > remaining:
             raise ValueError("File grew beyond maxFileBytes")
-    return data, info
+        if chunk:
+            yield chunk
+        if len(chunk) < requested:
+            return
+        remaining -= len(chunk)
+        size = FILE_BLOCK_BYTES
+
+
+def load_bytes(filename, limit):
+    """Materialize the file only when its contents are needed; size the read to the file."""
+    with open_regular_file(filename, limit) as (handle, info):
+        return b"".join(bounded_chunks(handle, limit, info.st_size + 1)), info
+
+
+def file_digest(filename, limit, follow_symlinks=True):
+    """Return the observed byte count and revision without retaining the payload."""
+    with open_regular_file(filename, limit, follow_symlinks) as (handle, info):
+        sha = hashlib.sha256()
+        size = 0
+        for chunk in bounded_chunks(handle, limit, min(info.st_size + 1, FILE_BLOCK_BYTES)):
+            size += len(chunk)
+            sha.update(chunk)
+        return size, sha.hexdigest()
 
 
 def digest(data):
@@ -127,8 +162,8 @@ def atomic_write(filename, data, original, expected, limit):
 
         # Fail before replacing the destination if another writer changed its content.
         if expected is not None:
-            current, _ = load_bytes(filename, limit)
-            if digest(current) != expected:
+            _, current = file_digest(filename, limit)
+            if current != expected:
                 raise ValueError("Content conflict: file changed; read it again before editing")
             os.replace(temporary, filename)
         else:
@@ -305,8 +340,7 @@ def commit_upload(request):
     try:
         with mutation_lock(filename):
             # Verify before changing the destination; a failed transfer never becomes visible.
-            data, _ = load_bytes(temporary, request["maxFileBytes"], follow_symlinks=False)
-            revision = digest(data)
+            size, revision = file_digest(temporary, request["maxFileBytes"], follow_symlinks=False)
             if revision != args["sha256"]:
                 raise ValueError("Upload size or SHA-256 verification failed")
             expected = args.get("expectedSha256")
@@ -318,10 +352,10 @@ def commit_upload(request):
                 raise ValueError("Upload destination must be a regular file")
             if expected is not None:
                 try:
-                    current, _ = load_bytes(filename, request["maxFileBytes"])
+                    _, current = file_digest(filename, request["maxFileBytes"])
                 except FileNotFoundError:
                     raise ValueError("Content conflict: expected file does not exist") from None
-                if digest(current) != expected:
+                if current != expected:
                     raise ValueError("Content conflict: SHA-256 does not match")
 
             # No-overwrite must remain atomic even when an unrelated process creates the file.
@@ -331,41 +365,32 @@ def commit_upload(request):
             else:
                 os.replace(temporary, filename)
             fsync_directory(os.path.dirname(filename))
-            return {"path": filename, "bytesWritten": len(data), "sha256": revision}
+            return {"path": filename, "bytesWritten": size, "sha256": revision}
     finally:
         if os.path.lexists(temporary):
             os.unlink(temporary)
 
 
-def stat_file(request):
-    """Pin one canonical regular-file target for transfer checks, including missing files."""
-    args = request.get("args", {})
-    filename = path_for(args["path"], request["cwd"])
-    canonical = os.path.realpath(filename)
-    try:
-        info = os.stat(canonical)
-    except FileNotFoundError:
-        return {"path": filename, "exists": False, "realpath": canonical}
-    if not stat.S_ISREG(info.st_mode):
-        raise ValueError("Expected a regular file")
-    return {"path": filename, "exists": True, "size": info.st_size,
-            "realpath": canonical}
-
-
-def hash_file(request):
-    """Hash an existing remote file without transferring its contents."""
+def transfer_target(request):
+    """Pin the SFTP path and perform the required preflight in one worker request."""
     args = request.get("args", {})
     filename = os.path.realpath(path_for(args["path"], request["cwd"]))
-    data, _ = load_bytes(filename, request["maxFileBytes"])
-    return {"path": filename, "size": len(data), "sha256": digest(data)}
-
-
-def make_directory(request):
-    """Create missing remote parents for an SFTP upload."""
-    args = request.get("args", {})
-    filename = path_for(args["path"], request["cwd"])
-    os.makedirs(filename, exist_ok=True)
-    return {"path": filename}
+    upload = request["op"] == "prepare_upload"
+    check_revision = upload and args.get("checkRevision", False)
+    try:
+        info = os.stat(filename)
+    except FileNotFoundError:
+        if upload and not check_revision:
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+        return {"path": filename, "exists": False}
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("Expected a regular file")
+    result = {"path": filename, "exists": True}
+    if check_revision:
+        _, result["sha256"] = file_digest(filename, request["maxFileBytes"])
+    elif not upload:
+        result["size"] = info.st_size
+    return result
 
 
 def home_filesystem(home):
@@ -409,12 +434,8 @@ def dispatch(request):
         return edit_file(request)
     if operation == "commit_upload":
         return commit_upload(request)
-    if operation == "stat":
-        return stat_file(request)
-    if operation == "hash":
-        return hash_file(request)
-    if operation == "mkdir":
-        return make_directory(request)
+    if operation in ("stat", "prepare_upload"):
+        return transfer_target(request)
     if operation == "probe":
         return probe(request)
     raise ValueError("Unsupported file operation: " + operation)

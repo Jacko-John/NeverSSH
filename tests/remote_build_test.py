@@ -1,6 +1,7 @@
 """Exercise the remote build cache with real files, locks, and cleanup."""
 import fcntl
 import hashlib
+import io
 import json
 import multiprocessing
 import os
@@ -37,7 +38,7 @@ def make_payload(build_id, sources=SOURCES):
         "server_version": "0.2.0",
         "sources": hashes,
     }
-    return {"buildId": build_id, "manifest": manifest, "sources": sources}
+    return {"buildId": build_id, "manifest": manifest}
 
 
 def build_id(value):
@@ -61,7 +62,7 @@ def competing_bootstrap(identifier, channel):
 
     try:
         with patch.object(fcntl, "flock", probe_guard):
-            directory, lease = build_cache.ensure_build(make_payload(identifier))
+            directory, lease = build_cache.ensure_build(make_payload(identifier), SOURCES)
         try:
             channel.send(os.path.samestat(os.fstat(lease), os.stat(os.path.join(directory, ".lock"))))
         finally:
@@ -86,7 +87,7 @@ class BuildCacheTests(unittest.TestCase):
 
     def ensure(self, identifier, sources=SOURCES):
         """Install or reuse a build and release its shared lease after the call."""
-        directory, lease = build_cache.ensure_build(make_payload(identifier, sources))
+        directory, lease = build_cache.ensure_build(make_payload(identifier, sources), sources)
         os.close(lease)
         return Path(directory)
 
@@ -109,9 +110,41 @@ class BuildCacheTests(unittest.TestCase):
         self.ensure(identifier)
         self.assertTrue(build_cache.verify(str(directory), make_payload(identifier)["manifest"]))
 
+    def test_invalid_sources_leave_no_installed_build(self):
+        identifier = build_id("invalid-source")
+        with self.assertRaisesRegex(RuntimeError, "verification failed"):
+            build_cache.ensure_build(make_payload(identifier), {**SOURCES, "worker.py": "wrong"})
+        self.assertFalse((self.builds / identifier).exists())
+        self.assertEqual(list(self.builds.glob(".tmp-*")), [])
+
+    def test_cache_miss_releases_guard_until_sources_arrive_and_rechecks_competing_install(self):
+        identifier = build_id("sources-on-demand")
+        remaining = {name: value for name, value in SOURCES.items() if name != "build_cache.py"}
+
+        def deliver_sources():
+            with (self.builds / ".lock").open("r+b") as guard:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.ensure(identifier)
+            return json.dumps(remaining).encode()
+
+        def acquire():
+            payload = dict(make_payload(identifier), bootstrap=SOURCES["build_cache.py"])
+            directory, lease = build_cache.acquire_build(payload)
+            os.close(lease)
+            return directory
+
+        with patch.object(sys, "stdin") as input_stream, patch.object(sys, "stdout", new_callable=io.StringIO) as output, \
+                patch.object(build_cache, "install", wraps=build_cache.install) as install:
+            input_stream.buffer.readline.side_effect = deliver_sources
+            directory = acquire()
+            self.assertEqual(acquire(), directory)
+            self.assertEqual(output.getvalue().splitlines(), ['{"type":"need_sources"}'])
+            input_stream.buffer.readline.assert_called_once()
+            install.assert_called_once()
+
     def test_repair_keeps_competing_bootstrap_off_the_retired_lock(self):
         identifier = build_id("competing-repair")
-        directory, lease = build_cache.ensure_build(make_payload(identifier))
+        directory, lease = build_cache.ensure_build(make_payload(identifier), SOURCES)
         lock_path = Path(directory) / ".lock"
         try:
             (Path(directory) / "worker.py").write_text("damaged")

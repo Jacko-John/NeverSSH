@@ -7,7 +7,7 @@ import stat
 import subprocess
 import time
 
-from file_ops import digest, load_bytes, path_for, text_from
+from file_ops import digest, load_bytes, path_for, read_file, text_from
 
 
 RULE_BYTES = 65536
@@ -52,41 +52,40 @@ def scoped_path(value, root):
     return lexical, resolved
 
 
-def directory_chain(path, root):
-    """Return root-to-target ancestors; an absent target is interpreted as a new file."""
+def directory_chain(path, root, known):
+    """Yield missing ancestors in root-to-target order; treat an absent target as a file."""
     directory = path if os.path.isdir(path) else os.path.dirname(path)
     chain = []
-    while inside(directory, root):
+    while directory not in known and inside(directory, root):
         chain.append(directory)
         if directory == root:
             break
         directory = os.path.dirname(directory)
-    return list(reversed(chain))
+    return reversed(chain)
 
 
 def context_directories(paths, root):
     """Include both alias and real ancestors so symlinks cannot hide applicable rules."""
-    targets = []
-    directories = []
-    seen = set()
+    targets = {}
+    directories = {}
     for value in paths:
-        lexical, resolved = scoped_path(value, root)
-        for target in (lexical, resolved):
-            if target not in targets:
-                targets.append(target)
-            for directory in directory_chain(target, root):
-                ancestors = directory_chain(os.path.realpath(directory), root) + [directory]
-                for ancestor in ancestors:
-                    if ancestor in seen:
-                        continue
-                    if len(directories) == DIRECTORY_COUNT:
-                        raise ValueError("Workspace context exceeds its directory budget; request fewer paths")
-                    directories.append(ancestor)
-                    seen.add(ancestor)
-    return targets, directories
+        for target in scoped_path(value, root):
+            if target in targets:
+                continue
+            targets[target] = None
+            for directory in directory_chain(target, root, directories):
+                canonical = os.path.realpath(directory)
+                if canonical != directory:
+                    # Only an alias can introduce ancestors outside the lexical chain.
+                    for ancestor in directory_chain(canonical, root, directories):
+                        directories[ancestor] = None
+                directories[directory] = None
+                if len(directories) > DIRECTORY_COUNT:
+                    raise ValueError("Workspace context exceeds its directory budget; request fewer paths")
+    return list(targets), directories
 
 
-def instructions_for(directories, root, limit):
+def instructions_for(directories, root, limit, known_rules):
     """Read complete rules in ancestor order; unreadable or oversized guidance fails closed."""
     instructions = []
     scopes = list(dict.fromkeys(os.path.realpath(directory) for directory in directories))
@@ -100,14 +99,19 @@ def instructions_for(directories, root, limit):
             raise ValueError("AGENTS.md resolves outside the workspace: " + candidate)
         try:
             data, _ = load_bytes(filename, min(limit, RULE_BYTES))
-            content = text_from(data)
+            content = text_from(data).replace("\r\n", "\n")
         except (OSError, ValueError, UnicodeError) as error:
             raise ValueError("Cannot load project instructions %s: %s" % (candidate, error)) from error
         total += len(data)
         if total > CONTEXT_BYTES:
             raise ValueError("Project instructions exceed the 128 KiB context budget; request fewer paths")
-        instructions.append({"path": candidate, "scope": scope,
-                             "sha256": digest(data), "content": content})
+        if not content.strip():
+            continue
+        sha256 = digest(content.encode("utf-8"))
+        rule = {"path": candidate, "scope": scope, "sha256": sha256}
+        if sha256 not in known_rules:
+            rule["content"] = content
+        instructions.append(rule)
     # context_directories includes every ancestor. Send only the leaves of these
     # chains so a deep path does not repeat its entire prefix at every level.
     parents = {os.path.dirname(scope) for scope in scopes if scope != root}
@@ -348,7 +352,9 @@ def workspace_context(request, opening=False):
         raise ValueError("Workspace root changed; reopen the workspace before continuing")
     paths, directories = context_directories([root] if opening else args.get("paths", ["."]), root)
     warnings = []
-    instructions, used, leaves = instructions_for(directories, root, request["maxFileBytes"])
+    # Hints refer only to the body. Every request still checks, budgets and identifies each source.
+    known_rules = args.get("knownRules", ())[:4] if not opening else ()
+    instructions, used, leaves = instructions_for(directories, root, request["maxFileBytes"], known_rules)
     result = {"root": root, "paths": paths, "instructions": instructions, "rule_scope_leaves": leaves,
               "skill_files": [], "project_files": [], "git": None, "warnings": warnings}
     if opening:
@@ -409,8 +415,18 @@ def dispatch(request):
     operation = request["op"]
     if operation == "workspace_open":
         result = workspace_context(request, opening=True)
-    elif operation == "workspace_context":
+    elif operation in ("workspace_context", "workspace_read"):
         result = workspace_context(request)
+        args = request["args"]
+        if operation == "workspace_read":
+            # The ancestor leaves represent all inspected directories, including those with
+            # no rule. Bind each current digest to its scope so moved or removed rules miss.
+            identity = [result["rule_scope_leaves"], [(r["scope"], r["sha256"]) for r in result["instructions"]]]
+            result["read_condition"] = digest(json.dumps(identity, ensure_ascii=True).encode("ascii"))
+            if args.get("condition") == result["read_condition"]:
+                check_cancel(request.get("_cancel_event"))
+                target = result["paths"][-1]
+                return read_file({**request, "args": {**args["read"], "path": target}})
     elif operation == "workspace_skill_read":
         result = read_skill(request)
     else:

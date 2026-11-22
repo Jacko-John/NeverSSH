@@ -31,8 +31,24 @@ test("SSH compression is opt-out and applies to worker and SFTP transports", () 
   const target = { host: "dev" };
   expect(sshOptions(enabled, target, "/tmp/socket", true)).toContain("Compression=yes");
   expect(sshOptions(disabled, target, "/tmp/socket", true)).not.toContain("Compression=yes");
-  expect(sftpOptions(enabled, target, "/tmp/socket")).toContain("Compression=yes");
-  expect(sftpOptions(disabled, target, "/tmp/socket")).not.toContain("Compression=yes");
+  const supported = new Set<string>();
+  expect(sftpOptions(enabled, target, "/tmp/socket", supported)).toContain("Compression=yes");
+  expect(sftpOptions(disabled, target, "/tmp/socket", supported)).not.toContain("Compression=yes");
+});
+
+test("SSH lookup and clients without configurable session defaults use portable flags", () => {
+  const config = configSchema.parse({});
+  const target = { host: "dev" };
+  const supported = new Set(["controlmaster", "remotecommand"]);
+  const lookup = sshOptions(config, target, "none", true);
+  const master = sshOptions(config, target, "/tmp/socket", true, supported);
+  const worker = sshOptions(config, target, "/tmp/socket", false, supported);
+  expect(master).toContain("-N");
+  expect(worker).not.toContain("-N");
+  const sftp = sftpOptions(config, target, "/tmp/socket", supported);
+  for (const args of [lookup, master, worker, sftp]) {
+    expect(args.some(arg => /^(SessionType|ForkAfterAuthentication|StdinNull|IgnoreUnknown)=/i.test(arg))).toBe(false);
+  }
 });
 
 test("local paths are resolved relative to the config file and canonicalized", async () => {

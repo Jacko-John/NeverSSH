@@ -1,12 +1,13 @@
 /** Mediates the only tools allowed to read or write local user files. */
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { link, lstat, mkdir, mkdtemp, open, realpath, rename, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
+import { link, lstat, mkdir, open, realpath, rename, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import type { Config } from "../config";
 import { type RemoteResult, SshTransport } from "../ssh/transport";
 import { checkAbort } from "../errors";
+import { hashPayload, withStagingFile } from "./staging";
 
 /** Keep one wording for every transfer-root rejection. */
 function outsideTransferRoot(): Error {
@@ -59,7 +60,7 @@ export async function transferPath(config: Config, filename: string, writing: bo
 }
 
 /** Expand tilde against HOME, while ordinary relative paths resolve against the requested base. */
-export function remotePath(value: string, base: string, home = base): string {
+function resolveFrom(value: string, base: string, home: string): string {
   const expanded = value === "~" ? home : value.startsWith("~/") ? posix.join(home, value.slice(2)) : value;
   return expanded.startsWith("/") ? posix.normalize(expanded) : posix.normalize(posix.join(base, expanded));
 }
@@ -70,85 +71,57 @@ function sftpQuote(value: string): string {
   return value.replace(/([\\\s"'*?[\]!#])/g, "\\$1");
 }
 
-/** Resolve the remote base directory for a transfer request. */
-function remoteBase(ssh: SshTransport, connectionId: string, cwd?: string): string {
-  const home = ssh.cwd(connectionId);
-  return cwd ? remotePath(cwd, home) : home;
+/** File revisions and transfers must resolve the same request to the same path. */
+export function remotePath(path: string, home: string, cwd?: string): string {
+  return resolveFrom(path, cwd ? resolveFrom(cwd, home, home) : home, home);
 }
 
-type RemoteStat = { path: string; exists: boolean; size?: number; realpath?: string };
-type RemoteHash = { path: string; size: number; sha256: string };
+type TransferTarget = { path: string; exists: boolean; size?: number; sha256?: string };
 
-/** Read an opened regular file into bounded, immutable transfer bytes. */
-async function readSnapshot(handle: FileHandle, maxBytes: number, signal?: AbortSignal): Promise<Buffer> {
-  checkAbort(signal);
-  const info = await handle.stat();
-  if (!info.isFile()) throw new Error("Transfer requires a regular file");
-  if (info.size > maxBytes) throw new Error("File exceeds maxFileBytes");
-  const data = Buffer.alloc(maxBytes + 1);
-  let used = 0;
-  while (used < data.length) {
-    checkAbort(signal);
-    const read = await handle.read(data, used, data.length - used, null);
-    if (!read.bytesRead) break;
-    used += read.bytesRead;
-  }
-  if (used > maxBytes) throw new Error("File grew beyond maxFileBytes");
-  checkAbort(signal);
-  return data.subarray(0, used);
-}
+const READ_PAYLOAD = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+
+type UploadOptions = { localPath: string; remotePath: string; overwrite: boolean; expectedSha256?: string | undefined };
 
 /** Upload one bounded binary file over SFTP, reusing the authenticated ControlMaster. */
-export async function upload(ssh: SshTransport, connectionId: string, args: {
-  localPath: string; remotePath: string; overwrite: boolean; expectedSha256?: string | undefined;
-}, cwd?: string, signal?: AbortSignal): Promise<RemoteResult> {
+export async function upload(ssh: SshTransport, connectionId: string, args: UploadOptions, cwd?: string, signal?: AbortSignal): Promise<RemoteResult> {
   checkAbort(signal);
   const requestedSource = await transferPath(ssh.config, args.localPath, false);
   await ssh.prepareSftp(connectionId, signal);
   const filename = await transferPath(ssh.config, requestedSource, false);
-  // Recheck the opened descriptor so swapped symlinks and special files cannot bypass basic limits.
-  const handle = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  let data: Buffer;
-  try {
-    data = await readSnapshot(handle, ssh.config.maxFileBytes, signal);
-  } finally { await handle.close(); }
-
-  const digest = createHash("sha256").update(data).digest("hex");
-  const requested = remotePath(args.remotePath, remoteBase(ssh, connectionId, cwd), ssh.cwd(connectionId));
-  const info = await ssh.run(connectionId, "stat", { path: requested }, undefined, signal) as unknown as RemoteStat;
-  // Pin even an absent target: a dangling final symlink still selects its real destination.
-  const remote = info.realpath ?? requested;
-  if (info.exists) {
-    if (args.expectedSha256) {
-      const current = await ssh.run(connectionId, "hash", { path: remote }, undefined, signal) as unknown as RemoteHash;
-      if (current.sha256 !== args.expectedSha256) throw new Error("Content conflict: SHA-256 does not match");
-    } else if (!args.overwrite) {
-      throw new Error("File exists: set overwrite=true or provide expectedSha256");
+  return withStagingFile(join(tmpdir(), "neverssh-upload-"), async snapshot => {
+    const handle = await open(filename, READ_PAYLOAD);
+    const { sha256 } = await hashPayload(handle, ssh.config.maxFileBytes, signal, snapshot).finally(() => handle.close());
+    const requested = remotePath(args.remotePath, ssh.cwd(connectionId), cwd);
+    const remote = await uploadTarget(ssh, connectionId, args, requested, signal);
+    const temporary = posix.join(posix.dirname(remote), `.neverssh-upload-${randomUUID()}`);
+    try {
+      await ssh.sftp(connectionId, [`put ${sftpQuote(snapshot)} ${sftpQuote(temporary)}`], signal);
+      const result = await ssh.run(connectionId, "commit_upload", {
+        path: remote, temporary, overwrite: args.overwrite, sha256,
+        ...(args.expectedSha256 ? { expectedSha256: args.expectedSha256 } : {}),
+      }, undefined, signal);
+      return { ...result, localPath: filename };
+    } catch (error) {
+      // Cleanup must still run when the request's own cancellation signal has already fired.
+      await ssh.sftp(connectionId, [`rm ${sftpQuote(temporary)}`], undefined, 10000).catch(() => {});
+      throw error;
     }
-  } else if (args.expectedSha256) {
-    throw new Error("Content conflict: expected file does not exist");
-  }
+  });
+}
 
-  await ssh.run(connectionId, "mkdir", { path: posix.dirname(remote) }, undefined, signal);
-  const temporary = posix.join(posix.dirname(remote), `.neverssh-upload-${randomUUID()}`);
-  const snapshotDirectory = await mkdtemp(join(tmpdir(), "neverssh-upload-"));
-  const snapshot = join(snapshotDirectory, "payload");
-  try {
-    await writeFile(snapshot, data, { mode: 0o600 });
-    await ssh.sftp(connectionId, [`put ${sftpQuote(snapshot)} ${sftpQuote(temporary)}`], signal);
-    // The worker shares commit admission with text edits and rechecks conflicts after staging.
-    const committed = await ssh.run(connectionId, "commit_upload", {
-      path: remote, temporary, overwrite: args.overwrite, sha256: digest,
-      ...(args.expectedSha256 ? { expectedSha256: args.expectedSha256 } : {}),
-    }, undefined, signal);
-    return { ...committed, localPath: filename };
-  } catch (error) {
-    // Cleanup must still run when the request's own cancellation signal has already fired.
-    await ssh.sftp(connectionId, [`rm ${sftpQuote(temporary)}`], undefined, 10000).catch(() => {});
-    throw error;
-  } finally {
-    await rm(snapshotDirectory, { recursive: true, force: true });
+/** Pin the remote target before staging. The worker checks conflicts again at commit. */
+async function uploadTarget(ssh: SshTransport, connectionId: string, args: UploadOptions,
+  requested: string, signal?: AbortSignal): Promise<string> {
+  const target = await ssh.run(connectionId, "prepare_upload", {
+    path: requested, ...(args.expectedSha256 && { checkRevision: true }),
+  }, undefined, signal) as unknown as TransferTarget;
+  if (args.expectedSha256) {
+    if (!target.exists) throw new Error("Content conflict: expected file does not exist");
+    if (target.sha256 !== args.expectedSha256) throw new Error("Content conflict: SHA-256 does not match");
+  } else if (target.exists && !args.overwrite) {
+    throw new Error("File exists: set overwrite=true or provide expectedSha256");
   }
+  return target.path;
 }
 
 /** Download over SFTP into a private local temporary file before committing atomically. */
@@ -161,28 +134,25 @@ export async function download(ssh: SshTransport, connectionId: string, args: {
   if (!args.overwrite && await lstat(filename).then(() => true).catch(() => false)) {
     throw new Error("Local destination exists; set overwrite=true explicitly");
   }
-  const requested = remotePath(args.remotePath, remoteBase(ssh, connectionId, cwd), ssh.cwd(connectionId));
+  const requested = remotePath(args.remotePath, ssh.cwd(connectionId), cwd);
   // Check existence and size without reading the file; SFTP carries the bytes once.
-  const info = await ssh.run(connectionId, "stat", { path: requested }, undefined, signal) as unknown as RemoteStat;
+  const info = await ssh.run(connectionId, "stat", { path: requested }, undefined, signal) as unknown as TransferTarget;
   if (!info.exists) throw new Error("Remote file does not exist: " + requested);
   if (info.size !== undefined && info.size > ssh.config.maxFileBytes) throw new Error("Remote file exceeds maxFileBytes");
-  const remote = info.realpath ?? requested;
-  const temporaryDirectory = await mkdtemp(join(dirname(filename), ".neverssh-download-"));
-  const temporary = join(temporaryDirectory, "payload");
-  try {
+  const remote = info.path;
+  return withStagingFile(join(dirname(filename), ".neverssh-download-"), async temporary => {
     await ssh.sftp(connectionId, [`get ${sftpQuote(remote)} ${sftpQuote(temporary)}`], signal);
-    const handle = await open(temporary, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    let data: Buffer;
+    const handle = await open(temporary, READ_PAYLOAD);
+    let payload;
     try {
-      data = await readSnapshot(handle, ssh.config.maxFileBytes, signal);
+      payload = await hashPayload(handle, ssh.config.maxFileBytes, signal);
       await handle.chmod(0o600);
     } finally { await handle.close(); }
-    const sha256 = createHash("sha256").update(data).digest("hex");
     // Revalidate the destination type and any configured root boundary before committing.
     await transferPath(ssh.config, filename, true);
     checkAbort(signal);
     if (args.overwrite) await rename(temporary, filename);
     else await link(temporary, filename);
-    return { path: remote, localPath: filename, size: data.length, sha256 };
-  } finally { await rm(temporaryDirectory, { recursive: true, force: true }); }
+    return { path: remote, localPath: filename, ...payload };
+  });
 }

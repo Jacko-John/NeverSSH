@@ -1,7 +1,7 @@
-/** Reproduce helper archive finalization after Darwin's exited-process-group signal error. */
+/** Exercise the Bash helper's output, exit notification, and archive cleanup. */
 import { expect, test } from "bun:test";
 
-test("helper shutdown finalizes metadata after an exited group's EPERM", async () => {
+test("helper wakes on exit, drains output, and finalizes its archive", async () => {
   const child = Bun.spawn(["uv", "run", "--no-project", "python", "-B", "tests/helper_shutdown_test.py"], {
     stdout: "pipe", stderr: "pipe",
   });

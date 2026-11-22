@@ -55,6 +55,7 @@ test("interface document covers every registered tool", async () => {
 });
 
 test("project operations accept exactly one scope and retain strict portable input schemas", () => {
+  const largestReview = Array.from({ length: 2048 }, (_, index) => index.toString(16).padStart(64, "0"));
   for (const { name, args } of scopedRequests) {
     const input = toolContracts[name].input;
     expect(input.safeParse({ ...args, connection_id: "1234abcd" }).success, name).toBe(true);
@@ -67,6 +68,12 @@ test("project operations accept exactly one scope and retain strict portable inp
     expect(input.safeParse({ ...args, connection_id: "1234abcd", ...ack }).success, name).toBe(false);
     expect(input.safeParse({ ...args, workspace_id: "ws_abcd1234", ...ack }).success, name).toBe(name !== "ssh_bash");
     expect(input.safeParse({ ...args, workspace_id: "ws_abcd1234", workspace_rules_ack: "invalid" }).success, name).toBe(false);
+    const receipts = [ack.workspace_rules_ack, "2b".repeat(32)];
+    expect(input.safeParse({ ...args, workspace_id: "ws_abcd1234", workspace_rules_ack: receipts }).success, name).toBe(name !== "ssh_bash");
+    expect(input.safeParse({ ...args, workspace_id: "ws_abcd1234", workspace_rules_ack: largestReview }).success, name).toBe(name !== "ssh_bash");
+    for (const invalid of [[], ["invalid"], [...largestReview, ack.workspace_rules_ack]]) {
+      expect(input.safeParse({ ...args, workspace_id: "ws_abcd1234", workspace_rules_ack: invalid }).success, name).toBe(false);
+    }
   }
   for (const { name, inputSchema } of tools) {
     expect(inputSchema.type, name).toBe("object");
@@ -102,7 +109,7 @@ test("workspace contracts validate handles, defaults, bounded lists, and unknown
   const read = workspaceContracts.ssh_skill_read.input;
   const scope = { workspace_id: "ws_abcd1234" };
   expect(open.parse({ connection_id: "1234abcd", path: "/srv/app" })).toEqual({
-    connection_id: "1234abcd", path: "/srv/app", skill_directories: [".agents/skills", ".claude/skills"],
+    connection_id: "1234abcd", path: "/srv/app", reread_rules: false, skill_directories: [".agents/skills", ".claude/skills"],
   });
   expect(open.safeParse({ connection_id: "1234abcd", path: "/srv/app", skill_directories: [] }).success).toBe(true);
   expect(open.safeParse({ connection_id: "1234abcd", path: "/srv/app", skill_directories: Array(17).fill("skills") }).success).toBe(false);
@@ -242,7 +249,7 @@ test("workspace and skill return examples match their typed text formatters", as
     instructions: [], rule_scopes: ["/srv/app"], skills: [], project_files: [], git: null, warnings: [],
   };
   const examples = {
-    ssh_workspace_open: contextText(base),
+    ssh_workspace_open: contextText(base, { updated: base.instructions, removed: [] }),
     ssh_skill_read: skillText({
       workspace_id: base.workspace_id, connection_id: base.connection_id, name: "testing",
       path: "/srv/app/.agents/skills/testing/SKILL.md", directory: "/srv/app/.agents/skills/testing", execution: "remote",

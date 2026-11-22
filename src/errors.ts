@@ -6,11 +6,14 @@ export class ToolError extends Error {
   }
 }
 
+/** Preserve a more specific owner-provided failure when interrupting a caller. */
+export function abortError(signal: AbortSignal): ToolError {
+  return signal.reason instanceof ToolError ? signal.reason : new ToolError("OPERATION_CANCELLED", "Operation cancelled");
+}
+
 /** Reject cancelled work before opening a remote request or committing a local transfer. */
 export function checkAbort(signal?: AbortSignal): void {
-  if (!signal?.aborted) return;
-  if (signal.reason instanceof ToolError) throw signal.reason;
-  throw new ToolError("OPERATION_CANCELLED", "Operation cancelled");
+  if (signal?.aborted) throw abortError(signal);
 }
 
 /** Normalize unknown failures to the same model-readable code and message. */
@@ -32,14 +35,11 @@ export async function bounded<T>(promise: Promise<T>, timeout: number, code: str
   let abort: (() => void) | undefined;
   const interrupted = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new ToolError(code, message)), timeout);
-    abort = () => {
-      const reason = signal?.reason instanceof ToolError
-        ? signal.reason
-        : new ToolError("OPERATION_CANCELLED", "Operation cancelled");
-      reject(reason);
-    };
-    signal?.addEventListener("abort", abort, { once: true });
-    if (signal?.aborted) abort();
+    if (signal) {
+      abort = () => reject(abortError(signal));
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+    }
   });
   try {
     return await Promise.race([promise, interrupted]);

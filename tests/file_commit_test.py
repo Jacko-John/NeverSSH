@@ -1,5 +1,6 @@
 """Exercise same-worker revision conflicts with real files and deterministic commit gates."""
 import base64
+import errno
 import os
 from pathlib import Path
 import stat
@@ -8,6 +9,7 @@ import tempfile
 import threading
 import tracemalloc
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "remote"))
@@ -95,8 +97,13 @@ class FileCommitTests(unittest.TestCase):
         fifo = self.root / "fifo.jpg"
         os.mkfifo(fifo)
         for target in (directory, fifo):
-            with self.subTest(path=target.name), self.assertRaises((ValueError, IsADirectoryError)):
-                file_ops.dispatch(self.request("read", path=target.name))
+            with self.subTest(path=target.name):
+                descriptor = os.open(target, os.O_RDONLY | os.O_NONBLOCK)
+                with patch.object(os, "open", return_value=descriptor), self.assertRaises((ValueError, IsADirectoryError)):
+                    file_ops.dispatch(self.request("read", path=target.name))
+                with self.assertRaises(OSError) as closed:
+                    os.fstat(descriptor)
+                self.assertEqual(closed.exception.errno, errno.EBADF)
 
     def test_paging_a_line_dense_file_keeps_memory_proportional_to_its_bytes(self):
         size = 2 * 1024 * 1024
@@ -300,18 +307,46 @@ class FileCommitTests(unittest.TestCase):
         result = file_ops.dispatch(self.request("stat", path=str(alias)))
 
         self.assertFalse(result["exists"])
-        self.assertEqual(result["realpath"], str(target.resolve()))
+        self.assertEqual(result["path"], str(target.resolve()))
 
-    def test_hash_returns_the_canonical_path_of_a_regular_file(self):
+    def test_upload_preflight_returns_the_digest_and_canonical_path_of_a_regular_file(self):
         target = self.root / "target"
         target.write_bytes(b"contents")
         alias = self.root / "alias"
         alias.symlink_to(target)
 
-        result = file_ops.dispatch(self.request("hash", path=str(alias)))
+        result = file_ops.dispatch(self.request("prepare_upload", path=str(alias), checkRevision=True))
 
         self.assertEqual(result["path"], str(target.resolve()))
         self.assertEqual(result["sha256"], file_ops.digest(b"contents"))
+
+    def test_content_and_digest_observe_actual_bytes_when_descriptor_size_is_stale(self):
+        data = b"ab" * (128 * 1024)
+        target = self.root / "growing.txt"
+        target.write_bytes(data)
+        # Some regular files expose zero size even though reads return data.
+        info = SimpleNamespace(st_mode=target.stat().st_mode, st_size=0)
+        with patch.object(file_ops.os, "fstat", return_value=info):
+            self.assertEqual(file_ops.load_bytes(target, len(data))[0], data)
+            self.assertEqual(file_ops.file_digest(target, len(data)), (len(data), file_ops.digest(data)))
+            for reader in (file_ops.load_bytes, file_ops.file_digest):
+                with self.subTest(reader=reader), self.assertRaisesRegex(ValueError, "grew beyond maxFileBytes"):
+                    reader(target, len(data) - 1)
+
+    def test_hashing_a_transfer_keeps_only_a_bounded_part_of_the_file_in_memory(self):
+        size = 4 * 1024 * 1024
+        target = self.root / "large.bin"
+        target.write_bytes(b"z" * size)
+        request = self.request("prepare_upload", path=target.name, checkRevision=True)
+        request["maxFileBytes"] = size
+        tracemalloc.start()
+        try:
+            result = file_ops.dispatch(request)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(result["sha256"], file_ops.digest(target.read_bytes()))
+        self.assertLess(peak, size // 2)
 
     def test_upload_cannot_replace_a_nonregular_destination(self):
         target = self.root / "target"

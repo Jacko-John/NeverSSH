@@ -32,7 +32,7 @@ const operationScope = {
 };
 const fileScope = {
   ...operationScope,
-  workspace_rules_ack: "仅用于工作区。阅读 WORKSPACE_RULES_CHANGED 的规则后，在重试原调用时原样回传其中的确认值。",
+  workspace_rules_ack: "仅用于工作区。读完规则后原样回传确认码。每份规则的当前版本对应一个 64 字符的小写十六进制码。可传单个字符串，或包含 1～2048 个码的数组。",
 };
 const descriptions: Record<string, Record<string, string>> = {
   "ssh_connect.input": {
@@ -53,7 +53,7 @@ const descriptions: Record<string, Record<string, string>> = {
   },
   "ssh_task_output.input": {
     ...taskScope,
-    wait_seconds: "最多等待任务结束的秒数，支持小数。0 表示立即查询；输出到来不会提前结束等待。",
+    wait_seconds: "最多等待任务结束的秒数，支持小数。0 表示直接查询当前预览。获取远端预览最多另等 5 秒。",
   },
   "ssh_task_stop.input": taskScope,
   "ssh_task_list.input": {
@@ -62,6 +62,7 @@ const descriptions: Record<string, Record<string, string>> = {
   "ssh_workspace_open.input": {
     connection_id: "打开项目所用的远端连接 ID。",
     path: "已存在的远端项目目录；支持绝对路径、~/ 和相对于远端 HOME 的路径。",
+    reread_rules: "设为 true 重新展示根目录的 AGENTS.md，并清除之前的规则确认。下次访问子目录时再展示该目录的规则。",
     skill_directories: "替换默认远端 skill 搜索目录，统一从工作区根目录解析一次；默认 .agents/skills 和 .claude/skills，不支持随目标路径发现子目录 skill。绝对路径和 ~/ 指向远端共享目录；空数组关闭发现。",
   },
   "ssh_skill_read.input": {

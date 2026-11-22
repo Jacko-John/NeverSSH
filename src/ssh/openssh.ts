@@ -4,35 +4,43 @@ import { createHash } from "node:crypto";
 import type { Config, Endpoint, SshTarget } from "../config";
 import { bounded, ToolError } from "../errors";
 
+export type ResolvedTarget = {
+  target: SshTarget; endpoint: Endpoint; key: string; supportedOptions: ReadonlySet<string>;
+};
+
 /** Apply the same non-interactive security and connection policy to SSH and SFTP. */
-function connectionOptions(config: Config): string[] {
+function connectionOptions(config: Config, supportedOptions?: ReadonlySet<string>): string[] {
   return [
     "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
     "-o", "UpdateHostKeys=no", "-o", "CheckHostIP=no", "-o", "ForwardAgent=no",
     "-o", "ForwardX11=no", "-o", "ClearAllForwardings=yes", "-o", "PermitLocalCommand=no",
     "-o", "ConnectTimeout=15", "-o", "ConnectionAttempts=1", "-o", "ServerAliveInterval=15",
-    "-o", "ServerAliveCountMax=2", "-o", "LogLevel=ERROR",
+    "-o", "ServerAliveCountMax=2", "-o", "LogLevel=ERROR", "-o", "RequestTTY=no", "-o", "RemoteCommand=none",
+    // ssh -G lists these settings only on clients that support them. Older clients
+    // already run in the foreground with stdin attached when neither -f nor -n is used.
+    ...(supportedOptions?.has("forkafterauthentication") ? ["-o", "ForkAfterAuthentication=no"] : []),
+    ...(supportedOptions?.has("stdinnull") ? ["-o", "StdinNull=no"] : []),
     ...(config.compression ? ["-o", "Compression=yes"] : []),
   ];
 }
 
 /** Pin transport behavior while inheriting trusted identity, proxy, and host matching configuration. */
-export function sshOptions(config: Config, target: SshTarget, socket: string, master: boolean): string[] {
+export function sshOptions(config: Config, target: SshTarget, socket: string, master: boolean, supportedOptions?: ReadonlySet<string>): string[] {
   return [
     ...(config.sshConfig ? ["-F", config.sshConfig] : []),
     ...(target.user ? ["-l", target.user] : []), ...(target.port ? ["-p", String(target.port)] : []),
-    "-T", "-S", socket, "-o", `ControlMaster=${master ? "yes" : "no"}`,
-    "-o", "ControlPersist=no", ...connectionOptions(config), "-o", "RemoteCommand=none",
-    "-o", `SessionType=${master ? "none" : "default"}`, "-o", "ForkAfterAuthentication=no", "-o", "StdinNull=no",
+    ...(master ? ["-N"] : []), "-S", socket, "-o", `ControlMaster=${master ? "yes" : "no"}`,
+    "-o", "ControlPersist=no", ...connectionOptions(config, supportedOptions),
+    ...(!master && supportedOptions?.has("sessiontype") ? ["-o", "SessionType=default"] : []),
   ];
 }
 
 /** Reuse the existing ControlMaster for batch SFTP data transfer instead of the worker JSON path. */
-export function sftpOptions(config: Config, target: SshTarget, socket: string): string[] {
+export function sftpOptions(config: Config, target: SshTarget, socket: string, supportedOptions: ReadonlySet<string>): string[] {
   return [
     ...(config.sshConfig ? ["-F", config.sshConfig] : []),
     "-o", `ControlPath=${socket}`, "-o", "ControlMaster=no",
-    ...connectionOptions(config),
+    ...connectionOptions(config, supportedOptions),
     ...(target.port ? ["-P", String(target.port)] : []),
     ...(target.user ? ["-o", `User=${target.user}`] : []),
   ];
@@ -49,7 +57,7 @@ export function sshFailure(message: string): ToolError {
 }
 
 /** Ask OpenSSH to resolve a specific target, including Include/Match and command-line overrides. */
-export async function resolveTarget(config: Config, target: SshTarget, signal?: AbortSignal): Promise<{ endpoint: Endpoint; key: string }> {
+export async function resolveTarget(config: Config, target: SshTarget, signal?: AbortSignal): Promise<ResolvedTarget> {
   const child = spawn("ssh", ["-G", ...sshOptions(config, target, "none", true), target.host], {
     stdio: ["ignore", "pipe", "pipe"], env: sshEnvironment(),
   });
@@ -62,18 +70,23 @@ export async function resolveTarget(config: Config, target: SshTarget, signal?: 
   });
   child.stderr.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-8192); });
   child.on("error", (error) => { failure = new ToolError("SSH_UNAVAILABLE", error.message); });
-  const completion = new Promise<{ endpoint: Endpoint; key: string }>((resolve, reject) => child.once("close", (code) => {
+  const completion = new Promise<ResolvedTarget>((resolve, reject) => child.once("close", (code) => {
     if (failure) return reject(failure);
     if (code !== 0) return reject(sshFailure(stderr.trim()));
-    const values = new Map(stdout.split("\n").map((line) => {
-      const index = line.indexOf(" ");
-      return [line.slice(0, index), line.slice(index + 1)] as const;
-    }));
-    const host = values.get("hostname");
-    const user = values.get("user");
-    const port = Number(values.get("port"));
+    // Hash the full effective configuration for reuse, but retain only the settings we consume.
+    let host: string | undefined;
+    let user: string | undefined;
+    let port = 0;
+    const supportedOptions = new Set<string>();
+    for (const match of stdout.matchAll(/^(hostname|user|port|sessiontype|forkafterauthentication|stdinnull) (.*)$/gm)) {
+      const name = match[1]!;
+      if (name === "hostname") host = match[2];
+      else if (name === "user") user = match[2];
+      else if (name === "port") port = Number(match[2]);
+      else supportedOptions.add(name);
+    }
     if (!host || !user || !Number.isInteger(port) || port < 1 || port > 65535) return reject(new ToolError("SSH_FAILED", "OpenSSH returned an invalid destination"));
-    resolve({ endpoint: { host, user, port }, key: createHash("sha256").update(stdout).digest("hex") });
+    resolve({ target, endpoint: { host, user, port }, key: createHash("sha256").update(stdout).digest("hex"), supportedOptions });
   }));
   try { return await bounded(completion, 10000, "SSH_TIMEOUT", "SSH configuration resolution timed out", signal); }
   finally { if (child.exitCode === null) child.kill("SIGKILL"); }

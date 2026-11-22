@@ -29,7 +29,7 @@ try {
 The task-list handler uses the pure formatter in `src/tasks/text.ts` and the same text wrapper as other tools:
 
 ```ts
-registerTool("ssh_task_list", "List tasks whose output has not been read by ssh_task_output. Optional connection_id filter.",
+registerTool("ssh_task_list", "List tasks with unread output. Fully returned Bash results are already read. Optional connection_id filter.",
   contracts.ssh_task_list.input, true,
   (args) => textResult(taskListText(runtime.tasks.list(args.connection_id))));
 ```
@@ -136,15 +136,15 @@ Follow these existing responsibility boundaries:
 | Module | Responsibility |
 | --- | --- |
 | `src/index.ts`, `src/runtime.ts` | CLI/stdio lifetime and shared application state; runtime survives temporary MCP negotiation instances |
-| `src/mcp/server.ts` | Register tools through one helper, set annotations, delegate execution, package results |
+| `src/mcp/server.ts`, `src/mcp/read-result.ts` | Register tools, gate file operations on workspace guidance, and format bounded read responses before recording a revision |
 | `src/mcp/contracts.ts` | All 15 public input schemas, including scope validation and active configuration limits, shared by registration, documentation, and tests |
 | `src/mcp/operation-text.ts`, `src/tasks/text.ts` | Pure presentation of operation and task results |
-| `src/ssh/transport.ts`, `src/ssh/openssh.ts`, `src/ssh/discovery.ts` | Connection identity/lifetime, native OpenSSH arguments, and configured SSH candidates |
+| `src/ssh/transport.ts`, `src/ssh/shared-operation.ts`, `src/ssh/openssh.ts`, `src/ssh/discovery.ts` | Connection lifetime, independently cancellable waits for shared startup or SFTP probes, native OpenSSH arguments, and configured SSH candidates |
 | `src/ssh/worker-client.ts`, `src/ssh/request-channel.ts`, `src/ssh/json-lines.ts` | Worker handshake/multiplexing/admission, one request's I/O/cancellation, and bounded protocol framing |
 | `src/tasks/manager.ts` | Bash task lifetime, status, and bounded local previews |
 | `src/files/revisions.ts`, `src/remote/file_ops.py` | Local revision tracking and remote file validation/atomic commits |
-| `src/files/transfers.ts` | SFTP and the allowed local-file boundary |
-| `src/workspaces/manager.ts`, `src/workspaces/types.ts`, `src/workspaces/text.ts` | Workspace identities, typed project context and skill records, rule-change tracking, and pure workspace/skill presentation |
+| `src/files/transfers.ts`, `src/files/staging.ts` | SFTP, local path validation, private staging files, and bounded payload hashing |
+| `src/workspaces/manager.ts`, `src/workspaces/rules.ts`, `src/workspaces/types.ts`, `src/workspaces/text.ts` | Workspace identities, scoped rule versions and confirmations, typed project context, and workspace/skill presentation |
 | `src/remote/bundle.ts` | Local embedding of Python sources and content-addressed build manifest; this TypeScript module is not executed remotely |
 | `src/remote/worker.py`, `src/remote/helper.py`, `src/remote/archive.py`, `src/remote/build_cache.py` | Remote supervision, commands, archives, and verified build installation |
 | `src/remote/workspace.py` | Canonical project paths, scoped AGENTS.md, bounded skill/resource discovery, and optional Git inspection |
@@ -187,8 +187,8 @@ Keep the following existing invariants when adding a feature:
 - Use system OpenSSH with argument arrays and the existing access policy. Do not interpolate paths into a local shell, accept model-supplied SSH flags/credentials, weaken host-key checks, or silently replace SFTP with another transport.
 - Keep local and remote paths distinct. Only transfer operations access local user payload files, using each call's absolute `localPath` on the MCP host. Omitted or empty `localTransferRoots` imposes no directory restriction; a nonempty list requires canonical paths to stay within a configured root, including through symlinks. Preserve file type, size, overwrite, atomic commit, and cancellation checks in both modes. Remote workspaces and `cwd` do not resolve `localPath`; remote `cwd` is not a sandbox.
 - Keep remote project development on the remote host: use `ssh_read_file`, `ssh_write_file`, and `ssh_edit_file` directly, and run batch changes or code generation with remote `ssh_bash`. Do not make local temporary files plus upload, or download-edit-upload round trips, the default. Upload the user's existing local files or satisfy a specific transfer requirement; download files when they need to be retrieved locally. A required local-only tool can justify a transfer based on the actual task.
-- Workspace file paths stay inside the canonical project root. Before dispatching a read, write, edit, upload, or download, check for new, changed, or removed rules. Return `WORKSPACE_RULES_CHANGED` with their full guidance and a `workspace_rules_ack` for that workspace, target, and rule state. Require the caller to return it before recording file acknowledgment. Verify that discarding a review response and retrying without the token still pauses the operation. A paused read exposes no file content or revision and a paused download leaves the local destination untouched. Bash discovers rules only for `cwd`. Callers can operate in the intended directory or read its `AGENTS.md` explicitly. Connection mode skips project context. Preserve path and file revision checks.
-- Opening a workspace returns complete root guidance, a preview of up to 50 Git status entries with an omitted count, and the skill catalog, without traversing subdirectory rules. Track rule presentation and file acknowledgment separately. Opening a workspace or returning Bash guidance never confirms rules for file operations. Reopen with the same connection, canonical root, and skill configuration to recover root context and rediscover skills; a handle may be reused, but file confirmations reset and the catalog is rebuilt. Subdirectory rules are delivered again by subsequent target operations. A concurrent reopen can still invalidate an operation's preparation before execution; keep that lifecycle error separate from rule discovery.
+- Workspace file paths stay inside the canonical root. Read, write, edit, upload, and download dispatch only after every applicable rule version is confirmed. Apply receipts only to matching versions in the current scope. Test lost and partial receipts, parallel requests, and changes or removals through symlinks. A paused read records no revision and a paused download leaves its local destination untouched.
+- Opening returns pending root guidance with its receipt, up to 50 Git status entries with an omitted count, and the skill catalog. Ordinary refresh preserves confirmations. Explicit context recovery clears rule history and receipts. Observe versions during remote inspection and filter superseded entries at presentation, including delayed Bash and open results.
 - Keep operation blocks in their original order. Bash discovers rules for its working directory and appends changes to its first result, including background and nonzero results. Thrown operation errors do not attach or acknowledge collected guidance. Rule collection and path validation run before execution and can fail for unreadable files or resource limits. Exhausting rule history requires reopening.
 - A qualifying single-file Bash view can establish a revision. For a successful search, require actual file text in delivered standard output, including a truncated preview that still shows matches. Exit status, a count, a filename or a diagnostic alone cannot establish a revision. Other supported view commands require complete previews with nonempty stdout. Preserve whitespace, including a single newline. An explicit `ssh_read_file` can establish the revision of an empty file.
 - Keep revision hashes internal for rule-change checks; do not print them in project-rule or skill results. Keep fixed development workflow reminders in the distributed NeverSSH skill instead of appending them to every workspace response. Preserve rule sources, scopes, complete bodies, and the skill's remote resource and script locations.
@@ -231,12 +231,12 @@ That assertion cannot detect a JSON-wrapped public response, lost whitespace, a 
 Good: reopen the project after conversation compaction to recover root guidance and rediscover skills:
 
 ```json
-{"connection_id":"7a2c9d4f","path":"/srv/app"}
+{"connection_id":"7a2c9d4f","path":"/srv/app","reread_rules":true}
 ```
 
-Use `ssh_workspace_open` for that request, preserving the original skill configuration. Reopening may reuse the handle but clears file confirmations and rebuilds the catalog. Reload active skills using its current names; applicable subdirectory rules arrive with subsequent file operations or commands in those directories. Opening alone does not recover every subdirectory's rules. If a command generates files outside its `cwd`, operate in the intended directory or read the relevant `AGENTS.md` explicitly.
+Use `ssh_workspace_open` with the original skill configuration and `reread_rules: true` for recovery. Reload active skills from the refreshed catalog. Subdirectory rules arrive with subsequent target operations.
 
-A file or transfer operation that encounters pending scoped rules returns them with a confirmation value before accessing the payload. Read the guidance and retry the original call with its `workspace_rules_ack`. Bash commands may already have started when their guidance arrives. A workspace supplies path defaults and project guidance. Bash keeps its SSH permissions and local editor paths stay local. `WORKSPACE_REOPEN_REQUIRED` rejects invalidated preparation, exhausted rule history, or a skill read from an obsolete catalog. Completed operations retain their result without obsolete rule attachments.
+Workspace open, Bash and paused file calls return a string for one rule or an array with one code per displayed version. Reuse the value on applicable targets, including parallel file calls. A paused multi-rule response also supports the 0.7.0 single-code retry for the complete set. A repeated inspection conflict or explicit reset during preparation returns `WORKSPACE_RULES_RETRY`. Reopen on rule-history exhaustion. An obsolete skill source returns `SKILL_CATALOG_CHANGED`. Bash keeps its SSH permissions and local editor paths stay local.
 
 Use the isolated `SshFixture` in `tests/fixture.ts`: temporary keys, known_hosts, files, a loopback SSH endpoint, real system OpenSSH, and MCP stdio. Do not use a user's live servers or modify their SSH configuration for regression tests. Python tests run through uv, following the existing Bun wrappers.
 

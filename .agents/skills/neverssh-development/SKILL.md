@@ -22,11 +22,11 @@ Inspect the nearest registered tool, formatter, contract, and public integration
 
 Keep interface adapters in `src/mcp/`, connections and request protocols in `src/ssh/`, Bash state and text in `src/tasks/`, revisions and transfers in `src/files/`, and workspace state, types, and text in `src/workspaces/`. `src/remote/` contains Python sources and the local bundle definition. `src/runtime.ts` owns shared state; `src/index.ts` owns CLI and stdio lifetime.
 
-Bash, file, and transfer operations select exactly one of `connection_id` and `workspace_id`. Before a workspace file operation or transfer accesses its payload, return applicable rule changes and require the caller to retry with their `workspace_rules_ack`. Sending the response alone must leave the file operation paused. Bash delivers rule changes for its `cwd` with the command result. Preserve path resolution, read-before-edit checks, file revision checks, and explicit remote skill resource loading. A workspace is project context, not a Bash sandbox or local IDE mount. Update `skills/neverssh/SKILL.md` when changing the remote development workflow.
+Bash, file, and transfer operations select exactly one of `connection_id` and `workspace_id`. Keep rule observation, display, and confirmation in `src/workspaces/rules.ts`. Open, Bash, and paused file operations return receipts for the versions they actually display. File access requires confirmation of every applicable version. Preserve path resolution, read-before-edit and revision checks. Update `skills/neverssh/SKILL.md` when changing the remote development workflow.
 
 Remote project development uses the remote read, write, and edit tools directly; batch changes and code generation run through remote `ssh_bash`. Do not default to local temporary files plus upload or download-edit-upload round trips. Use transfers for existing local files or concrete transfer needs, including tasks that require a local-only tool.
 
-Use `ssh_workspace_open` again for root context recovery or skill rediscovery. Reopening can reuse a handle but clears rule confirmations and rebuilds the skill catalog; it returns root guidance, with subdirectory rules delivered by subsequent target operations.
+Use `ssh_workspace_open` to refresh Git status and rediscover skills. Set `reread_rules: true` for recovery after context loss. Ordinary refreshes preserve confirmations and receipts.
 
 Skills are selected by the catalogued `skill_name`. Use short directory prefixes and, if needed, suffixes for name collisions. Match registered names without interpreting them as paths. The catalog remains fixed until reopening, which rebuilds it and may assign different names.
 

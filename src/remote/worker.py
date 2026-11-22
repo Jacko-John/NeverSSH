@@ -67,9 +67,10 @@ class ChildRequest:
 class FileRequest:
     """Run one short file request in a daemon thread while the worker keeps serving I/O."""
 
-    def __init__(self, execute, request, cancel_event=None):
+    def __init__(self, execute, request, wake, cancel_event=None):
         self.execute = execute
         self.request = request
+        self.wake = wake
         self.done = False
         self.result = None
         self.error = None
@@ -90,6 +91,7 @@ class FileRequest:
             self.error = error
         finally:
             self.done = True
+            self.wake()
 
     def stop(self):
         """Abandon file results; workspace inspection additionally cancels its owned Git subprocess."""
@@ -129,6 +131,16 @@ class Worker:
         self.cleanup_confirmed = True
         self.wakeup_reader = None
         self.wakeup_writer = None
+        self.wakeup_lock = threading.Lock()
+
+    def wake(self):
+        """Notify the selector after a file thread finishes, including error results."""
+        with self.wakeup_lock:
+            if self.wakeup_writer is not None:
+                try:
+                    os.write(self.wakeup_writer, b"\0")
+                except BlockingIOError:
+                    pass  # A full pipe already guarantees a wakeup.
 
     def emit(self, message):
         """Queue bounded output so a blocked SSH peer cannot prevent child cleanup."""
@@ -139,13 +151,25 @@ class Worker:
         if len(self.outgoing) > self.max_file_bytes * 2 + 2097152:
             raise ValueError("Worker output backpressure limit exceeded")
 
+    def emit_json_chunk(self, request_id, chunk):
+        """Forward serialized JSON bytes as text when the outer JSON line stays compact."""
+        # Both producers JSON-escape control characters except the record's final newline.
+        # Raw DEL would become six characters; an arbitrary UTF-8 split may bisect a character.
+        if chunk.isascii() and b"\x7f" not in chunk:
+            escapes = chunk.count(b'"') + chunk.count(b"\\") + chunk.count(b"\n")
+            if escapes <= (len(chunk) + 2) // 3:
+                self.emit({"type": "stdout_text", "id": request_id, "text": chunk.decode("ascii")})
+                return
+        self.emit({"type": "stdout", "id": request_id, "base64": base64.b64encode(chunk).decode("ascii")})
+
     def interrupt(self, signum, frame):
-        """Defer signal handling to the event loop, where all request state is available."""
-        self.stop_requested = True
+        """Child exit wakes the selector to reap helpers; termination also starts shutdown."""
+        if signum != signal.SIGCHLD:
+            self.stop_requested = True
 
     def initialize(self):
         """Claim the session descriptors and report readiness before admitting requests."""
-        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGCHLD):
             signal.signal(signum, self.interrupt)
         os.set_blocking(sys.stdin.fileno(), False)
         os.set_blocking(sys.stdout.fileno(), False)
@@ -157,7 +181,7 @@ class Worker:
             os.set_blocking(self.wakeup_reader, False)
             os.set_blocking(self.wakeup_writer, False)
         self.selector.register(self.wakeup_reader, selectors.EVENT_READ, (None, "wakeup"))
-        signal.set_wakeup_fd(self.wakeup_writer)
+        signal.set_wakeup_fd(self.wakeup_writer, warn_on_full_buffer=False)
 
         if sys.version_info < (3, 8):
             self.emit({"type": "startup_error", "code": "RUNTIME_UNSUPPORTED",
@@ -187,7 +211,7 @@ class Worker:
             self.stopping = True
         elif kind == "request":
             self.start_request(request_id, message)
-        elif kind in ("control", "eof", "cancel"):
+        elif kind in ("control", "cancel"):
             self.control_request(request_id, message)
         else:
             raise ValueError("Unknown worker message")
@@ -213,13 +237,13 @@ class Worker:
             "connectionId": self.connection_id,
             **self.archive_limits,
         }
-        if operation in ("read", "write", "edit", "stat", "hash", "mkdir", "probe", "commit_upload"):
-            self.requests[request_id] = FileRequest(file_ops_module.dispatch, request_payload)
+        if operation in ("read", "write", "edit", "stat", "prepare_upload", "probe", "commit_upload"):
+            self.requests[request_id] = FileRequest(file_ops_module.dispatch, request_payload, self.wake)
             return
-        if operation in ("workspace_open", "workspace_context", "workspace_skill_read"):
+        if operation in ("workspace_open", "workspace_context", "workspace_read", "workspace_skill_read"):
             cancel_event = threading.Event()
             request_payload["_cancel_event"] = cancel_event
-            self.requests[request_id] = FileRequest(workspace_module.dispatch, request_payload, cancel_event)
+            self.requests[request_id] = FileRequest(workspace_module.dispatch, request_payload, self.wake, cancel_event)
             return
         if operation != "bash":
             self.reject_request(request_id, "Unsupported operation")
@@ -248,7 +272,7 @@ class Worker:
         os.set_blocking(process.stdin.fileno(), False)
 
     def control_request(self, request_id, message):
-        """Forward command input, close stdin, or ask a helper to terminate its children."""
+        """Forward a command control, or cancel the request through its owner."""
         request = self.requests.get(request_id)
         if request is None:
             return
@@ -259,8 +283,6 @@ class Worker:
         kind = message["type"]
         if kind == "cancel":
             request.stop()
-        elif kind == "eof":
-            request.close_input = True
         elif not request.close_input:
             request.input_buffer.extend(json.dumps(message["message"]).encode("utf-8") + b"\n")
             if len(request.input_buffer) > self.max_file_bytes * 2 + 131072:
@@ -284,8 +306,7 @@ class Worker:
 
         end = request.response_offset + RESPONSE_CHUNK_BYTES
         chunk = request.response_data[request.response_offset:end]
-        self.emit({"type": "stdout", "id": request_id,
-                   "base64": base64.b64encode(chunk).decode("ascii")})
+        self.emit_json_chunk(request_id, chunk)
         request.response_offset += len(chunk)
         return request.response_offset == len(request.response_data)
 
@@ -436,6 +457,8 @@ class Worker:
             return
         if stream == "control":
             self.receive_control(chunk)
+        elif stream == "stdout":
+            self.emit_json_chunk(request_id, chunk)
         else:
             self.emit({"type": stream, "id": request_id,
                        "base64": base64.b64encode(chunk).decode("ascii")})
@@ -494,8 +517,11 @@ class Worker:
                 self.selector.unregister(self.wakeup_reader)
             except Exception:
                 pass
+            # A cancelled filesystem call may finish after the connection shuts down.
+            with self.wakeup_lock:
+                os.close(self.wakeup_writer)
+                self.wakeup_writer = None
             os.close(self.wakeup_reader)
-            os.close(self.wakeup_writer)
         self.selector.close()
         if self.session_lock is not None:
             os.close(self.session_lock)
@@ -518,7 +544,9 @@ class Worker:
                 self.prepare_output()
                 if self.bye_sent and not self.outgoing:
                     break
-                if self.requests or self.outgoing or self.stopping:
+                # Normal I/O, file completion and child exit all wake the selector.
+                # Only pending termination needs a timer for escalation without I/O.
+                if self.stopping or any(req.stopping_at is not None for req in self.requests.values()):
                     timeout = 0.05
                 else:
                     timeout = min(60, max(0.05, self.next_archive_cleanup - time.monotonic()))

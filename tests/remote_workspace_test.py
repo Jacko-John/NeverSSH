@@ -43,7 +43,7 @@ class WorkspaceTests(unittest.TestCase):
 
     def invoke(self, operation="workspace_open", max_file_bytes=4 * 1024 * 1024, **args):
         """Exercise the normal dispatcher and file byte budget, without an SSH connection."""
-        if operation == "workspace_context":
+        if operation in ("workspace_context", "workspace_read"):
             args.setdefault("root", str(self.root))
         elif operation == "workspace_open":
             args.setdefault("path", str(self.root))
@@ -53,6 +53,37 @@ class WorkspaceTests(unittest.TestCase):
     def skill(self, path, name="example", body="body"):
         """Create metadata plus a distinct body so discovery cannot accidentally preload it."""
         return self.write(path, "---\nname: %s\ndescription: Example skill\n---\n%s" % (name, body))
+
+    def test_conditional_read_checks_additions_removals_and_aliases_before_opening_the_target(self):
+        self.write("root.txt", "root value")
+        self.write("side/value", "side value")
+        self.write("other/value", "other value")
+        root_rule = self.write("AGENTS.md", "root rule")
+        alias = self.root / "link"
+        alias.symlink_to("side")
+
+        def inspect(path, **extra):
+            return self.invoke("workspace_read", paths=[path], read={"requestedPath": path}, **extra)
+
+        with patch.object(workspace, "read_file", wraps=workspace.read_file) as read:
+            first = inspect("link/value")
+            tag = first["read_condition"]
+            read.assert_not_called()
+            self.assertEqual(inspect("link/value", condition=tag)["content"], "side value")
+            read.assert_called_once()
+            read.reset_mock()
+            self.write("side/AGENTS.md", "nested rule")
+            nested = inspect("link/value", condition=tag)
+            self.assertNotEqual(nested["read_condition"], tag)
+            (self.root / "side/AGENTS.md").unlink()
+            self.assertNotIn("content", inspect("link/value", condition=nested["read_condition"]))
+            root_rule.unlink()
+            self.assertNotIn("content", inspect("link/value", condition=tag))
+            self.write("AGENTS.md", "root rule")
+            alias.unlink()
+            alias.symlink_to("other")
+            self.assertNotIn("content", inspect("link/value", condition=tag))
+            read.assert_not_called()
 
     def test_open_discovers_only_root_instructions_and_entry_names(self):
         self.write("AGENTS.md", "root rules")
@@ -74,6 +105,29 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(result["skill_files"], [])
         self.assertEqual(result["project_files"], [])
         self.assertIsNone(result["git"])
+
+    def test_known_rule_bodies_still_check_and_identify_each_current_source(self):
+        self.write("AGENTS.md", "root")
+        first = self.write("a/AGENTS.md", "nested")
+        self.write("b/AGENTS.md", "nested")
+        initial = self.invoke("workspace_context", paths=["a/one"])["instructions"]
+        known = [rule["sha256"] for rule in initial]
+
+        def inspect(path):
+            return self.invoke("workspace_context", paths=[path], knownRules=known)["instructions"]
+
+        for directory in ("a", "b"):
+            rules = inspect(directory + "/two")
+            self.assertEqual([rule["sha256"] for rule in rules], known)
+            self.assertTrue(all("content" not in rule for rule in rules))
+            self.assertEqual(rules[1]["scope"], str(self.root / directory))
+        first.write_text("revised", encoding="utf-8")
+        self.assertEqual(inspect("a/two")[1]["content"], "revised")
+        first.unlink()
+        self.assertEqual([rule["scope"] for rule in inspect("a/two")], [str(self.root)])
+        self.write("a/AGENTS.md", "x" * (workspace.RULE_BYTES + 1))
+        with self.assertRaisesRegex(ValueError, "Cannot load project instructions"):
+            inspect("a/two")
 
     def test_operation_context_loads_rules_without_catalogs_or_git(self):
         self.write("backend/AGENTS.md", "backend rules")
@@ -135,8 +189,10 @@ class WorkspaceTests(unittest.TestCase):
         self.write("AGENTS.md", "a" * 60000)
         self.write("nested/AGENTS.md", "b" * 60000)
         self.write("nested/deeper/AGENTS.md", "c" * 60000)
+        previous = self.invoke("workspace_context", paths=["nested/file"])["instructions"]
         with self.assertRaisesRegex(ValueError, "128 KiB context budget"):
-            self.invoke("workspace_context", paths=["nested/deeper/new.py"])
+            self.invoke("workspace_context", paths=["nested/deeper/new.py"],
+                        knownRules=[rule["sha256"] for rule in previous])
         with patch.object(workspace, "DIRECTORY_COUNT", 1):
             with self.assertRaisesRegex(ValueError, "directory budget"):
                 self.invoke("workspace_context", paths=["nested/new.py"])

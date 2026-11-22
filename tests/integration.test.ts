@@ -207,6 +207,30 @@ describe("MCP and connections", () => {
     } finally { await call("ssh_close", { connection_id: id }); }
   }, 8000);
 
+  test("connects with the user's IgnoreUnknown and overrides interactive session settings", async () => {
+    const sshConfig = join(fixture.root, "interactive_ssh_config");
+    await writeFile(sshConfig, [
+      "IgnoreUnknown FixtureOnly,SessionType,ForkAfterAuthentication,StdinNull",
+      "FixtureOnly yes",
+      "RequestTTY force",
+      "RemoteCommand echo interactive",
+      "SessionType subsystem",
+      "ForkAfterAuthentication yes",
+      "StdinNull yes",
+      `Include "${fixture.config.sshConfig}"`,
+    ].join("\n") + "\n");
+    const runtime = new Runtime({ ...fixture.config, sshConfig });
+    try {
+      const connection = await runtime.ssh.connect({ host: "fixture" });
+      const id = String(connection.connection_id);
+      const result = await runtime.tasks.execute(id, "printf connected", undefined, 5000);
+      expect(result.exit_code).toBe(0);
+      expect(result.preview).toEqual([{ stream: "stdout", text: "connected" }]);
+      await runtime.ssh.sftp(id, ["pwd"], undefined, 5000);
+      expect(await runtime.ssh.closeConnection(id)).toMatchObject({ remote_cleanup: "confirmed" });
+    } finally { await runtime.close(); }
+  });
+
   test("a timed-out final caller retires its pending worker and publishes no handle", async () => {
     const runtime = new Runtime(fixture.config);
     try {
@@ -778,6 +802,7 @@ describe("Bash tasks and archives", () => {
     });
     expect(text).toContain("(running in background)");
     expect(text).toContain("still growing");
+    expect(await call("ssh_task_list")).toContain(taskScope(text).task_id);
     const complete = await call("ssh_task_output", { ...taskScope(text), wait_seconds: 300 });
     expect(complete).toContain("(completed)");
     expect(complete).toContain("stdout:\nbegindone");
@@ -789,12 +814,16 @@ describe("Bash tasks and archives", () => {
   });
 
   test("expected exit 1 is accepted on the initial call while queries report the process exit", async () => {
-    const benign = await call("ssh_bash", { connection_id: dev, command: "grep 'not found' /dev/null" });
-    expect(benign).toContain("(completed)");
-    expect(benign).toContain("Exit code: 1");
-    const query = await call("ssh_task_output", { ...taskScope(benign), wait_seconds: 0 });
-    expect(query).toContain("(failed)");
-    expect(query).toContain("Exit code: 1");
+    for (const command of ["test -f missing-build-marker", "grep 'not found' /dev/null"]) {
+      const benign = await call("ssh_bash", { connection_id: dev, command });
+      expect(benign).toContain("(completed)");
+      expect(benign).toContain("Exit code: 1");
+      const task = taskScope(benign);
+      expect(await call("ssh_task_list")).not.toContain(task.task_id);
+      const query = await call("ssh_task_output", { ...task, wait_seconds: 0 });
+      expect(query).toContain("(failed)");
+      expect(query).toContain("Exit code: 1");
+    }
     expect(await call("ssh_bash", { connection_id: dev, command: "false" }, true)).toContain("Exit code: 1");
   });
 
@@ -830,9 +859,16 @@ describe("Bash tasks and archives", () => {
     }, true);
     expect(badCwd).toContain("Error:");
     expect(badCwd).toContain("No such file");
-    const failed = await call("ssh_bash", { connection_id: dev, command: "printf failed; exit 7" }, true);
+    const failed = await call("ssh_bash", { connection_id: dev, command: "printf failed >&2; exit 7" }, true);
     expect(failed).toContain("Exit code: 7");
-    expect(await call("ssh_task_output", { ...taskScope(failed), wait_seconds: 0 })).toContain("Exit code: 7");
+    expect(failed).toEndWith("stderr:\nfailed");
+    const task = taskScope(failed);
+    expect(await call("ssh_task_list")).not.toContain(task.task_id);
+    const replay = await call("ssh_task_output", { ...task, wait_seconds: 0 });
+    expect(replay).toContain("Exit code: 7");
+    expect(replay).toEndWith("stderr:\nfailed");
+    const archive = await call("ssh_read_file", { connection_id: dev, file_path: logPath(failed) });
+    expect(archive).toEndWith("\tfailed");
   });
 
   test("lists active and retained tasks, active first", async () => {
@@ -911,10 +947,50 @@ describe("Bash tasks and archives", () => {
     expect(large).toContain(`${logBytes} bytes`);
     expect(large).toContain("read selectively");
     expect(large.length).toBeLessThan(70000);
+    expect(await call("ssh_task_list")).toContain(taskScope(large).task_id);
     expect((await lstat(logPath(large))).size).toBe(logBytes);
     expect((await lstat(logPath(large))).mode & 0o777).toBe(0o600);
     const readTail = await call("ssh_bash", { connection_id: dev, command: "tail -c 16 '" + logPath(large) + "'" });
     expect(readTail).toBe("x".repeat(16));
+    const failed = await call("ssh_bash", { connection_id: dev, command: "printf '%70000s' error >&2; exit 2" }, true);
+    expect(failed).toContain("read selectively");
+    expect(await call("ssh_task_list")).toContain(taskScope(failed).task_id);
+  }, 15000);
+
+  test("concurrent queries show a running command's latest tail and its final archive stays complete", async () => {
+    const body = "first line\n" + "repeated log line\n".repeat(10000) + "last stdout line\n";
+    const warning = "警告：阶段一结束\n";
+    const release = join(fixture.workspace, "release-tail-test");
+    await writeFile(join(fixture.workspace, "tail-test-input"), body);
+    const command = "cat tail-test-input; printf '警告：阶段一结束\\n' >&2; " +
+      "while [ ! -f release-tail-test ]; do sleep 0.05; done; printf 'final line\\n'";
+    const initial = await call("ssh_bash", { connection_id: dev, command, run_in_background: true });
+    const scope = taskScope(initial);
+    try {
+      const path = logPath(initial);
+      const minimumSize = Buffer.byteLength(`Command:\n${command}\n\nOutput:\n` + body + warning);
+      const deadline = Date.now() + 5000;
+      while ((await stat(path)).size < minimumSize) {
+        if (Date.now() > deadline) throw new Error("Large command did not reach its first checkpoint");
+        await delay(10);
+      }
+      const query = () => call("ssh_task_output", { ...scope, wait_seconds: 0 });
+      const [first, second] = await Promise.all([query(), query()]);
+      expect(second).toBe(first);
+      expect(first).toContain("last stdout line");
+      expect(first).toContain("stderr:\n" + warning);
+      expect(first).not.toContain("first line\n");
+      expect(await call("ssh_task_list", { connection_id: dev })).not.toContain(scope.task_id);
+    } finally {
+      await writeFile(release, "");
+    }
+    const done = await call("ssh_task_output", { ...scope, wait_seconds: 5 });
+    expect(done).toContain("final line");
+    expect(done).toContain("Exit code: 0");
+    const archive = await logOutput(done);
+    // Readiness across stdout and stderr can interleave. Both streams must be kept in full.
+    expect(archive.replace(warning, "")).toBe(body + "final line\n");
+    expect(archive).toContain(warning);
   }, 15000);
 
   test("configured output limits stop commands without silently dropping or evicting retained logs", async () => {

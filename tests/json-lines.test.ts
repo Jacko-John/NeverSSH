@@ -29,6 +29,16 @@ test("rejects a complete oversized record before delivering it", () => {
   expect(received).toEqual([]);
 });
 
+test("checks the combined fragments when a later chunk finishes the record", () => {
+  const records = new JsonLines(3);
+  const received: unknown[] = [];
+  const receive = (record: unknown) => received.push(record);
+  records.push("12", receive);
+  records.push("3\n45", receive);
+  expect(() => records.push("67\n", receive)).toThrow("size limit");
+  expect(received).toEqual([123]);
+});
+
 test("rejects an unfinished oversized record even without a newline", () => {
   const records = new JsonLines(2);
   records.push("10", () => {});
@@ -40,4 +50,6 @@ test("delivers earlier valid records before reporting malformed JSON", () => {
   const received: unknown[] = [];
   expect(() => records.push('1\ninvalid\n2\n', (record) => received.push(record))).toThrow();
   expect(received).toEqual([1]);
+  records.push("", (record) => received.push(record));
+  expect(received).toEqual([1, 2]);
 });

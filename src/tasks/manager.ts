@@ -1,22 +1,18 @@
 /** Own remote Bash lifetimes and a bounded tail preview; full output lives in remote archives. */
 import { EventEmitter } from "node:events";
-import { StringDecoder } from "node:string_decoder";
 import { z } from "zod";
 import type { RemoteChannel } from "../ssh/request-channel";
-import { checkAbort, ToolError } from "../errors";
+import { bounded, checkAbort, ToolError } from "../errors";
 import { ShortIds } from "../ids";
 import { JsonLines } from "../ssh/json-lines";
 import type { SshTransport } from "../ssh/transport";
 import { showsSearchText, viewedFile, type FileView } from "./file-view";
+import { outputEvent, tailEvent, TaskPreview, type PreviewChunk } from "./preview";
 
-const PREVIEW_BYTES = 65536;
-const PREVIEW_CHUNKS = 4096;
 const MAX_ACTIVE_TASKS = 4;
 const MAX_RETAINED_TASKS = 256;
 const RETENTION_MS = 14 * 24 * 60 * 60_000;
 
-type Stream = "stdout" | "stderr";
-type Preview = { stream: Stream; text: string };
 type Reason = "cancelled" | "connection_closed" | "connection_lost" | "failed" | "output_limit" | "output_error";
 const viewedRevision = z.object({
   path: z.string().startsWith("/"), requestPath: z.string().startsWith("/"), sha256: z.string().regex(/^[a-f0-9]{64}$/),
@@ -27,9 +23,7 @@ const viewedRevision = z.object({
 const helperEvent = z.union([
   z.object({ event: z.literal("started"), pid: z.number().int().positive(), cwd: z.string(),
     outputFile: z.string().startsWith("/"), outputBytes: z.number().int().positive() }),
-  z.object({ event: z.literal("output"), stream: z.enum(["stdout", "stderr"]),
-    base64: z.string().max(21848).regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/),
-    outputBytes: z.number().int().nonnegative() }),
+  outputEvent, tailEvent, z.object({ event: z.literal("progress"), outputBytes: z.number().int().nonnegative() }),
   z.object({ event: z.literal("exit"), exitCode: z.number().int(), outputBytes: z.number().int().nonnegative(),
     outputComplete: z.boolean(), message: z.string().nullish(), viewedFile: viewedRevision.nullish(),
     reason: z.enum(["cancelled", "disconnected", "failed", "output_limit", "output_error"]).nullish() }),
@@ -41,27 +35,24 @@ export type TaskSummary = {
   task_id: string;
   finished: boolean;
   exit_code: number | null;
-  reason?: TaskResult["reason"];
+  reason?: Reason | undefined;
   stop_requested: boolean;
   output_file: string;
   output_bytes: number;
 };
 
-export type TaskResult = {
-  connection_id: string;
-  task_id: string;
-  finished: boolean;
-  exit_code: number | null;
-  reason?: Reason;
+export type TaskResult = TaskSummary & {
   message?: string | undefined;
-  stop_requested: boolean;
-  output_file: string;
-  output_bytes: number;
   size_known: boolean;
   output_complete: boolean;
   preview_complete: boolean;
-  preview: Preview[];
+  preview: PreviewChunk[];
 };
+
+/** A final, known exit with all archived program output present in the preview. */
+export function hasCompleteResult(result: TaskResult): boolean {
+  return result.finished && result.exit_code !== null && result.size_known && result.output_complete && result.preview_complete;
+}
 
 type Task = {
   id: string;
@@ -70,9 +61,9 @@ type Task = {
   outputFile: string;
   outputBytes: number;
   outputComplete: boolean;
-  preview: Preview[];
-  previewBytes: number;
-  previewComplete: boolean;
+  preview: TaskPreview;
+  onDemand: boolean;
+  pendingPreview?: { id: number; promise: Promise<TaskResult>; resolve: (value: TaskResult) => void };
   readBytes: number;
   viewObservation: number;
   view: FileView | undefined;
@@ -90,6 +81,7 @@ type Task = {
 export class TaskManager {
   private readonly tasks = new Map<string, Task>();
   private readonly ids = new ShortIds();
+  private previewSequence = 0;
   private closed = false;
 
   constructor(private readonly ssh: Pick<SshTransport, "open" | "cwd">) {}
@@ -103,22 +95,12 @@ export class TaskManager {
 
   /** Preserve all active tasks; evict completed local previews without touching remote logs. */
   private prune(): void {
+    const expiredBefore = Date.now() - RETENTION_MS;
     for (const task of this.tasks.values()) {
       if (task.finishedAt !== undefined &&
-          (Date.now() - task.finishedAt >= RETENTION_MS || this.tasks.size >= MAX_RETAINED_TASKS)) {
+          (task.finishedAt <= expiredBefore || this.tasks.size >= MAX_RETAINED_TASKS)) {
         this.tasks.delete(task.id);
       }
-    }
-  }
-
-  /** Bound both preview bytes and allocation count, retaining the newest complete chunks. */
-  private append(task: Task, stream: Stream, text: string): void {
-    if (!text) return;
-    task.preview.push({ stream, text });
-    task.previewBytes += Buffer.byteLength(text);
-    while (task.preview.length && (task.previewBytes > PREVIEW_BYTES || task.preview.length > PREVIEW_CHUNKS)) {
-      task.previewBytes -= Buffer.byteLength(task.preview.shift()!.text);
-      task.previewComplete = false;
     }
   }
 
@@ -126,8 +108,11 @@ export class TaskManager {
   async start(connectionId: string, command: string, cwd?: string, signal?: AbortSignal, viewObservation = 0, attempt = 0): Promise<string> {
     checkAbort(signal);
     if (this.closed) throw new ToolError("CONNECTION_LOST", "Task manager is closed");
-    const active = [...this.tasks.values()].filter((task) => task.connectionId === connectionId && task.finishedAt === undefined);
-    if (active.length >= MAX_ACTIVE_TASKS) {
+    let active = 0;
+    for (const task of this.tasks.values()) {
+      if (task.connectionId === connectionId && task.finishedAt === undefined) active++;
+    }
+    if (active >= MAX_ACTIVE_TASKS) {
       throw new ToolError("TASK_LIMIT_REACHED", "Four commands are already active on this connection; wait for or stop one first");
     }
     this.prune();
@@ -135,7 +120,7 @@ export class TaskManager {
     const view = viewedFile(command, this.ssh.cwd(connectionId));
     const task: Task = {
       id: `task_${this.ids.next()}`, connectionId, outputFile: "", outputBytes: 0, outputComplete: true,
-      preview: [], previewBytes: 0, previewComplete: true, readBytes: 0, viewObservation, started: false, exitCode: null,
+      preview: new TaskPreview(), onDemand: false, readBytes: 0, viewObservation, started: false, exitCode: null,
       stopRequested: false, changed: new EventEmitter(), view,
     };
     this.tasks.set(task.id, task);
@@ -159,9 +144,9 @@ export class TaskManager {
   private attach(task: Task, channel: RemoteChannel, signal?: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
       const records = new JsonLines(131072);
-      const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
       let terminal = false;
       let broken = false;
+      let startupError: { code: string; message: string } | undefined;
       let diagnostics = "";
       const cleanupStart = () => {
         clearTimeout(timer);
@@ -178,12 +163,12 @@ export class TaskManager {
         task.changed.emit("change");
       };
       const abort = () => {
-        channel.cancel();
         fail("Command start cancelled; inspect remote state before retrying", "failed", "OPERATION_CANCELLED");
+        channel.cancel();
       };
       const timer = setTimeout(() => {
-        channel.cancel();
         fail("Remote command did not confirm startup within 15 seconds; inspect remote state before retrying");
+        channel.cancel();
       }, 15000);
       signal?.addEventListener("abort", abort, { once: true });
       if (signal?.aborted) abort();
@@ -193,27 +178,35 @@ export class TaskManager {
         try {
           records.push(chunk, (record) => {
             if (broken) return;
+            if (startupError || terminal) throw new Error("Unexpected helper event after a terminal record");
             const event = helperEvent.parse(record);
             if ("ok" in event) {
-              fail(event.error.message, "failed", event.error.code);
-              channel.cancel();
+              if (task.started) {
+                fail(event.error.message, "failed", event.error.code);
+                channel.cancel();
+              } else {
+                // The helper has reported an error and is exiting. Let the worker reap it
+                // before a client can close the connection or retry an archive collision.
+                startupError = event.error;
+              }
               return;
             }
-            if (event.event === "started" && !task.started && !terminal) {
+            if (event.event === "started" && !task.started) {
               task.started = true;
               task.outputFile = event.outputFile;
-              task.outputBytes = event.outputBytes;
+              task.preview.through = task.outputBytes = event.outputBytes;
               cleanupStart();
               resolve();
-            } else if (event.event === "output" && task.started && !terminal) {
-              const bytes = Buffer.from(event.base64, "base64");
-              if (bytes.length > 16384 || event.outputBytes !== task.outputBytes + bytes.length) {
-                throw new Error("Malformed output byte count");
-              }
-              const stream: Stream = event.stream;
+            } else if (event.event === "output" && task.started && !task.onDemand) {
+              task.preview.output(event);
               task.outputBytes = event.outputBytes;
-              this.append(task, stream, decoders[stream].write(bytes));
-            } else if (event.event === "exit" && task.started && !terminal) {
+            } else if ((event.event === "progress" || event.event === "tail") && task.started) {
+              if (event.outputBytes < task.outputBytes) throw new Error("Malformed output byte count");
+              task.onDemand = true;
+              if (event.event === "tail") task.preview.tail(event);
+              task.outputBytes = event.outputBytes;
+              if (event.event === "tail" && event.requestId !== undefined) this.deliverPreview(task, event.requestId);
+            } else if (event.event === "exit" && task.started) {
               if (event.outputBytes < task.outputBytes) {
                 throw new Error("Malformed task exit event");
               }
@@ -221,11 +214,10 @@ export class TaskManager {
               task.exitCode = event.exitCode;
               task.reason = event.reason === "disconnected" ? "connection_closed" : event.reason ?? undefined;
               task.message = typeof event.message === "string" ? event.message : undefined;
-              if (event.outputBytes > task.outputBytes) task.previewComplete = false;
               task.outputBytes = event.outputBytes;
               task.outputComplete = event.outputComplete;
+              task.onDemand = false;
               if (event.viewedFile) task.viewedFile = event.viewedFile;
-              channel.stdin.end();
             } else {
               throw new Error("Unexpected helper event");
             }
@@ -238,13 +230,22 @@ export class TaskManager {
       channel.once("error", (error) => { fail(error.message); channel.cancel(); });
       channel.once("close", (code: number) => {
         cleanupStart();
-        for (const stream of ["stdout", "stderr"] as const) this.append(task, stream, decoders[stream].end());
+        task.preview.finish();
         if (!terminal && !broken) {
-          fail(`SSH channel closed without a command result: ${diagnostics.trim() || `exit ${code}`}. Inspect remote state before retrying.`,
-            code === 255 ? "connection_lost" : "failed");
+          // A collision can be retried only when the helper also exits with its reserved pre-start status.
+          if (startupError && (code === 2 || (code === 1 && startupError.code !== "TASK_ID_EXISTS"))) {
+            fail(startupError.message, "failed", startupError.code);
+          } else {
+            const detail = startupError ? `${startupError.code}: ${startupError.message} (helper exit ${code})` : diagnostics.trim() || `exit ${code}`;
+            fail(`SSH channel closed without a command result: ${detail}. Inspect remote state before retrying.`,
+              code === 255 ? "connection_lost" : "failed");
+          }
         }
         if (!terminal) task.exitCode = null;
         task.finishedAt = Date.now();
+        // Retained previews do not need the closed streams or the worker that owned them.
+        delete task.channel;
+        this.deliverPreview(task);
         task.changed.emit("change");
       });
     });
@@ -257,19 +258,21 @@ export class TaskManager {
     const revision = task.viewedFile;
     if (!revision || !task.view) return;
     delete task.viewedFile;
-    const stdout = result.preview.filter((chunk) => chunk.stream === "stdout").map((chunk) => chunk.text).join("");
     if (task.view.search) {
+      let stdout = "";
+      for (const chunk of result.preview) if (chunk.stream === "stdout") stdout += chunk.text;
       if (!showsSearchText(task.view, stdout, revision.hasNul, !result.preview_complete)) return;
-    } else if (!result.preview_complete || !stdout) return;
+    } else if (!result.preview_complete || !result.preview.some(chunk => chunk.stream === "stdout" && chunk.text.length > 0)) return;
     return { ...revision, observation: task.viewObservation };
   }
 
-  /** List tasks with output not yet consumed by ssh_task_output, active first. */
+  /** List tasks with unread output, active first. */
   list(connectionId?: string): TaskSummary[] {
     this.prune();
-    const tasks = [...this.tasks.values()]
-      .filter((task) => connectionId === undefined || task.connectionId === connectionId)
-      .filter((task) => task.outputBytes > task.readBytes);
+    const tasks: Task[] = [];
+    for (const task of this.tasks.values()) {
+      if (task.outputBytes > task.readBytes && (connectionId === undefined || task.connectionId === connectionId)) tasks.push(task);
+    }
     tasks.sort((left, right) => {
       const leftFinished = left.finishedAt === undefined ? 0 : 1;
       const rightFinished = right.finishedAt === undefined ? 0 : 1;
@@ -296,8 +299,34 @@ export class TaskManager {
       ...(task.reason ? { reason: task.reason } : {}), ...(task.message ? { message: task.message } : {}),
       stop_requested: task.stopRequested, output_file: task.outputFile, output_bytes: task.outputBytes,
       size_known: sizeKnown, output_complete: task.outputComplete,
-      preview_complete: task.previewComplete && sizeKnown, preview: task.preview.slice(),
+      preview_complete: task.preview.complete && task.preview.through === task.outputBytes && sizeKnown,
+      preview: task.preview.chunks.slice(),
     };
+  }
+
+  private deliverPreview(task: Task, id?: number): void {
+    if (task.pendingPreview && (id === undefined || task.pendingPreview.id === id)) {
+      task.pendingPreview.resolve(this.snapshot(task.id));
+      delete task.pendingPreview;
+    }
+  }
+
+  /** Concurrent readers share a snapshot. Each marks only the bytes at that checkpoint. */
+  private async currentPreview(task: Task, signal?: AbortSignal): Promise<TaskResult> {
+    checkAbort(signal);
+    if (!task.channel || !task.onDemand) return this.snapshot(task.id);
+    const message = "Timed out waiting for task preview: " + task.id;
+    let pending = task.pendingPreview;
+    if (!pending) {
+      const id = ++this.previewSequence;
+      const { promise, resolve } = Promise.withResolvers<TaskResult>();
+      const reply = bounded(promise, 5000, "TASK_PREVIEW_TIMEOUT", message).finally(() => {
+        if (task.pendingPreview?.id === id) delete task.pendingPreview;
+      });
+      task.pendingPreview = pending = { id, promise: reply, resolve };
+      task.channel.requestPreview(id);
+    }
+    return signal ? bounded(pending.promise, 5000, "TASK_PREVIEW_TIMEOUT", message, signal) : pending.promise;
   }
 
   /** Wait for closure, not merely the next output chunk; the budget never restarts on output. */
@@ -326,27 +355,27 @@ export class TaskManager {
     const id = await this.start(connectionId, command, cwd, signal, viewObservation);
     try {
       await this.wait(this.get(id), waitMs, signal);
-      const task = this.get(id);
-      const result = this.snapshot(id);
-      // The inline result contains the full output only for a successful, fully previewed command.
-      if (result.finished && result.reason === undefined && result.exit_code === 0 &&
-          result.preview_complete && result.output_complete && result.size_known) {
-        task.readBytes = task.outputBytes;
-      }
-      return result;
-    } catch (error) {
+      checkAbort(signal);
+    } catch {
       await this.stop(id);
       const task = this.get(id);
       throw new ToolError("OPERATION_CANCELLED", `Bash call cancelled; stop requested for ${id}. Retained log: ${task.outputFile}`);
     }
+    return this.snapshot(id);
+  }
+
+  /** Acknowledge only the bytes in this response, even if another snapshot has arrived. */
+  markRead(result: TaskResult): void {
+    const task = this.tasks.get(result.task_id);
+    if (task) task.readBytes = Math.max(task.readBytes, result.output_bytes);
   }
 
   /** Interrupting a later query leaves its already reported command running. */
   async output(taskId: string, waitMs = 30000, signal?: AbortSignal): Promise<TaskResult> {
     const task = this.get(taskId);
     await this.wait(task, waitMs, signal);
-    const result = this.snapshot(taskId);
-    task.readBytes = task.outputBytes;
+    const result = await this.currentPreview(task, signal);
+    this.markRead(result);
     return result;
   }
 
@@ -355,7 +384,7 @@ export class TaskManager {
     const task = this.get(taskId);
     if (task.finishedAt === undefined && task.channel) {
       task.stopRequested = true;
-      task.channel.stdin.write(JSON.stringify({ action: "stop" }) + "\n");
+      task.channel.stopCommand();
       await this.wait(task, 4000);
       if (task.finishedAt === undefined) task.channel.cancel();
     }

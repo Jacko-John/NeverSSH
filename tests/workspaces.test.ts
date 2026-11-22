@@ -10,9 +10,11 @@ import { createServer } from "../src/mcp/server";
 import * as operationText from "../src/mcp/operation-text";
 import { Runtime } from "../src/runtime";
 import type { RemoteResult } from "../src/ssh/request-channel";
+import { WaitBudget } from "../src/ssh/wait-queue";
 import { WorkspaceManager } from "../src/workspaces/manager";
+import { MAX_KNOWN_RULES } from "../src/workspaces/rules";
 import { contextText } from "../src/workspaces/text";
-import type { Instruction } from "../src/workspaces/types";
+import type { Instruction, RuleAcknowledgment } from "../src/workspaces/types";
 import { SshFixture } from "./fixture";
 
 const fixture = new SshFixture();
@@ -36,10 +38,18 @@ async function call(name: string, args: Record<string, unknown>, error = false):
 }
 
 /** Read the acknowledgement from the review the client actually received. */
-function acknowledgement(review: string): { workspace_rules_ack: string } {
-  const match = /^workspace_rules_ack: ([a-f0-9]{64})$/m.exec(review);
-  expect(match, review.slice(0, 2048)).not.toBeNull();
-  return { workspace_rules_ack: match![1]! };
+function acknowledgement(review: string): { workspace_rules_ack: RuleAcknowledgment } {
+  const array = /^"workspace_rules_ack": (\[.*\])$/m.exec(review);
+  if (array) {
+    const tokens: unknown = JSON.parse(array[1]!);
+    if (!Array.isArray(tokens) || !tokens.length || !tokens.every(token => typeof token === "string" && /^[a-f0-9]{64}$/.test(token))) {
+      throw new Error("Expected an array of rule receipts");
+    }
+    return { workspace_rules_ack: tokens };
+  }
+  const single = /^workspace_rules_ack: ([a-f0-9]{64})$/m.exec(review);
+  expect(single, review.slice(0, 2048)).not.toBeNull();
+  return { workspace_rules_ack: single![1]! };
 }
 
 async function pausedAccess(peer: Client, name: "ssh_read_file" | "ssh_download", args: Record<string, unknown>, guidance: string): Promise<string> {
@@ -76,8 +86,8 @@ async function project(files: Record<string, string>): Promise<string> {
   return root;
 }
 
-async function open(root: string): Promise<{ id: string; text: string }> {
-  const text = await call("ssh_workspace_open", { connection_id: connectionId, path: root });
+async function open(root: string, reset = false): Promise<{ id: string; text: string }> {
+  const text = await call("ssh_workspace_open", { connection_id: connectionId, path: root, ...(reset && { reread_rules: true }) });
   return { id: workspaceId(text), text };
 }
 
@@ -161,10 +171,10 @@ describe("workspace context and instruction delivery", () => {
     expect(opened.text).toContain("git status --short -- .");
   });
 
-  test("creating a new file first returns newly applicable root-to-leaf instructions", async () => {
-    const root = await project({ "AGENTS.md": "Root rule.\n", "backend/AGENTS.md": "Backend rule.\n",
+  test("a single-code client reviews root-to-leaf rules and creates its file on the first retry", async () => {
+    const root = await project({ "AGENTS.md": "Root rule.\n", "README.md": "readme", "backend/AGENTS.md": "Backend rule.\n",
       "backend/api/AGENTS.md": "API rule.\n", "frontend/AGENTS.md": "Frontend-only rule.\n" });
-    const { id } = await open(root);
+    const { id, text } = await open(root);
     const file_path = "backend/api/new/deep/file.txt";
     const response = await client.callTool({ name: "ssh_write_file", arguments: { workspace_id: id, file_path, content: "new file\n" } });
     expect(response.isError).toBe(true);
@@ -178,14 +188,24 @@ describe("workspace context and instruction delivery", () => {
     expect(written.indexOf("Root rule.")).toBeLessThan(written.indexOf("Backend rule."));
     expect(written).not.toContain("Frontend-only rule.");
     expect(await stat(join(root, "backend/api/new")).catch(() => null)).toBeNull();
+    // A v0.7.0 client reads one 64-character value from the first response block.
+    const firstBlock = result?.type === "text" ? result.text : "";
+    const legacy = /^workspace_rules_ack: ([a-f0-9]{64})$/m.exec(firstBlock);
+    expect(legacy).not.toBeNull();
+    const prefix = "workspace_rules_ack: ";
+    const firstField = firstBlock.split("\n").find(line => line.startsWith(prefix));
+    expect(firstField?.slice(prefix.length)).toBe(legacy![1]!);
+    expect(await call("ssh_read_file", { workspace_id: id, file_path: "README.md", ...acknowledgement(text) })).toEndWith("\treadme");
     const repeated = await call("ssh_write_file", { workspace_id: id, file_path, content: "new file\n",
-      ...acknowledgement(result?.type === "text" ? result.text : "") });
+      workspace_rules_ack: legacy![1]! });
     expect(repeated).not.toContain("Backend rule.");
     expect(repeated).not.toContain("API rule.");
     expect(await readFile(join(root, file_path), "utf8")).toBe("new file\n");
+    await writeFile(join(root, "backend/api/AGENTS.md"), "Revised API rule.\n");
+    await pausedAccess(client, "ssh_read_file", { workspace_id: id, file_path, workspace_rules_ack: legacy![1]! }, "Revised API rule.");
   });
 
-  test("new nested rules pause reads before recording a revision and reopening resets their delivery", async () => {
+  test("new nested rules pause reads before recording a revision and explicit recovery resets confirmations", async () => {
     const root = await project({ "AGENTS.md": "Root rule.\n", "src/AGENTS.md": "Nested rule.\n", "src/value.txt": "before\n" });
     const original = await open(root);
     const args = { workspace_id: original.id, file_path: "src/value.txt" };
@@ -203,7 +223,7 @@ describe("workspace context and instruction delivery", () => {
     expect(await call("ssh_read_file", { ...args, ...acknowledgement(retry) })).toBe("     1\tbefore");
     await call("ssh_edit_file", edit);
     expect(await readFile(join(root, "src/value.txt"), "utf8")).toBe("after\n");
-    const reopened = await open(root);
+    const reopened = await open(root, true);
     expect(reopened.id).toBe(original.id);
     expect(reopened.text).not.toContain("Nested rule.");
     const write = { workspace_id: reopened.id, file_path: "src/new.txt", content: "new\n" };
@@ -233,16 +253,161 @@ describe("workspace context and instruction delivery", () => {
     expect(second.content).toEqual([{ type: "image", data: base64, mimeType: "image/png" }]);
   });
 
-  test("a review for one target cannot confirm a sibling target before acknowledgement", async () => {
+  test("one open receipt covers parallel reads and a partially covered scope asks only for its extra rules", async () => {
+    const root = await project({ "AGENTS.md": "Root guidance.\n", "a": "a", "b": "b", "c": "c",
+      "docs/AGENTS.md": "Docs guidance.\n", "docs/page": "page" });
+    const opened = await open(root);
+    const ack = acknowledgement(opened.text);
+    const read = (file_path: string) => ({ workspace_id: opened.id, file_path });
+    // Discarding open's guidance still prevents a bare request from accessing the file.
+    const bare = await pausedAccess(client, "ssh_read_file", read("a"), "Root guidance.");
+    expect(bare).toContain("initial confirmation");
+    expect(acknowledgement(bare)).toEqual(ack);
+    const extra = await pausedAccess(client, "ssh_read_file", { ...read("docs/page"), ...ack }, "Docs guidance.");
+    expect(extra).not.toContain("Root guidance.");
+    expect(await call("ssh_read_file", { ...read("docs/page"), ...acknowledgement(extra) })).toEndWith("\tpage");
+    const recovered = await open(root, true);
+    const results = await Promise.all(["a", "b", "c"].map((path) =>
+      call("ssh_read_file", { ...read(path), ...acknowledgement(recovered.text) })));
+    expect(results).toEqual(["     1\ta", "     1\tb", "     1\tc"]);
+  });
+
+  test("a conditional read cannot reuse a confirmation after a rule changes back to its old text", async () => {
+    const root = await project({ "AGENTS.md": "Version A\n", "data.txt": "contents\n" });
+    const opened = await open(root);
+    const args = { workspace_id: opened.id, file_path: "data.txt" };
+    const a = acknowledgement(opened.text);
+    expect(await call("ssh_read_file", { ...args, ...a })).toContain("contents");
+    expect(await call("ssh_read_file", args)).toContain("contents");
+    await writeFile(join(root, "AGENTS.md"), "Version B\n");
+    await pausedAccess(client, "ssh_read_file", args, "Version B");
+    await writeFile(join(root, "AGENTS.md"), "Version A\n");
+    const review = await pausedAccess(client, "ssh_read_file", { ...args, ...a }, "Version A");
+    expect(acknowledgement(review)).not.toEqual(a);
+    expect(await call("ssh_read_file", { ...args, ...acknowledgement(review) })).toContain("contents");
+  });
+
+  test("workspace inspections and worker admission share the connection's 64 waiting slots", async () => {
+    const root = await project({ value: "one file" });
+    const runtime = new Runtime(fixture.config);
+    const existing = new Set(fixture.commands);
+    const workers = new AbortController();
+    const inspections = new AbortController();
+    try {
+      const id = (await runtime.ssh.connect({ host: "fixture" })).connection_id as string;
+      const remote = [...fixture.commands].find(worker => !existing.has(worker))!;
+      const opened = await runtime.workspaces.open(id, root, []);
+      const scope = { workspace_id: opened.workspace_id };
+      const path = join(root, "value");
+      const read = { args: { requestedPath: path }, observe: () => 1 };
+      expect(runtime.workspaces.reviewGuidance(await runtime.workspaces.prepare(scope, path, undefined, read))).toBeUndefined();
+
+      // Hold real worker replies while a conditional read and seven ordinary reads occupy all slots.
+      remote.stdout.pause();
+      try {
+        const hot = runtime.workspaces.prepare(scope, path, undefined, read);
+        await Promise.all(Array.from({ length: 7 }, () => runtime.ssh.open(id, "stat", { path })));
+        const queuedWorkers = Promise.allSettled(Array.from({ length: 32 }, () =>
+          runtime.ssh.open(id, "stat", { path }, undefined, workers.signal)));
+        const queuedInspections = Promise.allSettled(Array.from({ length: 32 }, () =>
+          runtime.workspaces.prepare(scope, path, inspections.signal)));
+        await expect(runtime.ssh.open(id, "stat", { path })).rejects.toMatchObject({ code: "CONNECTION_BUSY" });
+        await expect(runtime.workspaces.prepare(scope, path)).rejects.toMatchObject({ code: "CONNECTION_BUSY" });
+        workers.abort();
+        expect((await queuedWorkers).every(outcome => outcome.status === "rejected" && outcome.reason.code === "OPERATION_CANCELLED")).toBe(true);
+        const moved = Promise.allSettled(Array.from({ length: 32 }, () =>
+          runtime.workspaces.prepare(scope, path, inspections.signal)));
+        await expect(runtime.ssh.open(id, "stat", { path })).rejects.toMatchObject({ code: "CONNECTION_BUSY" });
+        inspections.abort();
+        expect([...(await moved), ...(await queuedInspections)].every(outcome =>
+          outcome.status === "rejected" && outcome.reason.code === "OPERATION_CANCELLED")).toBe(true);
+        remote.stdout.resume();
+        expect((await hot).file?.value.content).toBe("one file");
+      } finally { remote.stdout.resume(); }
+    } finally {
+      workers.abort();
+      inspections.abort();
+      await runtime.close();
+    }
+  }, 10000);
+
+  test("open and Bash receipts can be combined and never confirm a rule omitted from those responses", async () => {
+    const root = await project({ "AGENTS.md": "Root guidance.\n", "docs/AGENTS.md": "Docs guidance.\n", "docs/page": "page" });
+    const first = await open(root);
+    const read = { workspace_id: first.id, file_path: "docs/page" };
+    const bash = { workspace_id: first.id, cwd: "docs", command: "printf ok" };
+    const docs = await call("ssh_bash", bash);
+    expect(docs).toContain("Docs guidance.");
+    expect(docs).not.toContain("Root guidance.");
+    const missing = await pausedAccess(client, "ssh_read_file", { ...read, ...acknowledgement(docs) }, "Root guidance.");
+    expect(missing).not.toContain("Docs guidance.");
+    const reset = await open(root, true);
+    const current = await call("ssh_bash", bash);
+    const receipts = [reset.text, current].flatMap(text => acknowledgement(text).workspace_rules_ack);
+    expect(await call("ssh_read_file", { ...read, workspace_rules_ack: receipts })).toBe("     1\tpage");
+  });
+
+  test("a multi-rule response can confirm a root file and later confirm its subdirectory", async () => {
+    const root = await project({ "AGENTS.md": "Project rule.\n", "README.md": "readme",
+      "docs/AGENTS.md": "Docs rule.\n", "docs/guide.md": "guide" });
+    const opened = await open(root);
+    const read = (file_path: string) => ({ workspace_id: opened.id, file_path });
+    const guide = read("docs/guide.md");
+    const first = await pausedAccess(client, "ssh_read_file", guide, "Docs rule.");
+    const ack = acknowledgement(first);
+    expect(Array.isArray(ack.workspace_rules_ack)).toBe(true);
+    expect(ack.workspace_rules_ack).toHaveLength(2);
+    expect(ack.workspace_rules_ack).toEqual(expect.arrayContaining([acknowledgement(opened.text).workspace_rules_ack]));
+    expect(await call("ssh_read_file", { ...read("README.md"), ...ack })).toEndWith("\treadme");
+    const outstanding = await pausedAccess(client, "ssh_read_file", guide, "Docs rule.");
+    expect(outstanding).not.toContain("Project rule.");
+    expect(await call("ssh_read_file", { ...guide, ...ack })).toEndWith("\tguide");
+  });
+
+  test("a late command keeps its output without redisplaying superseded instructions", async () => {
+    const root = await project({ "docs/AGENTS.md": "Use title case.\n", "docs/page": "page" });
+    const { id } = await open(root);
+    const bash = { workspace_id: id, cwd: "docs" };
+    const started = join(root, "docs/started");
+    const release = join(root, "docs/release");
+    const slow = call("ssh_bash", { ...bash,
+      command: "touch started; while [ ! -f release ]; do sleep 0.01; done; printf finished" });
+    try {
+      const deadline = Date.now() + 5000;
+      while (!(await Bun.file(started).exists()) && Date.now() < deadline) await Bun.sleep(10);
+      expect(await Bun.file(started).exists()).toBe(true);
+      await writeFile(join(root, "docs/AGENTS.md"), "Use sentence case.\n");
+      const read = { workspace_id: id, file_path: "docs/page" };
+      const updated = await pausedAccess(client, "ssh_read_file", read, "Use sentence case.");
+      expect(await call("ssh_read_file", { ...read, ...acknowledgement(updated) })).toEndWith("\tpage");
+    } finally {
+      await writeFile(release, "ready");
+    }
+    expect(await slow).toBe("finished");
+    expect(await call("ssh_bash", { ...bash, command: "printf done" })).toBe("done");
+  }, 15000);
+
+  test("line ending changes retain the receipt, and clearing an active rule reports its removal once", async () => {
+    const root = await project({ "AGENTS.md": "Root guidance.\n", "docs/AGENTS.md": "   \n", "docs/page": "page" });
+    const opened = await open(root);
+    const read = { workspace_id: opened.id, file_path: "docs/page" };
+    await writeFile(join(root, "AGENTS.md"), "Root guidance.\r\n");
+    expect(await call("ssh_read_file", { ...read, ...acknowledgement(opened.text) })).toEndWith("\tpage");
+    await writeFile(join(root, "AGENTS.md"), "\r\n");
+    const removed = await open(root);
+    expect(removed.text).toContain("Project instructions removed:");
+    expect(await call("ssh_read_file", { ...read, ...acknowledgement(removed.text) })).toEndWith("\tpage");
+    expect(await call("ssh_read_file", read)).toEndWith("\tpage");
+  });
+
+  test("a receipt from one file confirms the same rule on a sibling download", async () => {
     const root = await project({ "src/AGENTS.md": "Review the source directory.\n", "src/one": "first", "src/two": "second" });
     const { id } = await open(root);
     const one = { workspace_id: id, file_path: "src/one" };
     const two = { workspace_id: id, file_path: "src/two" };
     const first = await pausedAccess(client, "ssh_read_file", one, "Review the source directory.");
-    const sibling = await pausedAccess(client, "ssh_read_file", { ...two, ...acknowledgement(first) }, "Review the source directory.");
-    expect(sibling).not.toContain("     1\tsecond");
     const localPath = join(fixture.transfers, "sibling-acknowledged.txt");
-    await call("ssh_download", { workspace_id: id, remotePath: two.file_path, localPath, ...acknowledgement(sibling) });
+    await call("ssh_download", { workspace_id: id, remotePath: two.file_path, localPath, ...acknowledgement(first) });
     expect(await readFile(localPath, "utf8")).toBe("second");
     expect(await call("ssh_read_file", one)).toBe("     1\tfirst");
   });
@@ -261,13 +426,15 @@ describe("workspace context and instruction delivery", () => {
     expect(reopened.text).toContain("Root rule.\n");
     expect(reopened.text).not.toContain("Nested rule.\n");
     expect(reopened.text).toContain("Catalog must not repeat on reads.");
-    const recovered = await pausedAccess(client, "ssh_read_file", { ...args, ...acknowledgement(first) }, "Nested rule.\n");
-    expect(recovered).toContain("Root rule.\n");
-    expect(recovered).not.toContain("Catalog must not repeat on reads.");
-    expect(await call("ssh_read_file", { ...args, ...acknowledgement(recovered) })).toBe("     1\tbefore");
+    expect(await call("ssh_read_file", { ...args, ...acknowledgement(first) })).toBe("     1\tbefore");
+    const refreshed = await open(root);
+    expect(refreshed.text).not.toContain("Root rule.\n");
+    expect(refreshed.text).not.toContain("workspace_rules_ack:");
+    expect(await call("ssh_read_file", args)).toBe("     1\tbefore");
 
     await writeFile(join(root, "src/AGENTS.md"), "Changed nested rule.\n");
-    const changed = await pausedAccess(client, "ssh_read_file", { ...args, ...acknowledgement(recovered) }, "Changed nested rule.\n");
+    const changed = await pausedAccess(client, "ssh_read_file", { ...args, ...acknowledgement(first) }, "Changed nested rule.\n");
+    expect(changed).toContain("Previously shown guidance changed.");
     expect(changed).not.toContain("Root rule.\n");
     expect(changed).not.toContain("Nested rule.\n");
 
@@ -365,6 +532,50 @@ describe("workspace context and instruction delivery", () => {
     }
   }, 15000);
 
+  test("workspace revisions follow the dispatch of the file read on both the cold and conditional paths", async () => {
+    const root = await project({ value: "first" });
+    const runtime = new Runtime(fixture.config);
+    const peer = new Client({ name: "workspace-observation-order", version: "1" });
+    try {
+      const [local, remote] = InMemoryTransport.createLinkedPair();
+      await createServer(runtime).connect(remote);
+      await peer.connect(local);
+      const connected = await textCall(peer, "ssh_connect", { host: "fixture" });
+      const connection_id = connected.slice("Connection: ".length);
+      const opened = await textCall(peer, "ssh_workspace_open", { connection_id, path: root });
+      const scoped = { workspace_id: workspaceId(opened), file_path: "value" };
+      const direct = { connection_id, file_path: join(root, "value") };
+      const run = runtime.ssh.run.bind(runtime.ssh);
+      for (const hot of [false, true]) {
+        const captured = Promise.withResolvers<void>();
+        const resume = Promise.withResolvers<void>();
+        const hook = spyOn(runtime.ssh, "run").mockImplementation(async (...request) => {
+          const result = await run(...request);
+          if (request[1] === "workspace_read") {
+            expect(Boolean(request[2]?.condition)).toBe(hot);
+            captured.resolve();
+            await resume.promise;
+          }
+          return result;
+        });
+        try {
+          const delayed = textCall(peer, "ssh_read_file", scoped);
+          await captured.promise;
+          if (hot) await textCall(peer, "ssh_write_file", { ...direct, content: "third" });
+          else {
+            await textCall(peer, "ssh_read_file", direct);
+            await writeFile(direct.file_path, "second");
+          }
+          resume.resolve();
+          const result = await delayed;
+          expect(result).toContain("1\tsecond");
+          expect(result.includes("A later observation recorded different contents")).toBe(hot);
+        } finally { resume.resolve(); hook.mockRestore(); }
+      }
+      await textCall(peer, "ssh_edit_file", { ...direct, old_string: "third", new_string: "verified" });
+    } finally { await peer.close(); await runtime.close(); }
+  }, 15000);
+
   test("image reads check guidance before fetching bytes and give the retried image its full response budget", async () => {
     const root = await project({ "src/AGENTS.md": "图片规则仍需交付。\n", "src/value.txt": "before\n" });
     const runtime = new Runtime(fixture.config);
@@ -381,10 +592,11 @@ describe("workspace context and instruction delivery", () => {
       image.data = "A".repeat(Math.floor((9 * 1024 * 1024 - emptyBytes) / 4) * 4);
       expect(Buffer.byteLength(JSON.stringify({ content: [image] }), "utf8")).toBeLessThanOrEqual(9 * 1024 * 1024);
       const originalRun = runtime.ssh.run.bind(runtime.ssh);
+      let revision = "a".repeat(64);
       const hook = spyOn(runtime.ssh, "run").mockImplementation(async (...request) => {
-        if (request[1] !== "read") return originalRun(...request);
+        if (request[1] !== "read" && !(request[1] === "workspace_read" && request[2]?.condition)) return originalRun(...request);
         return { kind: "image", base64: image.data, mimeType: image.mimeType, path: join(root, "src/value.txt"),
-          size: image.data.length / 4 * 3, sha256: "a".repeat(64) };
+          size: image.data.length / 4 * 3, sha256: revision };
       });
       try {
         const review = await pausedAccess(peer, "ssh_read_file", args, "图片规则仍需交付。\n");
@@ -396,10 +608,14 @@ describe("workspace context and instruction delivery", () => {
         expect(returned?.type).toBe("image");
         expect(returned?.type === "image" ? returned.data.length : 0).toBe(image.data.length);
         image.data += "AAAA";
+        revision = "b".repeat(64);
+        hook.mockClear();
         const rejected = await textCall(peer, "ssh_read_file", args, true);
         expect(rejected).toStartWith("Error: OPERATION_FAILED\n");
         expect(rejected).toContain("9 MiB MCP response budget");
         expect(rejected).not.toContain("图片规则仍需交付。");
+        expect(hook.mock.calls.map(([, op]) => op)).toEqual(["workspace_read"]);
+        expect(runtime.files.get(connected.slice("Connection: ".length), join(root, "src/value.txt"))?.sha256).toBe("a".repeat(64));
       } finally { hook.mockRestore(); }
     } finally {
       await peer.close();
@@ -928,7 +1144,7 @@ describe("remote development lifecycle", () => {
       expect(typeof id).toBe("string");
       if (typeof id !== "string") throw new Error("Missing fixture connection handle");
       const opened = await runtime.workspaces.open(id, root, [".agents/skills"]);
-      const text = contextText(opened);
+      const text = contextText(opened, runtime.workspaces.guidance(opened));
       runtime.workspaces.delivered(opened);
       expect(opened.skills).toHaveLength(128);
       expect(opened.warnings).toEqual([]);
@@ -956,7 +1172,7 @@ describe("remote development lifecycle", () => {
       const connection = await runtime.ssh.connect({ host: "fixture" });
       if (typeof connection.connection_id !== "string") throw new Error("Missing fixture connection handle");
       const opened = await runtime.workspaces.open(connection.connection_id, root, [".agents/skills"]);
-      const text = contextText(opened);
+      const text = contextText(opened, runtime.workspaces.guidance(opened));
       runtime.workspaces.delivered(opened);
       expect(opened.skills).toHaveLength(2);
       expect(text).not.toContain("body body body");
@@ -1011,16 +1227,23 @@ describe("remote development lifecycle", () => {
 /** Model protocol responses without coupling state tests to SSH's private connection representation. */
 class ContextTransport {
   readonly available = new Set(["00000001"]);
+  private readonly budgets = new Map<string, WaitBudget>();
   readonly requests: string[] = [];
   rules: Instruction[] = [];
   skillFiles: { path: string; scope: string; content: string }[] = [];
   malformed = false;
 
-  get(id: string): void {
+  get(id: string): { waitBudget: WaitBudget } {
     if (!this.available.has(id)) throw new ToolError("CONNECTION_NOT_FOUND", "Fixture connection was evicted");
+    let budget = this.budgets.get(id);
+    if (!budget) {
+      budget = new WaitBudget();
+      this.budgets.set(id, budget);
+    }
+    return { waitBudget: budget };
   }
 
-  sessions() { return { sessions: [...this.available].map((connection_id) => ({ connection_id })) }; }
+  isReady(id: string): boolean { return this.available.has(id); }
   cwd(): string { return "/home/fixture"; }
 
   async run(_connectionId: string, operation: string, args: RemoteResult = {}): Promise<RemoteResult> {
@@ -1048,6 +1271,92 @@ function rule(scope: string, content: string): Instruction {
 }
 
 describe("bounded workspace state", () => {
+  test("a dispatched conditional read precedes a reset, and cancelled inspections release their queue slots", async () => {
+    const transport = new ContextTransport();
+    const manager = new WorkspaceManager(transport);
+    transport.rules = [rule("/project", "root A")];
+    const id = "00000001";
+    const opened = await manager.open(id, "/project", []);
+    const receipt = manager.guidance(opened).token!;
+    manager.delivered(opened);
+    const scope = { workspace_id: opened.workspace_id };
+    const path = "/project/value";
+    const read = { args: { requestedPath: "value" }, observe: () => 1 };
+    const condition = "a".repeat(64);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const run = transport.run.bind(transport);
+    const hook = spyOn(transport, "run").mockImplementation(async (id, op, args) => {
+      if (args?.condition) {
+        expect(op).toBe("workspace_read");
+        expect(args.condition).toBe(condition);
+        entered.resolve();
+        await release.promise;
+        return { path, content: "authorized" };
+      }
+      const data = await run(id, op, args);
+      return op === "workspace_read" ? { ...data, read_condition: condition } : data;
+    });
+    try {
+      expect(manager.reviewGuidance(await manager.prepare(scope, path, undefined, read), receipt)).toBeUndefined();
+      const reading = manager.prepare(scope, path, undefined, read);
+      await entered.promise;
+      const controller = new AbortController();
+      const waiters = Array.from({ length: 64 }, () => manager.prepare(scope, path, controller.signal));
+      const outcomes = Promise.allSettled(waiters);
+      await expect(manager.open(id, "/project", [], { rereadRules: true })).rejects.toMatchObject({ code: "CONNECTION_BUSY" });
+      controller.abort();
+      expect((await outcomes).every(outcome => outcome.status === "rejected" && outcome.reason.code === "OPERATION_CANCELLED")).toBe(true);
+      const reset = manager.open(id, "/project", [], { rereadRules: true });
+      expect(hook.mock.calls.some(([, op]) => op === "workspace_open")).toBe(false);
+      release.resolve();
+      expect((await reading).file).toEqual({ value: { path, content: "authorized" }, observation: 1 });
+      manager.delivered(await reset);
+      const afterReset = await manager.prepare(scope, path, undefined, read);
+      expect(afterReset.file).toBeUndefined();
+      expect(manager.reviewGuidance(afterReset, receipt)?.updated).toEqual(transport.rules);
+    } finally {
+      release.resolve();
+      hook.mockRestore();
+    }
+  });
+  test("a delayed rule cache hit uses only the rules offered with that inspection", async () => {
+    const transport = new ContextTransport();
+    const manager = new WorkspaceManager(transport);
+    const root = rule("/project", "Root rule\n".repeat(40));
+    const other = rule("/other", "Other rule\n".repeat(40));
+    transport.rules = [root, other];
+    const run = transport.run.bind(transport);
+    const inspected = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const remote = spyOn(transport, "run").mockImplementation(async (id, operation, args) => {
+      const result = await run(id, operation, args);
+      if (operation === "workspace_open") return result;
+      if (args?.root === "/other") {
+        expect(args.knownRules).toBeUndefined();
+        return result;
+      }
+      inspected.resolve();
+      expect(args?.knownRules).toEqual([root.sha256]);
+      await release.promise;
+      return { ...result, instructions: [{ path: root.path, scope: root.scope, sha256: root.sha256 }] };
+    });
+    try {
+      const opened = await manager.open("00000001", "/project", []);
+      const scope = { workspace_id: opened.workspace_id };
+      const first = manager.prepare(scope, "one");
+      await inspected.promise;
+      const otherWorkspace = await manager.open("00000001", "/other", []);
+      expect(manager.guidance(otherWorkspace).updated).toEqual([other]);
+      release.resolve();
+      expect(manager.reviewGuidance(await first)?.updated).toEqual([root]);
+      expect(manager.reviewGuidance(await manager.prepare({ workspace_id: otherWorkspace.workspace_id }, "two"))?.updated).toEqual([other]);
+    } finally {
+      release.resolve();
+      remote.mockRestore();
+    }
+  });
+
   test("open and Bash can display all rules while files still require an explicit, scoped receipt", async () => {
     const transport = new ContextTransport();
     const manager = new WorkspaceManager(transport);
@@ -1057,30 +1366,31 @@ describe("bounded workspace state", () => {
     const opened = await manager.open("00000001", "/project", []);
     const scope = { workspace_id: opened.workspace_id };
     manager.delivered(opened);
-    const bash = await manager.prepare(scope, "src", undefined, "bash");
+    const bash = await manager.prepare(scope, "src");
     expect(manager.guidance(bash.context!).updated).toEqual([nested]);
     manager.delivered(bash.context!);
     const target = "src/file";
     const file = await manager.prepare(scope, target);
     const review = manager.reviewGuidance(file)!;
     expect(review.updated).toEqual([root, nested]);
-    expect(review.token).toMatch(/^[a-f0-9]{64}$/);
+    expect(Array.isArray(review.token)).toBe(true);
+    expect(review.token).toHaveLength(2);
     manager.delivered(file.context!);
     expect(manager.reviewGuidance(await manager.prepare(scope, target))).toEqual(review);
-    const sibling = manager.reviewGuidance(await manager.prepare(scope, "src/other"), review.token)!;
-    expect(sibling.updated).toEqual([root, nested]);
-    expect(sibling.token).not.toBe(review.token);
+    const sibling = manager.reviewGuidance(await manager.prepare(scope, "src/other"))!;
+    expect(sibling.token).toEqual(review.token);
+    expect(manager.reviewGuidance(await manager.prepare(scope, "src/other"), review.token)).toBeUndefined();
     const other = await manager.open("00000001", "/project", ["/shared"]);
     manager.delivered(other);
     const wrongWorkspace = manager.reviewGuidance(await manager.prepare({ workspace_id: other.workspace_id }, target), review.token)!;
-    expect(wrongWorkspace.token).not.toBe(review.token);
+    expect(wrongWorkspace.token).not.toEqual(review.token);
     expect(wrongWorkspace.updated).toEqual([root, nested]);
     expect(manager.reviewGuidance(await manager.prepare(scope, target), review.token)).toBeUndefined();
     expect(manager.reviewGuidance(await manager.prepare(scope, "src/other"))).toBeUndefined();
     expect(manager.reviewGuidance(await manager.prepare(scope, target), wrongWorkspace.token)).toBeUndefined();
-    manager.delivered(await manager.open("00000001", "/project", []));
+    manager.delivered(await manager.open("00000001", "/project", [], { rereadRules: true }));
     const reopened = manager.reviewGuidance(await manager.prepare(scope, target), review.token)!;
-    expect(reopened.token).not.toBe(review.token);
+    expect(reopened.token).not.toEqual(review.token);
     expect(reopened.updated).toEqual([root, nested]);
   });
 
@@ -1090,7 +1400,7 @@ describe("bounded workspace state", () => {
     const opened = await manager.open("00000001", "/project", []);
     manager.delivered(opened);
     const scope = { workspace_id: opened.workspace_id };
-    async function present(ack?: string) {
+    async function present(ack?: RuleAcknowledgment) {
       const file = await manager.prepare(scope, "src/file");
       const review = manager.reviewGuidance(file, ack);
       if (review) manager.delivered(file.context!);
@@ -1125,13 +1435,13 @@ describe("bounded workspace state", () => {
     manager.delivered(opened);
     const scope = { workspace_id: opened.workspace_id };
     transport.rules = [rule("/project/src", "Old rule")];
-    const bash = await manager.prepare(scope, "src", undefined, "bash");
+    const bash = await manager.prepare(scope, "src");
     transport.rules = [rule("/project/src", "Current rule")];
     const file = await manager.prepare(scope, "src/file");
     const review = manager.reviewGuidance(file)!;
     manager.delivered(file.context!);
     expect(manager.reviewGuidance(await manager.prepare(scope, "src/file"), review.token)).toBeUndefined();
-    expect(manager.guidance(bash.context!).updated[0]?.content).toBe("Old rule");
+    expect(manager.guidance(bash.context!)).toEqual({ updated: [], removed: [] });
     manager.delivered(bash.context!);
     expect(manager.reviewGuidance(await manager.prepare(scope, "src/file"))).toBeUndefined();
   });
@@ -1155,7 +1465,9 @@ describe("bounded workspace state", () => {
     const retry = await manager.prepare(scope, "src/download");
     expect(manager.reviewGuidance(retry)).toBeUndefined();
     await manager.open("00000001", "/project", []);
-    expect(() => manager.reviewGuidance(retry)).toThrow("Reopen with ssh_workspace_open");
+    expect(manager.reviewGuidance(retry)).toBeUndefined();
+    await manager.open("00000001", "/project", [], { rereadRules: true });
+    expect(() => manager.reviewGuidance(retry)).toThrow(expect.objectContaining({ code: "WORKSPACE_RULES_RETRY" }));
   });
 
   test("a rule deleted after preparation cannot be returned or acknowledged again by the old file access", async () => {
@@ -1250,22 +1562,22 @@ describe("bounded workspace state", () => {
     const scope = { workspace_id: opened.workspace_id };
     const original = rule("/project/src", "Original source rule");
     transport.rules = [original];
-    const first = await manager.prepare(scope, "/project/src", undefined, "bash");
-    const second = await manager.prepare(scope, "/project/src", undefined, "bash");
+    const first = await manager.prepare(scope, "/project/src");
+    const second = await manager.prepare(scope, "/project/src");
     expect(manager.guidance(first.context!).updated).toEqual([original]);
     manager.delivered(first.context!);
     expect(manager.guidance(second.context!)).toEqual({ updated: [], removed: [] });
 
     transport.rules = [rule("/project/src", "Refreshed source rule")];
-    const refreshed = await manager.prepare(scope, "/project/src", undefined, "bash");
+    const refreshed = await manager.prepare(scope, "/project/src");
     manager.delivered(refreshed.context!);
-    expect(manager.guidance(second.context!).updated).toEqual([original]);
+    expect(manager.guidance(second.context!).updated).toEqual([]);
     manager.delivered(second.context!);
-    const next = await manager.prepare(scope, "/project/src", undefined, "bash");
-    expect(manager.guidance(next.context!).updated).toEqual(transport.rules);
+    const next = await manager.prepare(scope, "/project/src");
+    expect(manager.guidance(next.context!).updated).toEqual([]);
   });
 
-  test("only successful delivery suppresses repeated guidance and old responses cannot update a reopened handle", async () => {
+  test("only successful delivery suppresses repeated guidance and old responses cannot update an explicitly reset handle", async () => {
     const transport = new ContextTransport();
     transport.rules = [rule("/project", "Root rule")];
     const manager = new WorkspaceManager(transport);
@@ -1277,7 +1589,7 @@ describe("bounded workspace state", () => {
     expect(manager.guidance(first.context!)).toEqual({ updated: [], removed: [] });
     transport.rules.push(rule("/project/src", "Source rule"));
     const read = await manager.prepare(scope, "/project/src/file");
-    const refreshed = await manager.open("00000001", "/project", []);
+    const refreshed = await manager.open("00000001", "/project", [], { rereadRules: true });
     manager.delivered(refreshed);
     manager.delivered(read.context!);
     const next = await manager.prepare(scope, "/project/src/file");
@@ -1289,31 +1601,41 @@ describe("bounded workspace state", () => {
     await expect(manager.prepare(scope, "/project/src/file")).resolves.toMatchObject({ path: "/project/src/file" });
   });
 
-  test("reopening during preparation invalidates the operation before it can execute", async () => {
-    const transport = new ContextTransport();
-    const manager = new WorkspaceManager(transport);
-    const opened = await manager.open("00000001", "/project", []);
-    manager.delivered(opened);
-    const originalRun = transport.run.bind(transport);
-    let resume: () => void = () => {};
-    const waiting = new Promise<void>((resolve) => { resume = resolve; });
-    const hook = spyOn(transport, "run").mockImplementation(async (connectionId, operation, args) => {
-      if (operation === "workspace_context") await waiting;
-      return originalRun(connectionId, operation, args);
+  for (const reset of [false, true]) {
+    test(`${reset ? "resetting" : "refreshing"} during preparation preserves the workspace handle`, async () => {
+      const transport = new ContextTransport();
+      const manager = new WorkspaceManager(transport);
+      const opened = await manager.open("00000001", "/project", []);
+      manager.delivered(opened);
+      const scope = { workspace_id: opened.workspace_id };
+      const originalRun = transport.run.bind(transport);
+      const inspected = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const hook = spyOn(transport, "run").mockImplementation(async (id, operation, args) => {
+        const result = await originalRun(id, operation, args);
+        if (operation === "workspace_context") {
+          inspected.resolve();
+          await release.promise;
+        }
+        return result;
+      });
+      try {
+        const pending = manager.prepare(scope, "/project/file");
+        await inspected.promise;
+        manager.delivered(await manager.open("00000001", "/project", [], { rereadRules: reset }));
+        release.resolve();
+        if (reset) await expect(pending).rejects.toMatchObject({ code: "WORKSPACE_RULES_RETRY" });
+        else expect(manager.reviewGuidance(await pending)).toBeUndefined();
+        expect(manager.reviewGuidance(await manager.prepare(scope, "/project/file"))).toBeUndefined();
+      } finally {
+        release.resolve();
+        hook.mockRestore();
+      }
     });
-    try {
-      const pending = manager.prepare({ workspace_id: opened.workspace_id }, "/project/file");
-      manager.delivered(await manager.open("00000001", "/project", []));
-      resume();
-      await expect(pending).rejects.toMatchObject({ code: "WORKSPACE_REOPEN_REQUIRED" });
-    } finally {
-      resume();
-      hook.mockRestore();
-    }
-  });
+  }
 
-  test("completed operations do not return stale guidance after reopening or disconnecting", async () => {
-    for (const change of ["reopen", "disconnect"]) {
+  test("completed operations do not return stale guidance after recovery or disconnecting", async () => {
+    for (const change of ["reset", "disconnect"]) {
       const transport = new ContextTransport();
       transport.rules = [rule("/project", "Original root rule")];
       const manager = new WorkspaceManager(transport);
@@ -1321,9 +1643,9 @@ describe("bounded workspace state", () => {
       manager.delivered(opened);
       transport.rules.push(rule("/project/src", "Original source rule"));
       const prepared = await manager.prepare({ workspace_id: opened.workspace_id }, "/project/src/file");
-      if (change === "reopen") {
+      if (change === "reset") {
         transport.rules = [rule("/project", "Replacement root rule")];
-        manager.delivered(await manager.open("00000001", "/project", []));
+        manager.delivered(await manager.open("00000001", "/project", [], { rereadRules: true }));
       } else {
         transport.available.clear();
       }
@@ -1332,37 +1654,10 @@ describe("bounded workspace state", () => {
     }
   });
 
-  test("preparation cannot succeed after a concurrent reopen has completed", async () => {
+  test("a catalog refresh interrupts only skill reads whose selected source changed", async () => {
     const transport = new ContextTransport();
-    const manager = new WorkspaceManager(transport);
-    const opened = await manager.open("00000001", "/project", []);
-    manager.delivered(opened);
-    const originalRun = transport.run.bind(transport);
-    const completed: string[] = [];
-    let reopened: Promise<void> | undefined;
-    const hook = spyOn(transport, "run").mockImplementation(async (connectionId, operation, args) => {
-      const response = await originalRun(connectionId, operation, args);
-      if (operation === "workspace_context") {
-        reopened = manager.open("00000001", "/project", []).then(() => { completed.push("reopened"); });
-      }
-      return response;
-    });
-    try {
-      await manager.prepare({ workspace_id: opened.workspace_id }, "/project/file").then(
-        () => { completed.push("prepared"); },
-        (error: unknown) => {
-          expect(error).toMatchObject({ code: "WORKSPACE_REOPEN_REQUIRED" });
-          completed.push("rejected");
-        },
-      );
-      await reopened;
-      expect(completed).not.toEqual(["reopened", "prepared"]);
-    } finally { hook.mockRestore(); }
-  });
-
-  test("a skill read cannot return an old source after its workspace is reopened", async () => {
-    const transport = new ContextTransport();
-    transport.skillFiles = [{ path: "/project/.agents/skills/first/SKILL.md", scope: "/project", content: "name: check\ndescription: First checks.\n" }];
+    const stable = { path: "/project/.agents/skills/docs/SKILL.md", scope: "/project", content: "name: docs\ndescription: Documentation.\n" };
+    transport.skillFiles = [stable, { path: "/project/.agents/skills/first/SKILL.md", scope: "/project", content: "name: check\ndescription: First checks.\n" }];
     const manager = new WorkspaceManager(transport);
     const opened = await manager.open("00000001", "/project", []);
     manager.delivered(opened);
@@ -1376,10 +1671,12 @@ describe("bounded workspace state", () => {
     });
     try {
       const pending = manager.skill(opened.workspace_id, "check", "SKILL.md");
-      transport.skillFiles = [{ path: "/project/.claude/skills/second/SKILL.md", scope: "/project", content: "name: check\ndescription: Second checks.\n" }];
+      const unchanged = manager.skill(opened.workspace_id, "docs", "SKILL.md");
+      transport.skillFiles = [stable, { path: "/project/.claude/skills/second/SKILL.md", scope: "/project", content: "name: check\ndescription: Second checks.\n" }];
       manager.delivered(await manager.open("00000001", "/project", []));
       resume();
-      await expect(pending).rejects.toMatchObject({ code: "WORKSPACE_REOPEN_REQUIRED" });
+      await expect(pending).rejects.toMatchObject({ code: "SKILL_CATALOG_CHANGED" });
+      await expect(unchanged).resolves.toMatchObject({ path: stable.path });
     } finally {
       resume();
       hook.mockRestore();
@@ -1420,6 +1717,26 @@ describe("bounded workspace state", () => {
     await expect(manager.open("00000001", "/project", [])).rejects.toThrow();
     transport.malformed = false;
     expect((await manager.open("00000001", "/project", [])).root).toBe("/project");
+  });
+
+  test("rejects conflicting or out-of-scope rule sources without displacing a valid receipt", async () => {
+    const transport = new ContextTransport();
+    const root = rule("/project", "Root rule");
+    transport.rules = [root];
+    const manager = new WorkspaceManager(transport);
+    const opened = await manager.open("00000001", "/project", []);
+    const receipt = manager.guidance(opened).token!;
+    manager.delivered(opened);
+    const scope = { workspace_id: opened.workspace_id };
+    const valid = await transport.run("00000001", "workspace_context", { paths: ["/project/file"] });
+    for (const instructions of [[{ path: root.path, scope: root.scope, sha256: root.sha256 }], [root, root],
+      [{ ...root, path: "/elsewhere/AGENTS.md" }], [rule("/elsewhere", "Other")]]) {
+      const invalid = spyOn(transport, "run").mockResolvedValueOnce({ ...valid, instructions });
+      try {
+        await expect(manager.prepare(scope, "/project/file")).rejects.toMatchObject({ code: "REMOTE_OPERATION_FAILED" });
+      } finally { invalid.mockRestore(); }
+    }
+    expect(manager.reviewGuidance(await manager.prepare(scope, "/project/file"), receipt)).toBeUndefined();
   });
 
   test("retired transport records do not prevent opening a new workspace", async () => {
@@ -1505,10 +1822,11 @@ describe("bounded workspace state", () => {
     ];
     const manager = new WorkspaceManager(transport);
     const opened = await manager.open("00000001", "/project", []);
+    const text = contextText(opened, manager.guidance(opened));
     manager.delivered(opened);
     const names = opened.skills.map((skill) => skill.callName);
     expect(names).toEqual(["project@check", "shared@check", "shared@check-2"]);
-    expect(contextText(opened)).not.toContain("/shared-a");
+    expect(text).not.toContain("/shared-a");
     for (const [index, name] of names.entries()) {
       await expect(manager.skill(opened.workspace_id, name, "SKILL.md")).resolves.toMatchObject({ path: transport.skillFiles[index]!.path });
     }
@@ -1521,28 +1839,55 @@ describe("bounded workspace state", () => {
     await expect(manager.skill(opened.workspace_id, "check", "SKILL.md")).resolves.toMatchObject({ path: "/shared-c/skills/check/SKILL.md" });
   });
 
+  for (const rereadRules of [false, true]) {
+    test(`a ${rereadRules ? "rule reread" : "catalog refresh"} that reaches the history limit recovers on its first call`, async () => {
+      const transport = new ContextTransport();
+      const manager = new WorkspaceManager(transport);
+      const opened = await manager.open("00000001", "/project", []);
+      manager.delivered(opened);
+      const scope = { workspace_id: opened.workspace_id };
+      for (let index = 0; index < MAX_KNOWN_RULES; index++) {
+        const directory = `/project/dir-${index}`;
+        transport.rules = [rule(directory, "Nested guidance")];
+        manager.delivered((await manager.prepare(scope, directory)).context!);
+      }
+
+      const root = rule("/project", "New root guidance");
+      transport.rules = [root];
+      const reopened = await manager.open("00000001", "/project", [], { rereadRules });
+      expect(reopened.workspace_id).toBe(opened.workspace_id);
+      const notice = manager.guidance(reopened);
+      expect(notice.updated).toEqual([root]);
+      manager.delivered(reopened);
+      expect(manager.reviewGuidance(await manager.prepare(scope, "/project/file"), notice.token)).toBeUndefined();
+    });
+  }
+
   test("instruction history exhaustion requires reopening instead of silently dropping rule state", async () => {
     const transport = new ContextTransport();
     const manager = new WorkspaceManager(transport);
     const opened = await manager.open("00000001", "/project", []);
     manager.delivered(opened);
-    transport.rules = Array.from({ length: 2048 }, (_, index) => ({ ...rule("/project/a", `Rule ${index}`), path: `/project/a/rule-${index}/AGENTS.md` }));
-    const filled = await manager.prepare({ workspace_id: opened.workspace_id }, "/project/a/file");
-    manager.delivered(filled.context!);
+    for (let index = 0; index < MAX_KNOWN_RULES; index++) {
+      const scope = `/project/a/rule-${index}`;
+      transport.rules = [rule(scope, `Rule ${index}`)];
+      const filled = await manager.prepare({ workspace_id: opened.workspace_id }, scope + "/file");
+      manager.delivered(filled.context!);
+    }
     transport.rules = [];
     const originalRun = transport.run.bind(transport);
     let resume: () => void = () => {};
     const waiting = new Promise<void>((resolve) => { resume = resolve; });
     const hook = spyOn(transport, "run").mockImplementation(async (connectionId, operation, args) => {
       const response = await originalRun(connectionId, operation, args);
-      if (operation === "workspace_context" && (args?.paths as string[])?.includes("/project/a/file")) await waiting;
+      if (operation === "workspace_context" && (args?.paths as string[])?.includes("/project/a/rule-0/file")) await waiting;
       return response;
     });
     try {
-      const pending = manager.prepare({ workspace_id: opened.workspace_id }, "/project/a/file");
+      const pending = manager.prepare({ workspace_id: opened.workspace_id }, "/project/a/rule-0/file");
       transport.rules = [rule("/project/b", "Another scope")];
-      const overflowing = await manager.prepare({ workspace_id: opened.workspace_id }, "/project/b/file");
-      manager.delivered(overflowing.context!);
+      await expect(manager.prepare({ workspace_id: opened.workspace_id }, "/project/b/file"))
+        .rejects.toMatchObject({ code: "WORKSPACE_REOPEN_REQUIRED" });
       resume();
       await expect(pending).rejects.toMatchObject({
         code: "WORKSPACE_REOPEN_REQUIRED", message: expect.stringContaining("Instruction delivery history is full"),

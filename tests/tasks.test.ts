@@ -1,5 +1,5 @@
 /** Exercise foreground waits, output bounds, and lifecycle races without remote processes. */
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, jest, test } from "bun:test";
 import { RemoteChannel, type RemoteResult } from "../src/ssh/request-channel";
 import { TaskManager } from "../src/tasks/manager";
 import { bashResult } from "../src/tasks/text";
@@ -91,6 +91,72 @@ async function start(command = "fixture"): Promise<{ id: string; channel: Remote
   return { id: await pending, channel };
 }
 
+test("a startup rejection preserves the helper's natural exit before reporting the error", async () => {
+  let settled = false;
+  const pending = tasks.start(CONNECTION, "fixture").finally(() => { settled = true; });
+  await Promise.resolve();
+  const channel = fixture.channels[0]!;
+  emit(channel, { ok: false, error: { code: "BASH_UNAVAILABLE", message: "Missing Bash" } });
+  await Promise.resolve();
+  expect(fixture.messages).toEqual([]);
+  expect(settled).toBe(false);
+  channel.finish(2);
+  await expect(pending).rejects.toMatchObject({ code: "BASH_UNAVAILABLE", message: "Missing Bash" });
+  expect(fixture.messages).toEqual([]);
+});
+
+test("an archive collision retries once the worker confirms the helper's pre-start exit", async () => {
+  const pending = tasks.start(CONNECTION, "fixture");
+  await Promise.resolve();
+  const first = fixture.channels[0]!;
+  emit(first, { ok: false, error: { code: "TASK_ID_EXISTS", message: "Already exists" } });
+  await Promise.resolve();
+  expect(fixture.channels).toHaveLength(1);
+  expect(fixture.messages).toEqual([]);
+  first.finish(2);
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(fixture.channels).toHaveLength(2);
+  const second = fixture.channels[1]!;
+  fixture.started(second);
+  fixture.finish(second);
+  expect(tasks.snapshot(await pending)).toMatchObject({ finished: true, exit_code: 0 });
+});
+
+test.each([0, 1, 255])("an unconfirmed archive collision with helper exit %i cannot replay the command", async (code) => {
+  const pending = tasks.start(CONNECTION, "fixture");
+  await Promise.resolve();
+  const channel = fixture.channels[0]!;
+  emit(channel, { ok: false, error: { code: "TASK_ID_EXISTS", message: "Already exists" } });
+  channel.finish(code);
+  await expect(pending).rejects.toMatchObject({ code: "COMMAND_START_FAILED", message: expect.stringContaining("Already exists") });
+  expect(fixture.channels).toHaveLength(1);
+});
+
+test("a malformed follow-up after a startup rejection cancels the request without retrying", async () => {
+  const pending = tasks.start(CONNECTION, "fixture");
+  await Promise.resolve();
+  const channel = fixture.channels[0]!;
+  emit(channel, { ok: false, error: { code: "TASK_ID_EXISTS", message: "Already exists" } });
+  fixture.started(channel);
+  await expect(pending).rejects.toMatchObject({ code: "COMMAND_START_FAILED", message: expect.stringContaining("Invalid remote helper response") });
+  expect(fixture.channels).toHaveLength(1);
+  expect(fixture.messages).toContainEqual({ type: "cancel" });
+});
+
+test("a helper that reports rejection but never closes still times out", async () => {
+  jest.useFakeTimers();
+  try {
+    const pending = tasks.start(CONNECTION, "fixture");
+    await Promise.resolve();
+    emit(fixture.channels[0]!, { ok: false, error: { code: "TASK_ID_EXISTS", message: "Already exists" } });
+    jest.advanceTimersByTime(15000);
+    await expect(pending).rejects.toMatchObject({ code: "COMMAND_START_FAILED", message: expect.stringContaining("15 seconds") });
+    expect(fixture.channels).toHaveLength(1);
+    expect(fixture.messages).toContainEqual({ type: "cancel" });
+  } finally { jest.useRealTimers(); }
+});
+
 test("foreground waits for completion even after output arrives", async () => {
   let returned = false;
   const pending = tasks.execute(CONNECTION, "fixture", undefined, 1000);
@@ -105,6 +171,7 @@ test("foreground waits for completion even after output arrives", async () => {
   const result = await pending;
   expect(result).toMatchObject({ finished: true, exit_code: 0, output_bytes: HEADER_BYTES + 6, preview: [{ stream: "stdout", text: "ready\n" }] });
   expect(bashResult(result, "fixture").text).toBe("ready\n");
+  expect(fixture.messages).toEqual([]);
 });
 
 test("literal Bash argument recognition preserves quotes and rejects shell evaluation", () => {
@@ -144,23 +211,27 @@ test("task list contains only tasks with unread output", async () => {
   const { id, channel } = await start();
   fixture.output(channel, Buffer.from("one\n"));
   expect(tasks.list().map((task) => task.task_id)).toContain(id);
-  await tasks.output(id, 0);
+  const first = await tasks.output(id, 0);
   expect(tasks.list().map((task) => task.task_id)).not.toContain(id);
   fixture.output(channel, Buffer.from("two\n"));
+  tasks.markRead(first);
   expect(tasks.list().map((task) => task.task_id)).toContain(id);
   fixture.finish(channel);
   await tasks.output(id, 0);
+  tasks.markRead(first);
   expect(tasks.list().map((task) => task.task_id)).not.toContain(id);
 });
 
-test("fully delivered foreground commands do not appear in the task list", async () => {
+test("a complete foreground result stays unread until its response is ready", async () => {
   const pending = tasks.execute(CONNECTION, "fixture", undefined, 1000);
   await Promise.resolve();
   const channel = fixture.channels[0]!;
   fixture.started(channel);
   fixture.output(channel, Buffer.from("ready\n"));
   fixture.finish(channel);
-  await pending;
+  const result = await pending;
+  expect(tasks.list().map(task => task.task_id)).toContain(result.task_id);
+  tasks.markRead(result);
   expect(tasks.list()).toHaveLength(0);
 });
 
@@ -226,6 +297,115 @@ test("large previews stay bounded while the archived byte count includes all out
   expect(text).toContain(`${HEADER_BYTES + 2097152} bytes`);
   expect(text).toContain("read selectively");
   expect(text).not.toContain('"output"');
+});
+
+test("concurrent long-output queries share one atomic tail while later progress stays unread", async () => {
+  const { id, channel } = await start();
+  const total = HEADER_BYTES + 70000;
+  fixture.output(channel, Buffer.from("superseded"));
+  emit(channel, { event: "progress", outputBytes: total });
+  const cancelled = new AbortController();
+  const first = tasks.output(id, 0, cancelled.signal);
+  const second = tasks.output(id, 0);
+  await Promise.resolve();
+  cancelled.abort();
+  await expect(first).rejects.toMatchObject({ code: "OPERATION_CANCELLED" });
+  expect(fixture.messages).toEqual([{ type: "control", message: { action: "preview", requestId: 1 } }]);
+  expect(tasks.list()).toHaveLength(1);
+
+  // Both streams have a split UTF-8 character at the start of the retained window.
+  const stdout = Buffer.from("世"), stderr = Buffer.from("界");
+  const data = Buffer.concat([stderr.subarray(1), stdout.subarray(2), Buffer.from("!")]);
+  emit(channel, { event: "tail", requestId: 1, outputBytes: total, base64: data.toString("base64"), lengths: [-2, 1, 1],
+    before: { stdout: stdout.subarray(0, 2).toString("base64"), stderr: stderr.subarray(0, 1).toString("base64") } });
+  emit(channel, { event: "progress", outputBytes: total + 3 });
+  const result = await second;
+  expect(result.output_bytes).toBe(total);
+  expect(result.preview_complete).toBe(false);
+  expect(result.preview).toEqual([{ stream: "stderr", text: "界" }, { stream: "stdout", text: "世" },
+    { stream: "stdout", text: "!" }]);
+  expect(tasks.list()).toHaveLength(1);
+  emit(channel, { event: "tail", outputBytes: total + 3, base64: Buffer.from("end").toString("base64"), lengths: [3] });
+  emit(channel, { event: "exit", outputBytes: total + 3, outputComplete: true, exitCode: 0 });
+  channel.finish(0);
+  const final = await tasks.output(id, 0);
+  expect(final.preview.at(-1)).toEqual({ stream: "stdout", text: "end" });
+  expect(tasks.list()).toHaveLength(0);
+});
+
+test("a lost connection reports the last progress and only previously received preview data", async () => {
+  const { id, channel } = await start();
+  fixture.output(channel, Buffer.from("confirmed"));
+  emit(channel, { event: "progress", outputBytes: 80000 });
+  const pending = tasks.output(id, 0);
+  await Promise.resolve();
+  channel.finish(255);
+  expect(await pending).toMatchObject({ finished: true, exit_code: null, output_bytes: 80000, size_known: false,
+    preview_complete: false, output_complete: false, preview: [{ stream: "stdout", text: "confirmed" }] });
+});
+
+test("a foreground deadline returns the received preview without another SSH request", async () => {
+  const initial = tasks.execute(CONNECTION, "fixture", undefined, 2);
+  await Promise.resolve();
+  const channel = fixture.channels[0]!;
+  fixture.started(channel);
+  fixture.output(channel, Buffer.from("ready"));
+  emit(channel, { event: "progress", outputBytes: 80000 });
+  const result = await initial;
+  expect(result).toMatchObject({ finished: false, preview_complete: false, output_bytes: 80000,
+    preview: [{ stream: "stdout", text: "ready" }] });
+  expect(tasks.list().map(task => task.task_id)).toContain(result.task_id);
+  expect(fixture.messages).toEqual([]);
+  emit(channel, { event: "exit", outputBytes: 80000, outputComplete: true, exitCode: 0 });
+  channel.finish(0);
+});
+
+test("a timed-out explicit preview stays unread and its late reply cannot settle the next query", async () => {
+  const { id, channel } = await start();
+  jest.useFakeTimers();
+  try {
+    emit(channel, { event: "progress", outputBytes: 80000 });
+    const first = tasks.output(id, 0);
+    await Promise.resolve();
+    expect(fixture.messages).toEqual([{ type: "control", message: { action: "preview", requestId: 1 } }]);
+    jest.advanceTimersByTime(5000);
+    await expect(first).rejects.toMatchObject({ code: "TASK_PREVIEW_TIMEOUT" });
+    expect(tasks.list().map(task => task.task_id)).toContain(id);
+    const next = tasks.output(id, 0);
+    await Promise.resolve();
+    expect(fixture.messages.at(-1)).toMatchObject({ message: { action: "preview", requestId: 2 } });
+    emit(channel, { event: "tail", requestId: 1, outputBytes: 80000, base64: "YQ==", lengths: [1],
+      before: { stdout: "", stderr: "" } });
+    emit(channel, { event: "tail", requestId: 2, outputBytes: 80001, base64: "Yg==", lengths: [-1] });
+    expect(await next).toMatchObject({ finished: false, output_bytes: 80001,
+      preview: [{ stream: "stdout", text: "a" }, { stream: "stderr", text: "b" }] });
+    emit(channel, { event: "exit", outputBytes: 80001, outputComplete: true, exitCode: 0 });
+    channel.finish(0);
+  } finally { jest.useRealTimers(); }
+});
+
+test("a zero-wait Bash launch returns at startup when progress arrived in the same batch", async () => {
+  const initial = tasks.execute(CONNECTION, "fixture", undefined, 0);
+  await Promise.resolve();
+  const channel = fixture.channels[0]!;
+  fixture.started(channel);
+  emit(channel, { event: "progress", outputBytes: 80000 });
+  expect(await initial).toMatchObject({ finished: false, preview_complete: false, output_bytes: 80000 });
+  expect(fixture.messages).toEqual([]);
+  emit(channel, { event: "exit", outputBytes: 80000, outputComplete: true, exitCode: 0 });
+  channel.finish(0);
+});
+
+test("an invalid tail cannot publish partial data or acknowledge a later progress checkpoint", async () => {
+  const { id, channel } = await start();
+  fixture.output(channel, Buffer.from("confirmed"));
+  emit(channel, { event: "progress", outputBytes: 80000 });
+  emit(channel, { event: "tail", outputBytes: 90000, base64: "dGFpbA==", lengths: [2, -1],
+    before: { stdout: "", stderr: "" } });
+  const final = tasks.snapshot(id);
+  expect(final).toMatchObject({ output_bytes: 80000, reason: "failed", preview_complete: false,
+    preview: [{ stream: "stdout", text: "confirmed" }] });
+  expect(tasks.list()).toHaveLength(1);
 });
 
 test("file views require delivered stdout and only searches may have a truncated preview", async () => {
@@ -358,6 +538,7 @@ test("stopping twice preserves the original result and retained output", async (
   const result = await tasks.stop(id);
   expect(result).toMatchObject({ finished: true, exit_code: -15, reason: "cancelled" });
   expect(await tasks.stop(id)).toEqual(result);
+  expect(fixture.messages).toEqual([{ type: "control", message: { action: "stop" } }]);
   expect(bashResult(result, "fixture").text).toContain("Reason: cancelled");
   expect(bashResult(result, "fixture").text).toContain("ready\n");
 });

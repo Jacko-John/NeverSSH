@@ -9,6 +9,7 @@ import shlex
 import signal
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -28,6 +29,49 @@ exec(compile(source.read_text().rsplit("\nWorker(payload).run()", 1)[0], str(sou
 
 class WorkerOutputTests(unittest.TestCase):
     """Model a peer that stops reading, then drains all queued responses."""
+
+    def test_helper_frames_forward_partial_json_and_preserve_diagnostic_bytes(self):
+        records = []
+        output = worker_module.Worker.__new__(worker_module.Worker)
+        output.emit = records.append
+        key = types.SimpleNamespace(fd=1)
+        chunks = (b'{"event":"output","base64":"', b'//4="}\n', b'bad byte: \xff')
+        with patch.object(os, "read", side_effect=chunks):
+            for stream in ("stdout", "stdout", "stderr"):
+                worker_module.Worker.read_stream(output, key, "1", stream)
+        self.assertEqual([record["type"] for record in records], ["stdout_text", "stdout_text", "stderr"])
+        self.assertEqual("".join(record["text"] for record in records[:2]).encode("ascii"), b"".join(chunks[:2]))
+        self.assertEqual(base64.b64decode(records[2]["base64"]), chunks[2])
+
+    def test_json_chunks_round_trip_under_the_receiver_limit(self):
+        output = worker_module.Worker.__new__(worker_module.Worker)
+        records = []
+        output.emit = records.append
+        chunks = [b"A+/=" * 4096, b"\x7f" * 16384, b'\\"' * 8192, b"\xe4\xb8", b"\xad end"]
+        for chunk in chunks:
+            output.emit_json_chunk("1", chunk)
+        self.assertEqual(records[0]["type"], "stdout_text")
+        for chunk, record in zip(chunks, records):
+            self.assertLessEqual(len(json.dumps(record)), 65536)
+            restored = record["text"].encode("ascii") if "text" in record else base64.b64decode(record["base64"])
+            self.assertEqual(restored, chunk)
+
+    def test_file_completion_wakes_the_selector_for_success_and_failure(self):
+        worker = worker_module.Worker.__new__(worker_module.Worker)
+        worker.wakeup_lock = threading.Lock()
+        reader, worker.wakeup_writer = os.pipe()
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(reader, selectors.EVENT_READ)
+                for execute in (lambda _: "ready", lambda _: 1 / 0):
+                    request = worker_module.FileRequest(execute, {}, worker.wake)
+                    self.assertTrue(selector.select(1))
+                    self.assertEqual(os.read(reader, 1), b"\0")
+                    self.assertTrue(request.done)
+                    request.thread.join()
+        finally:
+            os.close(worker.wakeup_writer)
+            os.close(reader)
 
     def test_abnormal_helper_exit_cannot_confirm_cleanup(self):
         for exit_codes in ((0,), (2,), (2, 0), (1,), (-signal.SIGTERM,), (-signal.SIGKILL,), (1, 0), (1, 2)):
@@ -109,7 +153,7 @@ class WorkerOutputTests(unittest.TestCase):
         try:
             # Completed real file threads must retain their unsent bytes when the peer stalls.
             for index in range(8):
-                worker.requests[str(index)] = worker_module.FileRequest(lambda _: {"content": content}, {})
+                worker.requests[str(index)] = worker_module.FileRequest(lambda _: {"content": content}, {}, worker.wake)
             deadline = time.monotonic() + 5
             while not all(request.done for request in worker.requests.values()):
                 self.assertLess(time.monotonic(), deadline)
@@ -138,7 +182,9 @@ class WorkerOutputTests(unittest.TestCase):
             for record in records:
                 request_id = record["id"]
                 self.assertNotIn(request_id, closed)
-                if record["type"] == "stdout":
+                if record["type"] == "stdout_text":
+                    outputs[request_id].extend(record["text"].encode("ascii"))
+                elif record["type"] == "stdout":
                     outputs[request_id].extend(base64.b64decode(record["base64"]))
                 else:
                     self.assertEqual(record["type"], "close")

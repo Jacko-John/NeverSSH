@@ -1,48 +1,38 @@
 /** One request's input, output, and result within a shared SSH worker connection. */
 import { EventEmitter } from "node:events";
-import { PassThrough, Writable } from "node:stream";
+import { PassThrough } from "node:stream";
 import { ToolError } from "../errors";
-import { JsonLines } from "./json-lines";
 
 export type RemoteResult = Record<string, unknown>;
 
 export class RemoteChannel extends EventEmitter {
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
-  readonly stdin: Writable;
   private ended = false;
 
   constructor(private readonly send: (message: RemoteResult) => void) {
     super();
-    const input = new JsonLines(131072);
-    this.stdin = new Writable({
-      write: (chunk: Buffer, _encoding, callback) => {
-        try {
-          input.push(chunk.toString(), (message) => {
-            if (!this.ended) this.send({ type: "control", message });
-          });
-          callback();
-        } catch (error) {
-          callback(error instanceof Error ? error : new Error(String(error)));
-        }
-      },
-      final: (callback) => {
-        try {
-          if (!this.ended) this.send({ type: "eof" });
-          callback();
-        } catch (error) {
-          callback(error instanceof Error ? error : new Error(String(error)));
-        }
-      },
-    });
-    this.stdin.on("error", () => {});
+  }
+
+  /** Let Bash stop its command group and finalize the archive. */
+  stopCommand(): void {
+    this.control({ type: "control", message: { action: "stop" } });
+  }
+
+  /** Ask a long-running command for its latest retained output. */
+  requestPreview(requestId: number): void {
+    this.control({ type: "control", message: { action: "preview", requestId } });
   }
 
   /** Stop this request through the supervisor, which remains responsible for its children. */
   cancel(): void {
+    this.control({ type: "cancel" });
+  }
+
+  private control(message: RemoteResult): void {
     if (this.ended) return;
     try {
-      this.send({ type: "cancel" });
+      this.send(message);
     } catch {
       // A disconnected worker will finish the channel through its connection-loss handler.
     }
@@ -112,7 +102,6 @@ export class RemoteChannel extends EventEmitter {
           stderr.trim() || "Invalid remote operation response",
         ));
       });
-      this.stdin.end();
     });
   }
 }

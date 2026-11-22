@@ -8,8 +8,8 @@ import readFormatsSource from "./read_formats.py" with { type: "text" };
 import workerSource from "./worker.py" with { type: "text" };
 import workspaceSource from "./workspace.py" with { type: "text" };
 
-export const SERVER_VERSION = "0.7.0";
-export const PROTOCOL_VERSION = 2;
+export const SERVER_VERSION = "0.8.0";
+export const PROTOCOL_VERSION = 4;
 export const MIN_PYTHON = "3.8";
 export const ARCHIVE_FORMAT = 1;
 

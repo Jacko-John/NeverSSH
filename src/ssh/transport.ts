@@ -2,12 +2,14 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
-import { connectSchema, targetAllowed, type Config, type Endpoint, type SshTarget } from "../config";
+import { connectSchema, targetAllowed, type Config, type SshTarget } from "../config";
 import type { RemoteChannel, RemoteResult } from "./request-channel";
-import { bounded, checkAbort, ToolError } from "../errors";
+import { checkAbort, ToolError } from "../errors";
 import { ShortIds } from "../ids";
-import { resolveTarget, sftpOptions, sshEnvironment, sshFailure, sshOptions } from "./openssh";
+import { resolveTarget, sftpOptions, sshEnvironment, sshFailure, sshOptions, type ResolvedTarget } from "./openssh";
 import { WorkerClient, WORKER_BOOTSTRAP, type CleanupStatus } from "./worker-client";
+import { SharedOperation } from "./shared-operation";
+import { WaitBudget } from "./wait-queue";
 
 export type { RemoteResult } from "./request-channel";
 
@@ -19,33 +21,18 @@ const CLOSE_TIMEOUT_MS = 10_000;
 const SHUTDOWN_TIMEOUT_MS = 6_000;
 const SFTP_STOP_TIMEOUT_MS = 2_000;
 
-type Connection = {
+type Connection = ResolvedTarget & {
   id: string;
-  key: string;
-  target: SshTarget;
-  endpoint: Endpoint;
   state: "ready" | "lost" | "closing" | "closed";
   socket: string;
   master: ChildProcess;
   worker: WorkerClient;
+  waitBudget: WaitBudget;
   cleanup: CleanupStatus;
   sftpLifetime: AbortController;
   sftpRequests: Set<Promise<void>>;
+  sftpProbe?: SharedOperation<void> | true;
   closing?: Promise<void>;
-};
-
-type PendingConnection = {
-  promise: Promise<Connection>;
-  controller: AbortController;
-  waiters: number;
-  done: boolean;
-};
-
-type SftpCheck = {
-  promise: Promise<void>;
-  controller: AbortController;
-  waiters: number;
-  done: boolean;
 };
 
 /** Quote the fixed Python bootstrap for the remote POSIX shell. */
@@ -57,8 +44,7 @@ function shellQuote(value: string): string {
 export class SshTransport {
   private connections = new Map<string, Connection>();
   private reusable = new Map<string, Connection>();
-  private pending = new Map<string, PendingConnection>();
-  private readonly sftpChecks = new Map<string, SftpCheck>();
+  private pending = new Map<string, SharedOperation<Connection>>();
   private readonly ids = new ShortIds();
   private directory = mkdtemp("/tmp/neverssh-");
   private lifetime = new AbortController();
@@ -73,6 +59,11 @@ export class SshTransport {
       throw new ToolError("CONNECTION_NOT_FOUND", "Connection does not exist in this MCP instance");
     }
     return connection;
+  }
+
+  /** Check one handle without constructing a summary of every ready connection. */
+  isReady(id: string): boolean {
+    return !this.closed && this.connections.get(id)?.state === "ready";
   }
 
   /** Require an existing ready handle; an operation never reconnects implicitly. */
@@ -98,15 +89,14 @@ export class SshTransport {
     const combined = AbortSignal.any([this.lifetime.signal, controller.signal, ...(signal ? [signal] : [])]);
 
     try {
-      return await this.connectTarget(target, timeout, combined);
+      return await this.connectTarget(target, combined);
     } finally {
       clearTimeout(timer);
     }
   }
 
   /** Authorize the effective destination before reusing or starting its connection. */
-  private async connectTarget(target: SshTarget, timeout: number, signal: AbortSignal): Promise<RemoteResult> {
-    const started = Date.now();
+  private async connectTarget(target: SshTarget, signal: AbortSignal): Promise<RemoteResult> {
     if (this.closed) throw new ToolError("CONNECTION_LOST", "SSH transport is closed");
     checkAbort(signal);
 
@@ -117,36 +107,14 @@ export class SshTransport {
     const existing = this.reusable.get(resolved.key);
     if (existing?.state === "ready") return { connection_id: existing.id };
 
-    const pending = this.sharedStartup(target, resolved.endpoint, resolved.key);
-    pending.waiters++;
-    try {
-      const remaining = Math.max(1, timeout - (Date.now() - started));
-      const connection = await bounded(pending.promise, remaining, "CONNECT_TIMEOUT", "Connection preparation exceeded timeout_seconds", signal);
-      return { connection_id: connection.id };
-    } finally {
-      pending.waiters--;
-      if (!pending.waiters && !pending.done) pending.controller.abort();
+    const { key } = resolved;
+    let startup = this.pending.get(key);
+    if (!startup) {
+      startup = new SharedOperation(signal => this.create(resolved, signal).finally(() => this.pending.delete(key)));
+      this.pending.set(key, startup);
     }
-  }
-
-  /** Keep one startup per effective SSH configuration until it settles or its final waiter leaves. */
-  private sharedStartup(target: SshTarget, endpoint: Endpoint, key: string): PendingConnection {
-    const existing = this.pending.get(key);
-    if (existing) return existing;
-
-    const controller = new AbortController();
-    const pending: PendingConnection = {
-      promise: this.create(target, endpoint, key, controller.signal),
-      controller,
-      waiters: 0,
-      done: false,
-    };
-    this.pending.set(key, pending);
-    void pending.promise.finally(() => {
-      pending.done = true;
-      if (this.pending.get(key) === pending) this.pending.delete(key);
-    }).catch(() => {});
-    return pending;
+    const connection = await startup.wait(signal);
+    return { connection_id: connection.id };
   }
 
   /** Evict only closed records; issued IDs remain reserved for this process's lifetime. */
@@ -164,7 +132,8 @@ export class SshTransport {
   }
 
   /** Publish a handle only after its master and worker have completed startup. */
-  private async create(target: SshTarget, endpoint: Endpoint, key: string, signal: AbortSignal, attempt = 0): Promise<Connection> {
+  private async create(resolved: ResolvedTarget, signal: AbortSignal, attempt = 0): Promise<Connection> {
+    const { target, key, supportedOptions } = resolved;
     const id = this.allocateId();
     const socket = `${await this.directory}/${id}`;
     let master: ChildProcess | undefined;
@@ -177,16 +146,17 @@ export class SshTransport {
 
     try {
       checkAbort(signal);
-      master = await this.startMaster(target, socket, signal);
+      master = await this.startMaster(resolved, socket, signal);
       const child = spawn("ssh", [
-        ...sshOptions(this.config, target, socket, false),
+        ...sshOptions(this.config, target, socket, false, supportedOptions),
         target.host,
         `exec python3 -I -B -u -c ${shellQuote(WORKER_BOOTSTRAP)}`,
       ], { stdio: ["pipe", "pipe", "pipe"], env: sshEnvironment() });
 
-      worker = new WorkerClient(child, id, (diagnostic) => this.lost(connection, diagnostic));
+      const waitBudget = new WaitBudget();
+      worker = new WorkerClient(child, id, (diagnostic) => this.lost(connection, diagnostic), waitBudget);
       const connection: Connection = {
-        id, key, target, endpoint, socket, master, worker,
+        ...resolved, id, socket, master, worker, waitBudget,
         state: "ready",
         cleanup: "unconfirmed",
         sftpLifetime: new AbortController(),
@@ -207,7 +177,7 @@ export class SshTransport {
       await rm(socket, { force: true });
       // No connection handle has been published, so an archived-ID collision can safely retry.
       if (error instanceof ToolError && error.code === "SESSION_ID_EXISTS" && attempt < 8) {
-        return this.create(target, endpoint, key, signal, attempt + 1);
+        return this.create(resolved, signal, attempt + 1);
       }
       throw error;
     } finally {
@@ -216,8 +186,8 @@ export class SshTransport {
   }
 
   /** Wait for the private control socket, retaining bounded native SSH diagnostics on failure. */
-  private async startMaster(target: SshTarget, socket: string, signal: AbortSignal): Promise<ChildProcess> {
-    const child = spawn("ssh", [...sshOptions(this.config, target, socket, true), target.host], {
+  private async startMaster({ target, supportedOptions }: ResolvedTarget, socket: string, signal: AbortSignal): Promise<ChildProcess> {
+    const child = spawn("ssh", [...sshOptions(this.config, target, socket, true, supportedOptions), target.host], {
       stdio: ["ignore", "ignore", "pipe"], env: sshEnvironment(),
     });
     let diagnostic = "";
@@ -250,7 +220,7 @@ export class SshTransport {
   /** Stop owned SFTP processes and retire reuse without displacing a newer connection. */
   private retire(connection: Connection): void {
     connection.sftpLifetime.abort(new ToolError("CONNECTION_LOST", `Connection is ${connection.state}; SFTP stopped`));
-    this.sftpChecks.delete(connection.id);
+    delete connection.sftpProbe;
     if (this.reusable.get(connection.key) === connection) this.reusable.delete(connection.key);
   }
 
@@ -284,47 +254,31 @@ export class SshTransport {
 
   /** Share subsystem discovery while each caller cancels only its own wait. */
   async prepareSftp(id: string, signal?: AbortSignal): Promise<void> {
-    this.ready(id);
+    const connection = this.ready(id);
     checkAbort(signal);
-    let check = this.sftpChecks.get(id);
-    if (!check) {
-      const controller = new AbortController();
-      const pending: SftpCheck = {
-        controller, waiters: 0, done: false,
-        promise: this.sftp(id, ["pwd"], controller.signal).catch((error) => {
-          if (this.sftpChecks.get(id) === pending) this.sftpChecks.delete(id);
+    let probe = connection.sftpProbe;
+    if (probe === true) return;
+    if (!probe || probe.controller.signal.aborted) {
+      probe = new SharedOperation(signal => this.sftp(id, ["pwd"], signal).then(
+        () => { if (connection.sftpProbe === probe) connection.sftpProbe = true; },
+        (error) => {
+          if (connection.sftpProbe === probe) delete connection.sftpProbe;
           if (error instanceof ToolError &&
               ["SFTP_UNAVAILABLE", "SFTP_TIMEOUT", "OPERATION_CANCELLED", "CONNECTION_LOST"].includes(error.code)) {
             throw error;
           }
           throw new ToolError("SFTP_UNAVAILABLE",
             "SFTP is unavailable on this connection; enable the remote SFTP subsystem");
-        }),
-      };
-      void pending.promise.finally(() => { pending.done = true; }).catch(() => {});
-      this.sftpChecks.set(id, pending);
-      check = pending;
+        },
+      ));
+      connection.sftpProbe = probe;
     }
 
-    check.waiters++;
-    let rejectAbort!: (error: unknown) => void;
-    const cancelled = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
-    const abort = () => {
-      try { checkAbort(signal); }
-      catch (error) { rejectAbort(error); }
-    };
-    signal?.addEventListener("abort", abort, { once: true });
     try {
-      checkAbort(signal);
-      await Promise.race([check.promise, cancelled]);
+      await probe.wait(signal);
     } finally {
-      signal?.removeEventListener("abort", abort);
-      check.waiters--;
-      if (!check.waiters && !check.done) {
-        if (this.sftpChecks.get(id) === check) this.sftpChecks.delete(id);
-        check.controller.abort();
-        await check.promise.catch(() => {});
-      }
+      // SFTP cancellation returns after its subprocess and process group have been reaped.
+      if (probe.controller.signal.aborted) await probe.promise.catch(() => {});
     }
   }
 
@@ -334,7 +288,7 @@ export class SshTransport {
     const combined = AbortSignal.any([this.lifetime.signal, connection.sftpLifetime.signal, ...(signal ? [signal] : [])]);
     checkAbort(combined);
     const child = spawn("sftp", [
-      ...sftpOptions(this.config, connection.target, connection.socket),
+      ...sftpOptions(this.config, connection.target, connection.socket, connection.supportedOptions),
       "-q", "-b", "-", connection.target.host,
     ], { stdio: ["pipe", "pipe", "pipe"], env: sshEnvironment(), detached: true });
     let stderr = "";

@@ -1,5 +1,5 @@
 /** Present command results as readable MCP text while preserving program whitespace. */
-import type { TaskResult, TaskSummary } from "./manager";
+import { hasCompleteResult, type TaskResult, type TaskSummary } from "./manager";
 import { acceptsExitOne } from "./simple-command";
 
 /** Include exact bytes so agents can choose a bounded log-reading strategy. */
@@ -27,8 +27,12 @@ function status(task: TaskState): string {
 
 /** Keep raw Bash output compact; task reports label each stream for clarity. */
 function programOutput(task: TaskResult, labeled: boolean): string {
-  const stdout = task.preview.filter((chunk) => chunk.stream === "stdout").map((chunk) => chunk.text).join("");
-  const stderr = task.preview.filter((chunk) => chunk.stream === "stderr").map((chunk) => chunk.text).join("");
+  let stdout = "";
+  let stderr = "";
+  for (const chunk of task.preview) {
+    if (chunk.stream === "stdout") stdout += chunk.text;
+    else stderr += chunk.text;
+  }
   if (labeled) return [stdout && `stdout:\n${stdout}`, stderr && `stderr:\n${stderr}`].filter(Boolean).join("\n\n");
   if (stdout && stderr) return `${stdout}\nstderr:\n${stderr}`;
   return stdout || (stderr ? `stderr:\n${stderr}` : "");
@@ -91,8 +95,7 @@ export function taskListText(tasks: TaskSummary[]): string {
 /** Classify the initial invocation while preserving its real exit code for later task queries. */
 export function bashResult(task: TaskResult, command: string): { text: string; isError: boolean } {
   const output = programOutput(task, false);
-  if (task.finished && task.reason === undefined && task.exit_code === 0 &&
-      task.preview_complete && task.output_complete && task.size_known) return { text: output, isError: false };
+  if (task.exit_code === 0 && task.reason === undefined && hasCompleteResult(task)) return { text: output, isError: false };
   const acceptedExitOne = task.finished && task.reason === undefined && task.exit_code === 1 && acceptsExitOne(command);
   const isError = task.finished && (task.reason !== undefined || (task.exit_code !== 0 && !acceptedExitOne));
   const header = bashHeader(task, acceptedExitOne).join("\n");

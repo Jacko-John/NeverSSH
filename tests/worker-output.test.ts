@@ -71,7 +71,7 @@ test("oversized responses are cancelled once and subsequent chunks stay discarde
   channel.stdout.write("x".repeat(16384));
   channel.finish(0);
   await expect(response).rejects.toMatchObject({ code: "OPERATION_INTERRUPTED" });
-  expect(sent.filter((message) => message.type === "cancel")).toHaveLength(1);
+  expect(sent).toEqual([{ type: "cancel" }]);
 });
 
 test("a stalled peer keeps the worker queue bounded and pauses helper output", async () => {

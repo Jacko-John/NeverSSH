@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.0
+
+- Workspace open, Bash guidance, and paused file calls return one confirmation code per rule version. File calls accept a single code or an array and confirm only the rules that apply to their target. Codes for unchanged rules can be reused across files even after heavy activity in other directories.
+- Refreshing a workspace preserves confirmations. Use `reread_rules: true` after losing conversation context. Late Bash results omit superseded guidance. Line-ending conversions and blank instruction files no longer trigger a new rule review.
+- A finished foreground command counts as read when `ssh_bash` returns its full result, including a nonzero exit. Clients can still use a returned task ID to query the retained result with `ssh_task_output`.
+- When a host has no Bash, `ssh_bash` reports `BASH_UNAVAILABLE` and the connection can still confirm cleanup on close.
+- Fixed connections from OpenSSH 8.4 clients. SSH and SFTP now use the session options supported by the local client. SFTP transfers also work with host configurations that force a terminal or disable standard input.
+- Reconnecting to a verified worker build skips the source upload. Repeated operations under the same workspace rules reuse their text after the remote checks the current contents. Uploads prepare the destination in one worker request and recheck conflicts at commit.
+- File operations wake the worker as soon as their results are ready. Repeated workspace reads can check confirmed rules and read the file in one request.
+- Large Bash commands keep their full output in the remote log and send a bounded tail on demand and at completion. Image reads carry existing Base64 data in text frames to avoid encoding it twice.
+- A foreground Bash wait returns at its deadline with the output already received. Use `ssh_task_output` to fetch a running command's latest tail.
+- Reading a directory as a file releases its descriptor on error. A failed worker source check leaves no newly installed build in the cache.
+
 ## 0.7.0
 
 - Workspace reads, writes, edits, uploads, and downloads require explicit rule confirmation. After reviewing `WORKSPACE_RULES_CHANGED`, retry the same call with its `workspace_rules_ack`. Losing the review response leaves the operation paused. Opening a workspace or running Bash can display rules without confirming them for file access.

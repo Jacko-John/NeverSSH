@@ -1,5 +1,6 @@
 /** Exercise upload snapshots and SFTP path handling in an isolated real SSH fixture. */
 import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
+import { createHash, randomBytes } from "node:crypto";
 import { lstat, mkdir, readFile, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { download, upload } from "../src/files/transfers";
@@ -35,6 +36,56 @@ test("upload supports destination names near the filesystem component limit", as
   const result = await upload(ssh, connectionId, { localPath, remotePath, overwrite: false });
   expect(result.path).toBe(remotePath);
   expect(await readFile(remotePath, "utf8")).toBe("long name payload");
+});
+
+test("a multi-chunk upload commits the exact bytes hashed before remote preflight", async () => {
+  const localPath = join(fixture.transfers, "multi-chunk-source");
+  const remotePath = join(fixture.workspace, "multi-chunk-destination");
+  const expected = randomBytes(300 * 1024 + 1);
+  await writeFile(localPath, expected);
+  const run = ssh.run.bind(ssh);
+  const hook = spyOn(ssh, "run").mockImplementation(async (...args) => {
+    if (args[1] === "prepare_upload" && args[2]?.path === remotePath) await writeFile(localPath, "changed after staging");
+    return run(...args);
+  });
+  try {
+    const result = await upload(ssh, connectionId, { localPath, remotePath, overwrite: false });
+    expect(result.sha256).toBe(createHash("sha256").update(expected).digest("hex"));
+    expect(await readFile(remotePath)).toEqual(expected);
+    expect(await readFile(localPath, "utf8")).toBe("changed after staging");
+  } finally { hook.mockRestore(); }
+});
+
+test("upload checks the destination in one request and only sends accepted bytes", async () => {
+  const localPath = join(fixture.transfers, "checked-source");
+  const remotePath = join(fixture.workspace, "checked-target");
+  const missing = join(fixture.workspace, "missing-checked-parent", "target");
+  const expectedSha256 = createHash("sha256").update("previous").digest("hex");
+  await writeFile(localPath, "replacement");
+  await writeFile(remotePath, "previous");
+  await ssh.prepareSftp(connectionId);
+  const run = spyOn(ssh, "run");
+  const sftp = spyOn(ssh, "sftp");
+  try {
+    const args = { localPath, remotePath, overwrite: false };
+    await expect(upload(ssh, connectionId, args)).rejects.toThrow("File exists: set overwrite=true");
+    await expect(upload(ssh, connectionId, { ...args, expectedSha256: "0".repeat(64) }))
+      .rejects.toThrow("Content conflict: SHA-256 does not match");
+    await expect(upload(ssh, connectionId, { ...args, remotePath: missing, expectedSha256 }))
+      .rejects.toThrow("Content conflict: expected file does not exist");
+    expect(await stat(join(fixture.workspace, "missing-checked-parent")).catch(() => null)).toBeNull();
+    expect(sftp).not.toHaveBeenCalled();
+    expect(await readFile(remotePath, "utf8")).toBe("previous");
+    expect(run.mock.calls.map(call => call[1])).toEqual(Array(3).fill("prepare_upload"));
+    run.mockClear();
+    await upload(ssh, connectionId, { ...args, expectedSha256 });
+    expect(run.mock.calls.map(call => call[1])).toEqual(["prepare_upload", "commit_upload"]);
+    expect(sftp).toHaveBeenCalledTimes(1);
+    expect(await readFile(remotePath, "utf8")).toBe("replacement");
+  } finally {
+    run.mockRestore();
+    sftp.mockRestore();
+  }
 });
 
 test("empty transfer roots upload an absolute source outside the fixture allowlist through its symlink", async () => {

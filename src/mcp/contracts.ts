@@ -1,6 +1,7 @@
 /** Public input schemas shared by MCP registration, documentation, and tests. */
 import { z } from "zod";
 import { cleanString, connectSchema } from "../config";
+import { MAX_KNOWN_RULES } from "../workspaces/rules";
 
 const shortId = z.string().refine((value) => /^[a-f0-9]{8}$/.test(value), "Use the short ID returned by ssh_connect");
 export const connectionId = shortId.describe("Short connection_id returned by ssh_connect in this MCP instance.");
@@ -10,11 +11,11 @@ const taskScope = { task_id: taskId };
 const workspaceId = z.string().refine((value) => /^ws_[a-f0-9]{8}$/.test(value), "Use the workspace_id returned by ssh_workspace_open")
   .describe("Workspace handle returned by ssh_workspace_open in this MCP instance.");
 const operationScope = { connection_id: connectionId.optional(), workspace_id: workspaceId.optional() };
+const ruleReceipt = z.string().length(64).refine((value) => /^[a-f0-9]+$/.test(value), "Copy the returned workspace_rules_ack");
 const fileScope = {
   ...operationScope,
-  workspace_rules_ack: z.string().length(64).refine((value) => /^[a-f0-9]+$/.test(value),
-    "Use the workspace_rules_ack from WORKSPACE_RULES_CHANGED").optional()
-    .describe("After reviewing WORKSPACE_RULES_CHANGED, copy its workspace_rules_ack into the retry. Workspace mode only."),
+  workspace_rules_ack: z.union([ruleReceipt, z.array(ruleReceipt).min(1).max(MAX_KNOWN_RULES)]).optional()
+    .describe("After reading the rules, copy the returned value: one code for one rule or an array of codes for several rules. Codes from separate responses may be combined."),
 };
 const scopeMessage = "Provide exactly one connection_id or workspace_id";
 const fileScopeMessage = scopeMessage + ". workspace_rules_ack requires workspace_id";
@@ -70,6 +71,8 @@ export const workspaceContracts = {
     input: z.strictObject({
       connection_id: connectionId,
       path: cleanString.max(4096).describe("Remote project directory; canonicalized when opened. Relative paths resolve against remote HOME."),
+      reread_rules: z.boolean().default(false)
+        .describe("Show the root AGENTS.md again and clear prior rule confirmations. Subdirectory rules appear on the next visit."),
       skill_directories: z.array(cleanString.max(4096)).max(16).default([".agents/skills", ".claude/skills"])
         .describe("Remote skill directories, resolved once from the workspace root. Defaults are .agents/skills and .claude/skills; nested directory discovery is unsupported. Absolute and ~/ paths may select shared remote skills. Use [] to disable discovery."),
     }),

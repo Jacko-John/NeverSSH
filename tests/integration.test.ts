@@ -962,18 +962,26 @@ describe("Bash tasks and archives", () => {
     const warning = "警告：阶段一结束\n";
     const release = join(fixture.workspace, "release-tail-test");
     await writeFile(join(fixture.workspace, "tail-test-input"), body);
-    const command = "cat tail-test-input; printf '警告：阶段一结束\\n' >&2; " +
+    const command = "cat tail-test-input; while [ ! -f emit-tail-warning ]; do sleep 0.05; done; " +
+      "printf '警告：阶段一结束\\n' >&2; " +
       "while [ ! -f release-tail-test ]; do sleep 0.05; done; printf 'final line\\n'";
     const initial = await call("ssh_bash", { connection_id: dev, command, run_in_background: true });
     const scope = taskScope(initial);
     try {
       const path = logPath(initial);
-      const minimumSize = Buffer.byteLength(`Command:\n${command}\n\nOutput:\n` + body + warning);
-      const deadline = Date.now() + 5000;
-      while ((await stat(path)).size < minimumSize) {
-        if (Date.now() > deadline) throw new Error("Large command did not reach its first checkpoint");
-        await delay(10);
-      }
+      const waitForArchive = async (bytes: number) => {
+        const deadline = Date.now() + 5000;
+        while ((await stat(path)).size < bytes) {
+          if (Date.now() > deadline) throw new Error(`Command archive did not reach ${bytes} bytes`);
+          await delay(10);
+        }
+      };
+      // stdout and stderr use separate pipes. Drain stdout before emitting the warning
+      // so it actually belongs to the retained tail on systems with larger pipe buffers.
+      const stdoutEnd = Buffer.byteLength(`Command:\n${command}\n\nOutput:\n` + body);
+      await waitForArchive(stdoutEnd);
+      await writeFile(join(fixture.workspace, "emit-tail-warning"), "");
+      await waitForArchive(stdoutEnd + Buffer.byteLength(warning));
       const query = () => call("ssh_task_output", { ...scope, wait_seconds: 0 });
       const [first, second] = await Promise.all([query(), query()]);
       expect(second).toBe(first);
@@ -982,6 +990,7 @@ describe("Bash tasks and archives", () => {
       expect(first).not.toContain("first line\n");
       expect(await call("ssh_task_list", { connection_id: dev })).not.toContain(scope.task_id);
     } finally {
+      await writeFile(join(fixture.workspace, "emit-tail-warning"), "");
       await writeFile(release, "");
     }
     const done = await call("ssh_task_output", { ...scope, wait_seconds: 5 });

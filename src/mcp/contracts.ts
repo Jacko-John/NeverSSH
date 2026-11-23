@@ -56,7 +56,11 @@ export const commandContracts = {
     }).refine(validOperationScope, scopeMessage),
   },
   ssh_task_output: {
-    input: z.strictObject({ ...taskScope, wait_seconds: z.number().min(0).max(300).default(30) }),
+    input: z.strictObject({
+      ...taskScope,
+      wait_seconds: z.union([z.literal(-1), z.number().min(0).max(300)]).default(30)
+        .describe("Seconds to wait. Use -1 to wait until the task finishes or 0 to query immediately. Client timeouts still apply."),
+    }),
   },
   ssh_task_stop: {
     input: z.strictObject(taskScope),

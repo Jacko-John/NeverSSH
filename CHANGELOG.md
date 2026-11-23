@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.0
+
+- Use `ssh_task_output` with `wait_seconds: -1` to wait for a remote task to finish in one query. Cancelling the query leaves the command running, and the same task ID can be queried again.
+- Installation examples set a two-hour tool-call timeout for NeverSSH. Update an existing MCP registration to allow the same window for long waits.
+
 ## 0.8.0
 
 - Workspace open, Bash guidance, and paused file calls return one confirmation code per rule version. File calls accept a single code or an array and confirm only the rules that apply to their target. Codes for unchanged rules can be reused across files even after heavy activity in other directories.

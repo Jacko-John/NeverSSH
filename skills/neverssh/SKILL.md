@@ -36,8 +36,9 @@ After conversation compaction or loss of project context, reopen with the same c
 - `ssh_bash({workspace_id,command,cwd?})` runs a fresh non-interactive Bash (`--noprofile --norc`, stdin at EOF, no PTY). Shell state does not persist; put `VAR=1` in the command. Workspace `cwd` defaults to the project root. For operations outside a project, use `connection_id` instead; its default directory is remote HOME.
 - A short successful command returns its output. Background runs, wait expiry, truncation, or failure also return a `task_id`. The original result stays in the first MCP text block; workspace rule changes, if any, appear in a separate second block.
 - A command that exits nonzero has still run and can return rule changes. Do not replay it merely because guidance was returned. Started or background commands deliver guidance with their first result.
-- `run_in_background=true` returns at startup. Otherwise `wait_seconds` controls the foreground wait (default 120 seconds, maximum 600). Expiry leaves the process running. Task-output queries wait up to 300 seconds. A standalone search such as `rg` can return exit 1 as a valid result.
-- Follow with `ssh_task_output`, stop with `ssh_task_stop`, and find unread results with `ssh_task_list`.
+- Use `run_in_background: true` to return at startup. Timed foreground waits use `wait_seconds` (default 120, maximum 600). Timed task-output queries default to 30 seconds and accept up to 300. When a wait expires, the command keeps running.
+- When the next step needs a long-running command's final result, use `ssh_task_output({task_id,wait_seconds:-1})` with the ID from the launch. Allow two hours for the query in the MCP client as described in the installation reference. Stop tasks with `ssh_task_stop` and find unread results with `ssh_task_list`.
+- A standalone search such as `rg` can return exit 1 as a valid result.
 - Use `ssh_bash` for `ls`, `find`, and `rg` as well.
 
 ## Read and edit

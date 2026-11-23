@@ -174,6 +174,25 @@ test("foreground waits for completion even after output arrives", async () => {
   expect(fixture.messages).toEqual([]);
 });
 
+test("a blocking query waits beyond the timed limit and returns the final output", async () => {
+  const { id, channel } = await start();
+  jest.useFakeTimers();
+  try {
+    const waiting = tasks.output(id, null);
+    const timed = tasks.output(id, 300_000);
+    fixture.output(channel, Buffer.from("started\n"));
+    jest.advanceTimersByTime(601_000);
+    expect(await timed).toMatchObject({ finished: false });
+
+    fixture.output(channel, Buffer.from("finished\n"));
+    fixture.finish(channel);
+    const result = await waiting;
+    expect(result).toMatchObject({ finished: true, exit_code: 0, task_id: id });
+    expect(bashResult(result, "fixture").text).toBe("started\nfinished\n");
+    expect(fixture.messages).toEqual([]);
+  } finally { jest.useRealTimers(); }
+});
+
 test("literal Bash argument recognition preserves quotes and rejects shell evaluation", () => {
   expect(simpleCommandWords(`  cat  'one 'two\\ three "four\\q" '' "a\\$b"  `, REMOTE_HOME))
     .toEqual(["cat", "one two three", "four\\q", "", "a$b"]);
@@ -235,7 +254,7 @@ test("a complete foreground result stays unread until its response is ready", as
   expect(tasks.list()).toHaveLength(0);
 });
 
-test("zero wait yields and cancelling a later query leaves the task running", async () => {
+test.each([300_000, null])("zero wait yields and cancelling a query with wait %p leaves the task running", async (waitMs) => {
   const pending = tasks.execute(CONNECTION, "fixture", undefined, 0);
   await Promise.resolve();
   fixture.started(fixture.channels[0]!);
@@ -244,7 +263,7 @@ test("zero wait yields and cancelling a later query leaves the task running", as
   expect(bashResult(initial, "fixture").text).toContain("Task: ");
   expect(bashResult(initial, "fixture").text).toContain("running in background");
   const controller = new AbortController();
-  const query = tasks.output(initial.task_id, 300000, controller.signal);
+  const query = tasks.output(initial.task_id, waitMs, controller.signal);
   controller.abort();
   await expect(query).rejects.toMatchObject({ code: "OPERATION_CANCELLED" });
   expect(tasks.snapshot(initial.task_id).finished).toBe(false);
@@ -337,11 +356,14 @@ test("a lost connection reports the last progress and only previously received p
   const { id, channel } = await start();
   fixture.output(channel, Buffer.from("confirmed"));
   emit(channel, { event: "progress", outputBytes: 80000 });
+  const waiting = tasks.output(id, null);
   const pending = tasks.output(id, 0);
   await Promise.resolve();
   channel.finish(255);
-  expect(await pending).toMatchObject({ finished: true, exit_code: null, output_bytes: 80000, size_known: false,
+  const result = await pending;
+  expect(result).toMatchObject({ finished: true, exit_code: null, output_bytes: 80000, size_known: false,
     preview_complete: false, output_complete: false, preview: [{ stream: "stdout", text: "confirmed" }] });
+  expect(await waiting).toEqual(result);
 });
 
 test("a foreground deadline returns the received preview without another SSH request", async () => {

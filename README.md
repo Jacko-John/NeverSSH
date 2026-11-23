@@ -91,48 +91,42 @@ curl -fsSL https://github.com/Jacko-John/NeverSSH/releases/latest/download/never
 chmod +x ~/.local/bin/neverssh
 ```
 
-在 Claude Code 的 `.mcp.json` 中填写 launcher 的绝对路径。这个示例将工具调用超时设为 660 秒（660000 毫秒），为最长的前台等待预留启动和响应时间。
+在 Claude Code 的 `.mcp.json` 中填写 launcher 的绝对路径。这个示例将 NeverSSH 的工具调用超时设为两小时（7200000 毫秒）。
 
 ```json
 {
   "mcpServers": {
     "neverssh": {
       "command": "/Users/you/.local/bin/neverssh",
-      "timeout": 660000
+      "timeout": 7200000
     }
   }
 }
 ```
 
-其他 MCP 客户端请在各自的设置中将工具调用超时和空闲超时设为至少 660 秒。需要给 launcher 指定 NeverSSH 配置文件时，可以传入 `--config`。
+Codex 在 `[mcp_servers.neverssh]` 中设置 `tool_timeout_sec = 7200`。其他 MCP 客户端也为该服务设置两小时的工具调用超时。若客户端另有空闲超时，也允许等待两小时。各客户端的设置和 Claude Code 保持前台等待的方式见[安装说明](skills/neverssh/references/installation.md#register-the-mcp-server)。
 
-```json
-{
-  "mcpServers": {
-    "neverssh": {
-      "command": "/Users/you/.local/bin/neverssh",
-      "args": ["--config", "/absolute/path/neverssh.config.json"]
-    }
-  }
-}
-```
+需要给 launcher 指定 NeverSSH 配置文件时，在客户端配置的 `args` 里加入 `["--config", "/absolute/path/neverssh.config.json"]`。
 
 launcher 需要本机有 `curl`、`bun` 1.3+ 和 OpenSSH 客户端。有缓存时启动不等待网络，解析或下载失败只影响后台刷新，留待下次启动重试；只有缓存为空的首次启动需要网络。GUI 客户端需要可用的 `ssh` 搜索路径和 SSH Agent 环境。
 
 ### 从源码开发
+
+在 Claude Code 中可用以下配置从源码启动。
 
 ```json
 {
   "mcpServers": {
     "neverssh": {
       "command": "/absolute/path/to/bun",
-      "args": ["run", "/absolute/path/to/NeverSSH/src/index.ts"]
+      "args": ["run", "/absolute/path/to/NeverSSH/src/index.ts"],
+      "timeout": 7200000
     }
   }
 }
 ```
 
-需要自定义配置时，在 `args` 中增加 `--config` 和配置文件绝对路径。
+其他客户端从源码启动时，也要配置两小时的工具调用超时。需要自定义配置时，在 `args` 中增加 `--config` 和配置文件绝对路径。
 
 工作区通过普通 MCP 工具提供上下文；MCP 无法重定向客户端自带的本地 shell、编辑器或搜索工具，也不能保证客户端自动加载规则。仓库内的 [Agent skill](skills/neverssh/SKILL.md) 覆盖安装、工作区上下文和远端开发流程。以 Claude Code 为例，复制到用户级 skill 目录即可使用：
 
@@ -227,7 +221,15 @@ Connection: 7a2c9d4f
 
 `ssh_task_list` 列出有未读输出的任务。前台命令结束后，只要 `ssh_bash` 已完整返回结果，就会标为已读，报错也一样。想回看报错时，可用原响应中的 `task_id` 调用 `ssh_task_output`。
 
-`ssh_bash` 默认等待 120 秒，最长 600 秒。`ssh_task_output` 默认等待 30 秒，最长 300 秒。两者都支持小数。等待到期后原进程继续运行，设置 `run_in_background=true` 可在启动后立即返回。单独运行 `rg`、`grep` 等命令时，退出码 1 也能作为正常结果返回，例如一次没有匹配项的搜索。
+使用 `wait_seconds` 计时等待时，`ssh_bash` 默认 120 秒，上限 600 秒。`ssh_task_output` 默认 30 秒，上限 300 秒。两者都支持小数。等待到期后原进程继续运行，设置 `run_in_background: true` 可在启动后立即返回。单独运行 `rg`、`grep` 等命令时，退出码 1 也能作为正常结果返回，例如一次没有匹配项的搜索。
+
+需要等长任务结束时，先用 `ssh_bash` 设置 `run_in_background: true` 获取任务 ID，再用这个 ID 调用 `ssh_task_output`。
+
+```json
+{"task_id":"task_c2f091ab","wait_seconds":-1}
+```
+
+这次查询会等待任务结束再返回。客户端的调用超时和空闲超时应覆盖预计等待时间。
 
 每次命令使用独立的 Bash，stdin 默认为 EOF，没有 PTY。连接模式的 `cwd` 默认是远端 HOME，工作区模式默认是项目根目录；`cd` 和变量不会延续到下一条命令。环境变量可直接写进命令，例如 `CI=1 make test`。
 
@@ -284,8 +286,8 @@ JavaScript/TypeScript 使用 Bun。本地 Python 检查和测试解释器由 uv 
 推送 `v*` 标签会触发 GitHub Actions：
 
 ```sh
-git tag -a v0.8.0 -m "NeverSSH 0.8.0"
-git push origin v0.8.0
+git tag -a v0.9.0 -m "NeverSSH 0.9.0"
+git push origin v0.9.0
 ```
 
 工作流运行检查、测试和构建，并上传 `neverssh.js`、`neverssh` launcher 和 `neverssh.config.example.json` 到对应 Release。launcher 在后台解析 `releases/latest`，新标签在用户下一次启动时生效，无需修改 MCP 配置。

@@ -122,6 +122,8 @@ describe("MCP and connections", () => {
     }
     expect(Object.keys(listing.tools.find((tool) => tool.name === "ssh_bash")?.inputSchema.properties ?? {}))
       .toEqual(["connection_id", "workspace_id", "command", "cwd", "run_in_background", "wait_seconds"]);
+    expect(Object.keys(listing.tools.find((tool) => tool.name === "ssh_task_output")?.inputSchema.properties ?? {}))
+      .toEqual(["task_id", "wait_seconds"]);
     expect(Object.keys(listing.tools.find((tool) => tool.name === "ssh_task_stop")?.inputSchema.properties ?? {}))
       .toEqual(["task_id"]);
     for (const name of ["ssh_discover", "ssh_sessions"]) {
@@ -811,6 +813,28 @@ describe("Bash tasks and archives", () => {
       connection_id: dev, command: "sleep 0.1; printf completed", wait_seconds: 0.5,
     });
     expect(fractional).toBe("completed");
+  });
+
+  test("a wait of -1 returns the final result even when another query is cancelled", async () => {
+    const background = await call("ssh_bash", {
+      connection_id: dev, run_in_background: true,
+      command: "while [ ! -f release-blocking-query ]; do sleep 0.01; done; printf finished",
+    });
+    const task = taskScope(background);
+    const args = { ...task, wait_seconds: -1 };
+    const pending = call("ssh_task_output", args);
+    const controller = new AbortController();
+    const other = client.callTool({ name: "ssh_task_output", arguments: args }, { signal: controller.signal });
+    try {
+      expect(await call("ssh_task_output", { ...task, wait_seconds: 0 })).toContain("(running in background)");
+      controller.abort(new Error("Query cancelled by test"));
+      await expect(other).rejects.toThrow("Query cancelled by test");
+    } finally {
+      await writeFile(join(fixture.workspace, "release-blocking-query"), "");
+    }
+    const final = await pending;
+    expect(final).toContain("(completed)");
+    expect(final).toContain("stdout:\nfinished");
   });
 
   test("expected exit 1 is accepted on the initial call while queries report the process exit", async () => {

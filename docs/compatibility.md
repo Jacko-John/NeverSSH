@@ -2,6 +2,10 @@
 
 NeverSSH 不安装远端服务。远端 Python 源码由本地包提供，首次连接写入内容寻址的构建缓存，后续连接复用。
 
+## 0.9.0 客户端升级
+
+调用 `ssh_task_output` 时，可以用 `wait_seconds: -1` 在同一次查询中等到任务结束。为已有的 NeverSSH 注册项设置两小时的工具调用超时。具体设置见[安装说明](../skills/neverssh/references/installation.md#register-the-mcp-server)。
+
 ## 0.8.0 客户端升级
 
 客户端读完打开工作区、Bash 或文件调用返回的规则后，把 `workspace_rules_ack` 原样用于文件调用。一份规则返回一个字符串，多份规则返回一组逐条确认码。同一数组可以用于多个文件，每次只确认适用于该文件的当前规则版本。普通刷新保留确认。对话丢失上下文后，重新打开工作区时请传 `reread_rules: true`。
@@ -56,7 +60,7 @@ skill 默认只从工作区根目录的 `.agents/skills`、`.claude/skills` 发�
 
 | 维度 | 当前值 | 兼容规则 |
 | --- | --- | --- |
-| MCP 服务版本 | `0.8.0` | `0.x` 阶段不兼容接口调整升 minor；`1.0` 起按 semver 升 major |
+| MCP 服务版本 | `0.9.0` | `0.x` 阶段不兼容接口调整升 minor；`1.0` 起按 semver 升 major |
 | worker 协议 | `4` | JSON 行支持条件读取、文本分片和按需命令预览。协议不匹配时返回 `PROTOCOL_INCOMPATIBLE` |
 | 构建 ID | 源码内容哈希 | 本地与远端必须完全一致；不匹配返回 `BUILD_MISMATCH` |
 | 最低 Python | `3.8` | 在加载任何源码前检查；过旧返回 `RUNTIME_UNSUPPORTED` |

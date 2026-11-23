@@ -274,9 +274,12 @@ test("Bash contracts expose only the execution controls and typed task handles",
   expect(defaults).toEqual({ connection_id: bashScope.connection_id, command: "make test", run_in_background: false, wait_seconds: 120 });
   for (const option of [
     { timeout_seconds: 600 }, { timeout_ms: 1000 }, { wait_ms: 0 }, { env: { CI: "1" } },
-    { shell: "/bin/bash" }, { host: "other" }, { description: "run tests" },
+    { shell: "/bin/bash" }, { host: "other" }, { description: "run tests" }, { wait_seconds: -1 },
   ]) expect(bash.safeParse({ ...defaults, ...option }).success).toBe(false);
-  expect(commandContracts.ssh_task_output.input.parse(taskScope)).toEqual({ ...taskScope, wait_seconds: 30 });
+  const output = commandContracts.ssh_task_output.input;
+  expect(output.parse(taskScope)).toEqual({ ...taskScope, wait_seconds: 30 });
+  expect(output.parse({ ...taskScope, wait_seconds: -1 })).toEqual({ ...taskScope, wait_seconds: -1 });
+  expect(output.safeParse({ ...taskScope, wait_seconds: "-1" }).success).toBe(false);
   expect(commandContracts.ssh_task_stop.input.parse(taskScope)).toEqual(taskScope);
   expect(commandContracts.ssh_task_list.input.parse({})).toEqual({});
   expect(commandContracts.ssh_task_list.input.parse({ connection_id: "1234abcd" })).toEqual({ connection_id: "1234abcd" });
@@ -286,7 +289,7 @@ test("Bash contracts expose only the execution controls and typed task handles",
     expect(commandContracts.ssh_task_stop.input.safeParse({ task_id }).success).toBe(false);
   }
   expect(commandContracts.ssh_task_stop.input.safeParse({ ...taskScope, connection_id: "1234abcd" }).success).toBe(false);
-  expect(commandContracts.ssh_task_output.input.safeParse({ ...taskScope, cursor: 0 }).success).toBe(false);
+  expect(output.safeParse({ ...taskScope, cursor: 0 }).success).toBe(false);
   expect(commandContracts.ssh_task_stop.input.safeParse({ ...taskScope, signal: "SIGKILL" }).success).toBe(false);
 });
 
@@ -309,7 +312,7 @@ test("connection inputs reject host overrides on follow-up calls and invalid com
   }
 });
 
-test("foreground and query waits accept fractional seconds and enforce distinct caps", () => {
+test("timed waits accept fractional seconds and enforce distinct caps", () => {
   const cases = [
     { schema: commandContracts.ssh_bash.input, max: 600, args: { connection_id: "1234abcd", command: "true" } },
     { schema: commandContracts.ssh_task_output.input, max: 300, args: { task_id: "task_abcd1234" } },
@@ -318,7 +321,7 @@ test("foreground and query waits accept fractional seconds and enforce distinct 
     for (const wait_seconds of [0, 0.5, 120, max - 0.5, max]) {
       expect(schema.safeParse({ ...args, wait_seconds }).success).toBe(true);
     }
-    for (const wait_seconds of [-0.1, max + 0.1, Infinity, NaN]) {
+    for (const wait_seconds of [-2, -1.1, -0.1, max + 0.1, Infinity, NaN]) {
       expect(schema.safeParse({ ...args, wait_seconds }).success).toBe(false);
     }
     expect(schema.safeParse({ ...args, wait_ms: 1000 }).success).toBe(false);

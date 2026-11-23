@@ -53,7 +53,7 @@ const descriptions: Record<string, Record<string, string>> = {
   },
   "ssh_task_output.input": {
     ...taskScope,
-    wait_seconds: "最多等待任务结束的秒数，支持小数。0 表示直接查询当前预览。获取远端预览最多另等 5 秒。",
+    wait_seconds: "设为 -1 等到任务结束。计时等待取 0～300 秒，支持小数，0 表示立即查询当前预览。获取远端预览最多另等 5 秒。",
   },
   "ssh_task_stop.input": taskScope,
   "ssh_task_list.input": {

@@ -32,29 +32,35 @@ The launcher runs the cached `neverssh.js` from `${XDG_CACHE_HOME:-$HOME/.cache}
 
 ## Register the MCP server
 
+Set a two-hour tool-call timeout for NeverSSH. When the client exposes a separate idle timeout, allow two hours there too. This gives `ssh_task_output` with `wait_seconds: -1` time to return the final result of a long-running task.
+
 ### Claude Code
 
-```sh
-claude mcp add neverssh --scope user -- "$HOME/.local/bin/neverssh"
-```
-
-`--scope user` makes the server available in all projects. Use `--scope project` for a repository, or `local` for the current project only.
-
-With a custom configuration file:
+Substitute the launcher's absolute path in the registration command. The `timeout` field takes milliseconds. For an existing registration, set `"timeout": 7200000` in the server's existing configuration entry. [Claude Code tool-call time limits](https://code.claude.com/docs/en/mcp#time-limits-on-mcp-tool-calls)
 
 ```sh
-claude mcp add neverssh --scope user -- "$HOME/.local/bin/neverssh" --config /absolute/path/neverssh.config.json
+claude mcp add-json neverssh \
+  '{"type":"stdio","command":"/absolute/path/to/neverssh","timeout":7200000}' \
+  --scope user
 ```
 
-Verify and restart the session so the tools load:
+`--scope user` makes the server available in all projects. Use `--scope project` for a repository, or `--scope local` for the current project only. For a custom NeverSSH configuration, add `"args": ["--config", "/absolute/path/neverssh.config.json"]` to the same JSON object.
+
+To keep long tool calls in the current interactive turn, start the client with automatic backgrounding disabled for that session. [Claude Code backgrounding settings](https://code.claude.com/docs/en/mcp#automatic-backgrounding-of-long-tool-calls)
 
 ```sh
-claude mcp list
+CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0 claude
 ```
 
-Register an absolute path. MCP clients spawn the command directly, without a shell, so `~` is not expanded. A configuration that says `~/.local/bin/neverssh` fails with `ENOENT` even though the file exists.
+### Codex
 
-For the full 600-second foreground wait, allow at least 660 seconds for tool calls, including any idle deadline. In Claude Code set `"timeout": 660000` on the `neverssh` server entry in `.mcp.json`. This value is in milliseconds. [Claude Code timeout settings](https://code.claude.com/docs/en/env-vars)
+Add the server to `~/.codex/config.toml`, or update its existing table. Codex measures `tool_timeout_sec` in seconds. [Codex MCP configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)
+
+```toml
+[mcp_servers.neverssh]
+command = "/absolute/path/to/neverssh"
+tool_timeout_sec = 7200
+```
 
 ### JSON configuration for other clients
 
@@ -69,7 +75,7 @@ For the full 600-second foreground wait, allow at least 660 seconds for tool cal
 }
 ```
 
-Omit `args` when using the default configuration. Use the absolute path in `command`. Set the client’s tool-call and idle timeouts to at least 660 seconds using that client’s settings.
+Omit `args` when using the default configuration. Use an absolute path in `command` because MCP clients spawn the executable directly. Set the client's tool-call and idle timeouts to two hours using its own settings and units.
 
 GUI clients do not inherit a terminal environment. Make sure the client can find `ssh`, `bun`, and the user's SSH agent through `SSH_AUTH_SOCK`. If Bun is not on the GUI `PATH`, use the source form below with an absolute Bun path.
 
@@ -81,18 +87,21 @@ cd NeverSSH
 bun install --frozen-lockfile
 ```
 
+For Claude Code, register the source checkout with this configuration.
+
 ```json
 {
   "mcpServers": {
     "neverssh": {
       "command": "/absolute/path/to/bun",
-      "args": ["run", "/absolute/path/to/NeverSSH/src/index.ts"]
+      "args": ["run", "/absolute/path/to/NeverSSH/src/index.ts"],
+      "timeout": 7200000
     }
   }
 }
 ```
 
-Add `--config` and the configuration file path to `args` when needed. Restart the client after any configuration change.
+Add `--config` and the configuration file path to `args` when needed. For other clients, use the same command and arguments with the two-hour timeout in that client's settings. Restart the client after any configuration change.
 
 ## Verify the server
 

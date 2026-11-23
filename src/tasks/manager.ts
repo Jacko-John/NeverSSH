@@ -329,10 +329,10 @@ export class TaskManager {
     return signal ? bounded(pending.promise, 5000, "TASK_PREVIEW_TIMEOUT", message, signal) : pending.promise;
   }
 
-  /** Wait for closure, not merely the next output chunk; the budget never restarts on output. */
-  private async wait(task: Task, waitMs: number, signal?: AbortSignal): Promise<void> {
+  /** Wait for channel closure or cancellation. Null leaves the wait without a deadline. */
+  private async wait(task: Task, waitMs: number | null, signal?: AbortSignal): Promise<void> {
     checkAbort(signal);
-    if (task.finishedAt !== undefined || waitMs <= 0) return;
+    if (task.finishedAt !== undefined || (waitMs !== null && waitMs <= 0)) return;
     await new Promise<void>((resolve, reject) => {
       const cleanup = () => {
         clearTimeout(timer);
@@ -342,7 +342,7 @@ export class TaskManager {
       const done = () => { cleanup(); resolve(); };
       const changed = () => { if (task.finishedAt !== undefined) done(); };
       const abort = () => { cleanup(); reject(new ToolError("OPERATION_CANCELLED", "Waiting cancelled")); };
-      const timer = setTimeout(done, waitMs);
+      const timer = waitMs === null ? undefined : setTimeout(done, waitMs);
       task.changed.on("change", changed);
       signal?.addEventListener("abort", abort, { once: true });
       if (signal?.aborted) abort();
@@ -371,7 +371,7 @@ export class TaskManager {
   }
 
   /** Interrupting a later query leaves its already reported command running. */
-  async output(taskId: string, waitMs = 30000, signal?: AbortSignal): Promise<TaskResult> {
+  async output(taskId: string, waitMs: number | null = 30000, signal?: AbortSignal): Promise<TaskResult> {
     const task = this.get(taskId);
     await this.wait(task, waitMs, signal);
     const result = await this.currentPreview(task, signal);

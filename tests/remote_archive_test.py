@@ -1,4 +1,5 @@
 """Exercise retention and quotas against real POSIX locks and temporary archive files."""
+from contextlib import closing
 import fcntl
 import json
 import multiprocessing
@@ -8,6 +9,7 @@ import stat
 import sys
 import tempfile
 import time
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -65,9 +67,9 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.stat(Path(task.path).parent).st_mode), 0o700)
 
     def test_cleanup_rate_limit_marker(self):
-        self.assertTrue(self.store.cleanup_due())
-        self.store.mark_cleanup()
-        self.assertFalse(self.store.cleanup_due())
+        self.assertTrue(self.store.maintenance_due(".cleanup"))
+        self.store.mark_complete(".cleanup")
+        self.assertFalse(self.store.maintenance_due(".cleanup"))
 
     def test_original_multiline_command_is_preserved_in_log_and_metadata(self):
         command = "printf '%s\\n' '中文 $value'\n# trailing whitespace  \n"
@@ -227,10 +229,40 @@ class ArchiveTests(unittest.TestCase):
         task.finish(0, None)
         with self.store.guard():
             self.store.set_usage(8192)
-        self.store.cleanup()
+        self.store.reconcile_usage()
         with self.store.guard():
             self.assertEqual(self.store.usage(), task.output_offset + 10)
         self.assertEqual(Path(task.path).read_bytes()[task.output_offset:], b"real bytes")
+
+    def test_background_recount_preserves_concurrent_appends(self):
+        task = self.task()
+        with closing(ArchiveStore(4096, 8192, str(self.root))) as writer:
+            concurrent = writer.new_task("1234abcd", "task_22222222", COMMAND)
+            try:
+                stopping = threading.Event()
+                with self.store.guard():
+                    self.store.set_usage(self.store.usage() + 2000)
+                count = self.store.total_bytes
+
+                def racing_count():
+                    total = count()
+                    concurrent.append(b"after the count")
+                    return total
+
+                with patch.object(self.store, "total_bytes", racing_count):
+                    self.store.maintain(stopping)
+                self.assertFalse(self.store.maintenance_due(".cleanup"))
+                self.assertTrue(self.store.maintenance_due(".quota-reconciled"))
+                with self.store.guard():
+                    self.assertEqual(self.store.usage(), count() + 2000)
+                with patch.object(self.store, "cleanup", side_effect=AssertionError("duplicate log sweep")):
+                    self.store.maintain(stopping)
+                self.assertFalse(self.store.maintenance_due(".quota-reconciled"))
+                with self.store.guard():
+                    self.assertEqual(self.store.usage(), self.store.total_bytes())
+            finally:
+                concurrent.finish(0, None)
+                task.finish(0, None)
 
     def test_concurrent_processes_cannot_overrun_the_shared_budget(self):
         context = multiprocessing.get_context("spawn")

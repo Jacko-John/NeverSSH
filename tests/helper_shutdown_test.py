@@ -16,7 +16,7 @@ BOOTSTRAP = """import errno,json,os,subprocess,sys,types
 from pathlib import Path
 archive = types.ModuleType("neverssh_archive")
 exec(compile(Path(sys.argv[1]).read_text(), sys.argv[1], "exec"), archive.__dict__)
-sys.modules["neverssh_archive"] = archive
+sys.modules["archive"] = archive
 original_popen = subprocess.Popen
 def exited_command(*args, **kwargs):
     child = original_popen(*args, **kwargs)
@@ -39,6 +39,7 @@ if sys.argv[3] == "permission-error":
     os.killpg = denied_signal
 payload = {"request": json.loads(sys.stdin.buffer.readline())}
 exec(compile(Path(sys.argv[2]).read_text(), sys.argv[2], "exec"))
+sys.exit(run_task(payload["request"], bytearray()))
 """
 
 

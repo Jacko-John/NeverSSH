@@ -79,6 +79,7 @@ class ArchiveStore:
     """Serialize quota accounting and cleanup across concurrent SSH workers."""
 
     def __init__(self, max_task_bytes, max_archive_bytes, root=None):
+        self.write_revision = int.from_bytes(os.urandom(8), "big")
         self.max_task_bytes = max_task_bytes
         self.max_archive_bytes = max_archive_bytes
         base = root or os.path.join(os.path.expanduser("~"), ".neverssh")
@@ -87,17 +88,17 @@ class ArchiveStore:
         private_directory(self.root)
         self.guard_fd = private_file(os.path.join(base, ".archive.lock"), os.O_RDWR | os.O_CREAT)
 
-    def cleanup_due(self, interval=3600):
+    def maintenance_due(self, marker):
         """Persist cleanup time so short-lived connections do not rescan every archive."""
-        marker = os.path.join(os.path.dirname(self.root), ".cleanup")
+        marker = os.path.join(os.path.dirname(self.root), marker)
         try:
-            return time.time() - os.stat(marker).st_mtime >= interval
+            return time.time() - os.stat(marker).st_mtime >= 3600
         except OSError:
             return True
 
-    def mark_cleanup(self):
+    def mark_complete(self, marker):
         """Record a completed cleanup without changing the shared quota counter."""
-        marker = os.path.join(os.path.dirname(self.root), ".cleanup")
+        marker = os.path.join(os.path.dirname(self.root), marker)
         descriptor = private_file(marker, os.O_WRONLY | os.O_CREAT)
         try:
             os.utime(descriptor, None)
@@ -167,7 +168,7 @@ class ArchiveStore:
             return TaskArchive(self, prefix, log, lock, connection_id, task_id, command, header)
 
     def total_bytes(self):
-        """Reconcile actual regular-log sizes while all archive writers are excluded."""
+        """Count regular-log bytes for quota initialization or a validated background snapshot."""
         total = 0
         for session in os.scandir(self.root):
             if not CONNECTION_ID.fullmatch(session.name) or not session.is_dir(follow_symlinks=False):
@@ -178,8 +179,11 @@ class ArchiveStore:
         return total
 
     def set_usage(self, value):
-        """Store one fixed-width counter under the same lock used for log writes."""
-        os.pwrite(self.guard_fd, struct.pack("!Q", value), 0)
+        """Publish quota and its revision under the same lock used for log writes."""
+        # Legacy writers use the first eight bytes. A writer-specific revision
+        # also detects a write followed by a rollback to the same byte count.
+        self.write_revision = (self.write_revision + 1) % (1 << 64)
+        os.pwrite(self.guard_fd, struct.pack("!QQ", value, self.write_revision), 0)
 
     def usage(self):
         """Rebuild a missing counter after first use; connect/cleanup also reconciles crashes."""
@@ -207,23 +211,73 @@ class ArchiveStore:
             return False
         return isinstance(metadata, dict) and metadata.get("format") in (None, FORMAT)
 
-    def cleanup(self, now=None):
+    def cleanup(self, now=None, stopping=None):
         """Delete expired inactive tasks, then prune empty sessions without active workers."""
         now = time.time() if now is None else now
-        with self.guard():
-            for session in os.scandir(self.root):
-                if not CONNECTION_ID.fullmatch(session.name) or not session.is_dir(follow_symlinks=False):
-                    continue
+        for session in os.scandir(self.root):
+            if stopping is not None and stopping.is_set():
+                return
+            if not CONNECTION_ID.fullmatch(session.name) or not session.is_dir(follow_symlinks=False):
+                continue
+            try:
                 if not self.known_session(session.path):
                     continue
                 for entry in os.scandir(session.path):
-                    if entry.name.endswith(".log") and TASK_ID.fullmatch(entry.name[:-4]) and entry.is_file(follow_symlinks=False):
-                        self.cleanup_task(entry.path[:-4], now)
-                    elif entry.name.startswith(".metadata-") and entry.is_file(follow_symlinks=False):
-                        if now - entry.stat(follow_symlinks=False).st_mtime >= RETENTION_SECONDS:
-                            os.unlink(entry.path)
-                self.prune_session(session.path)
-            self.set_usage(self.total_bytes())
+                    if stopping is not None and stopping.is_set():
+                        return
+                    if entry.name.endswith(".log") and TASK_ID.fullmatch(entry.name[:-4]):
+                        with self.guard():
+                            if entry.is_file(follow_symlinks=False):
+                                self.cleanup_task(entry.path[:-4], now)
+                    elif entry.name.startswith(".metadata-"):
+                        with self.guard():
+                            if entry.is_file(follow_symlinks=False) and now - entry.stat().st_mtime >= RETENTION_SECONDS:
+                                os.unlink(entry.path)
+                with self.guard():
+                    self.prune_session(session.path)
+            except FileNotFoundError:
+                # An older worker can still clean archives using its original lock.
+                continue
+
+    def reconcile_usage(self):
+        """Commit a disk recount only if nobody changed the quota during the scan."""
+        # Recover interrupted reservations only from a quiet snapshot. A writer
+        # during the scan leaves its own counter authoritative until the next pass.
+        with self.guard():
+            before = self.accounting_stamp()
+        try:
+            total = self.total_bytes()
+        except FileNotFoundError:
+            return False
+        with self.guard():
+            if self.accounting_stamp() != before:
+                return False
+            self.set_usage(total)
+            return True
+
+    def accounting_stamp(self):
+        info = os.fstat(self.guard_fd)
+        return os.pread(self.guard_fd, 16, 0), info.st_mtime_ns, info.st_ctime_ns
+
+    def maintain(self, stopping):
+        """Elect one cleaner per account, independently of the quota lock."""
+        if not (self.maintenance_due(".cleanup") or self.maintenance_due(".quota-reconciled")):
+            return
+        lock = private_file(os.path.join(os.path.dirname(self.root), ".maintenance.lock"), os.O_RDWR | os.O_CREAT)
+        try:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            if self.maintenance_due(".cleanup"):
+                self.cleanup(stopping=stopping)
+                if not stopping.is_set():
+                    self.mark_complete(".cleanup")
+            if not stopping.is_set() and self.maintenance_due(".quota-reconciled"):
+                if self.reconcile_usage():
+                    self.mark_complete(".quota-reconciled")
+        finally:
+            os.close(lock)
 
     def cleanup_task(self, prefix, now):
         """An exclusive task lock proves that no helper is still writing this log."""
@@ -233,7 +287,8 @@ class ArchiveStore:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return
-            modified = os.lstat(prefix + ".log").st_mtime
+            info = os.lstat(prefix + ".log")
+            modified = info.st_mtime
             expires = modified + RETENTION_SECONDS
             metadata_exists = os.path.exists(prefix + ".meta.json")
             try:
@@ -253,7 +308,10 @@ class ArchiveStore:
         finally:
             os.close(descriptor)
         # The archive guard excludes new tasks while we remove the now-closed lock.
-        for extension in (".log", ".meta.json", ".lock"):
+        used = self.usage()
+        os.unlink(prefix + ".log")
+        self.set_usage(max(0, used - info.st_size))
+        for extension in (".meta.json", ".lock"):
             try:
                 os.unlink(prefix + extension)
             except FileNotFoundError:
@@ -267,9 +325,12 @@ class ArchiveStore:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return
-            entries = os.listdir(directory)
-            if set(entries) - {".session.lock", "session.json"}:
-                return
+            entries = []
+            with os.scandir(directory) as contents:
+                for entry in contents:
+                    if entry.name not in (".session.lock", "session.json"):
+                        return
+                    entries.append(entry.name)
         finally:
             os.close(descriptor)
         # Keep the archive guard while deleting only the entries we checked.

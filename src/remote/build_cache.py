@@ -3,7 +3,9 @@
 The bootstrap sends this source over SSH before any cached code runs. It keeps
 the on-disk build immutable and holds a shared lease for the worker lifetime.
 """
+from contextlib import contextmanager
 import calendar
+import importlib
 import fcntl
 import hashlib
 import json
@@ -84,8 +86,11 @@ def manifest_path(build_dir):
     return os.path.join(build_dir, "manifest.json")
 
 
-def verify(build_dir, expected):
-    """Verify the manifest shape and every source hash before executing cache code."""
+def installed(build_dir, expected):
+    """Recognize a private, atomically published installation by its build manifest."""
+    if not os.path.isdir(build_dir) or os.path.islink(build_dir):
+        return False
+    private_directory(build_dir)
     try:
         manifest = json.loads(read_text(manifest_path(build_dir)))
     except (OSError, ValueError, UnicodeError):
@@ -95,6 +100,13 @@ def verify(build_dir, expected):
     for key in ("build_id", "protocol", "min_python", "archive_format", "sources"):
         if manifest.get(key) != expected.get(key):
             return False
+    return True
+
+
+def verify(build_dir, expected):
+    """Check every installed byte before publishing a new build."""
+    if not installed(build_dir, expected):
+        return False
     sources = expected.get("sources")
     if not isinstance(sources, dict):
         return False
@@ -109,11 +121,13 @@ def verify(build_dir, expected):
     return True
 
 
-def install(build_dir, expected, sources, builds):
-    """Write a verified build into a temporary directory, then rename it into place."""
-    temporary = tempfile.mkdtemp(prefix=".tmp-", dir=builds)
-    os.chmod(temporary, 0o700)
+@contextmanager
+def staged_build(builds, expected, sources):
+    """Write and verify before taking the publication lock; protect slow active stages."""
+    temporary = tempfile.mkdtemp(prefix=".stage-", dir=builds)
+    lease = private_file(os.path.join(temporary, ".lock"), os.O_RDWR | os.O_CREAT)
     try:
+        fcntl.flock(lease, fcntl.LOCK_SH)
         for name, source in sources.items():
             if not isinstance(name, str) or not name or "/" in name or name in (".", ".."):
                 raise RuntimeError("Invalid build source name")
@@ -123,13 +137,9 @@ def install(build_dir, expected, sources, builds):
         write_file(manifest_path(temporary), json.dumps(manifest, sort_keys=True).encode("utf-8"))
         if not verify(temporary, expected):
             raise RuntimeError("Remote build verification failed")
-        try:
-            os.rename(temporary, build_dir)
-        except OSError:
-            # Another connection may have installed the same immutable build.
-            if not verify(build_dir, expected):
-                raise
+        yield temporary
     finally:
+        os.close(lease)
         if os.path.isdir(temporary):
             shutil.rmtree(temporary)
 
@@ -156,46 +166,80 @@ def unused_build(path):
         os.close(descriptor)
 
 
-def cleanup_locked(builds, current_id):
-    """Remove old unlocked builds while ensure_build holds the cache guard."""
-    candidates = []
+@contextmanager
+def cache_guard(builds, mode):
+    guard = private_file(os.path.join(builds, ".lock"), os.O_RDWR | os.O_CREAT)
     try:
-        names = os.listdir(builds)
-    except OSError:
-        return
-    for name in names:
+        fcntl.flock(guard, mode)
+        yield
+    finally:
+        os.close(guard)
+
+
+def retire(path, prefix=".tmp-"):
+    """Unpublish under the guard. The caller deletes the unique directory after unlocking."""
+    trash = tempfile.mkdtemp(prefix=prefix, dir=os.path.dirname(path))
+    try:
+        os.rename(path, os.path.join(trash, "retired"))
+    except BaseException:
+        os.rmdir(trash)
+        raise
+    return trash
+
+
+def cleanup_builds(builds, current_id):
+    """Scan outside the publication lock; recheck identity and lease before each rename."""
+    candidates = []
+    expired = []
+    for name in os.listdir(builds):
         path = os.path.join(builds, name)
-        if name.startswith(".tmp-"):
-            try:
-                if time.time() - os.lstat(path).st_mtime >= 86400:
-                    shutil.rmtree(path)
-            except OSError:
-                pass
-            continue
-        if not BUILD_ID.match(name) or name == current_id:
-            continue
         try:
-            if not stat.S_ISDIR(os.lstat(path).st_mode) or not unused_build(path):
+            info = os.lstat(path)
+            if not stat.S_ISDIR(info.st_mode):
                 continue
-            manifest = json.loads(read_text(manifest_path(path)))
+            if name.startswith(".retired-"):
+                expired.append((name, info))
+                continue
+            if name.startswith((".tmp-", ".stage-")):
+                if time.time() - info.st_mtime >= 86400:
+                    expired.append((name, info))
+                continue
+            if name == current_id or not BUILD_ID.fullmatch(name):
+                continue
+            # The guard also interoperates with older clients deleting leaf lock files.
+            with cache_guard(builds, fcntl.LOCK_SH):
+                if not os.path.isdir(path) or not unused_build(path):
+                    continue
+                manifest = json.loads(read_text(manifest_path(path)))
+            if not isinstance(manifest, dict) or manifest.get("format") != BUILD_FORMAT:
+                continue
+            when = created_at(manifest.get("created_at"))
+            if when is None:
+                continue
+            if time.time() - when > RETENTION_SECONDS:
+                expired.append((name, info))
+            else:
+                candidates.append((when, name, info))
         except (OSError, ValueError, UnicodeError):
             continue
-        if not isinstance(manifest, dict) or manifest.get("format") != BUILD_FORMAT:
-            continue
-        when = created_at(manifest.get("created_at"))
-        if when is None:
-            continue
-        if time.time() - when > RETENTION_SECONDS:
-            shutil.rmtree(path)
-            continue
-        candidates.append((when, name))
     candidates.sort(reverse=True)
-    for _, name in candidates[KEEP_BUILDS:]:
-        shutil.rmtree(os.path.join(builds, name))
+    expired.extend((name, info) for _, name, info in candidates[KEEP_BUILDS:])
+    for name, observed in expired:
+        path = os.path.join(builds, name)
+        try:
+            with cache_guard(builds, fcntl.LOCK_EX):
+                if not os.path.samestat(observed, os.lstat(path)):
+                    continue
+                if not name.startswith((".tmp-", ".retired-")) and not unused_build(path):
+                    continue
+                trash = retire(path)
+            shutil.rmtree(trash)
+        except FileNotFoundError:
+            continue
 
 
-def ensure_build(payload, sources=None):
-    """Lease a verified build, or return None when installation needs the bundle."""
+def ensure_build(payload, sources=None, rejected_lease=None):
+    """Lease an installed build, rechecking after staging if another client published first."""
     home = os.path.expanduser("~")
     base = os.path.join(home, ".neverssh")
     builds = os.path.join(base, "builds")
@@ -209,33 +253,46 @@ def ensure_build(payload, sources=None):
         raise RuntimeError("Invalid remote build manifest")
     build_dir = os.path.join(builds, build_id)
 
-    guard = private_file(os.path.join(builds, ".lock"), os.O_RDWR | os.O_CREAT)
-    try:
-        fcntl.flock(guard, fcntl.LOCK_EX)
-        if not verify(build_dir, expected):
-            if os.path.isdir(build_dir) and not unused_build(build_dir):
-                raise RuntimeError("Remote build is corrupt and currently in use")
-            if sources is None:
-                return None
+    def existing_lease():
+        if installed(build_dir, expected):
+            lease = private_file(os.path.join(build_dir, ".lock"), os.O_RDWR | os.O_CREAT)
+            try:
+                if rejected_lease is None or not os.path.samestat(os.fstat(lease), rejected_lease):
+                    fcntl.flock(lease, fcntl.LOCK_SH)
+                    return build_dir, lease
+            except BaseException:
+                os.close(lease)
+                raise
+            os.close(lease)
+        if os.path.isdir(build_dir) and not unused_build(build_dir):
+            raise RuntimeError("Remote build is corrupt and currently in use")
+        return None
+
+    with cache_guard(builds, fcntl.LOCK_SH):
+        existing = existing_lease()
+    if existing or sources is None:
+        return existing
+
+    with staged_build(builds, expected, sources) as temporary:
+        with cache_guard(builds, fcntl.LOCK_EX):
+            existing = existing_lease()
+            if existing:
+                return existing
             if os.path.isdir(build_dir):
-                shutil.rmtree(build_dir)
-            install(build_dir, expected, sources, builds)
-        lease = private_file(os.path.join(build_dir, ".lock"), os.O_RDWR | os.O_CREAT)
-        fcntl.flock(lease, fcntl.LOCK_SH)
-        cleanup_locked(builds, build_id)
-        return build_dir, lease
-    finally:
-        fcntl.flock(guard, fcntl.LOCK_UN)
-        os.close(guard)
+                retire(build_dir, prefix=".retired-")
+            os.rename(temporary, build_dir)
+            lease = private_file(os.path.join(build_dir, ".lock"), os.O_RDWR)
+            fcntl.flock(lease, fcntl.LOCK_SH)
+            payload["installedBuild"] = True
+            return build_dir, lease
 
 
-def acquire_build(payload):
-    """Request missing sources outside the cache guard, then recheck under the guard."""
-    bootstrap = payload.pop("bootstrap")
-    build = ensure_build(payload)
+def acquire_build(payload, rejected_lease=None):
+    """Ask for sources at most once per handshake, outside filesystem locks."""
+    build = ensure_build(payload, rejected_lease=rejected_lease)
     if build is not None:
         return build
-
+    bootstrap = payload.pop("bootstrap")
     print('{"type":"need_sources"}', flush=True)
     sources = json.loads(sys.stdin.buffer.readline())
     if not isinstance(sources, dict):
@@ -243,7 +300,7 @@ def acquire_build(payload):
     sources["build_cache.py"] = bootstrap
     if sources.keys() != payload["manifest"]["sources"].keys():
         raise ValueError("Remote build sources do not match manifest")
-    return ensure_build(payload, sources)
+    return ensure_build(payload, sources, rejected_lease=rejected_lease)
 
 
 def main(payload):
@@ -253,17 +310,34 @@ def main(payload):
     try:
         build_dir, lease = acquire_build(payload)
         payload["buildDir"] = build_dir
-        payload["fileOpsSource"] = read_text(os.path.join(build_dir, "file_ops.py"))
-        payload["readFormatsSource"] = read_text(os.path.join(build_dir, "read_formats.py"))
-        payload["workspaceSource"] = read_text(os.path.join(build_dir, "workspace.py"))
-        payload["archiveSource"] = read_text(os.path.join(build_dir, "archive.py"))
-        source = read_text(os.path.join(build_dir, "worker.py"))
+        sys.path.insert(0, build_dir)
+        try:
+            from worker import Worker
+        except Exception:
+            # Healthy source bytes indicate an interpreter/environment failure. Keep
+            # the original diagnostic and avoid downloading the same build again.
+            if verify(build_dir, payload["manifest"]) or "bootstrap" not in payload:
+                raise
+            # Drop our shared lock but pin the rejected inode until a replacement
+            # is leased. A concurrent repair can then win without another rehash.
+            old_lease = lease
+            try:
+                fcntl.flock(old_lease, fcntl.LOCK_UN)
+                build_dir, lease = acquire_build(payload, rejected_lease=os.fstat(old_lease))
+            finally:
+                os.close(old_lease)
+            for filename in payload["manifest"]["sources"]:
+                name = filename[:-3]
+                module = sys.modules.get(name)
+                if getattr(module, "__file__", None) == os.path.join(build_dir, filename):
+                    del sys.modules[name]
+            importlib.invalidate_caches()
+            from worker import Worker
     except Exception as error:
         fail(3, "NeverSSH remote build setup failed: " + str(error))
 
     # Keep the shared lease open for the worker's lifetime; O_CLOEXEC hides it from helpers.
-    namespace = {"__name__": "__main__", "__file__": os.path.join(build_dir, "worker.py"), "payload": payload}
-    exec(compile(source, namespace["__file__"], "exec"), namespace)
+    Worker(payload).run()
 
 
 if __name__ == "__main__":

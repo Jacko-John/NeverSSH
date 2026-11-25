@@ -3,12 +3,13 @@ import { createHash } from "node:crypto";
 import archiveSource from "./archive.py" with { type: "text" };
 import buildCacheSource from "./build_cache.py" with { type: "text" };
 import fileOpsSource from "./file_ops.py" with { type: "text" };
+import helperPoolSource from "./helper_pool.py" with { type: "text" };
 import helperSource from "./helper.py" with { type: "text" };
 import readFormatsSource from "./read_formats.py" with { type: "text" };
 import workerSource from "./worker.py" with { type: "text" };
 import workspaceSource from "./workspace.py" with { type: "text" };
 
-export const SERVER_VERSION = "0.9.0";
+export const SERVER_VERSION = "0.9.1";
 export const PROTOCOL_VERSION = 4;
 export const MIN_PYTHON = "3.8";
 export const ARCHIVE_FORMAT = 1;
@@ -18,6 +19,7 @@ export const BUILD_SOURCES = {
   "archive.py": archiveSource,
   "build_cache.py": buildCacheSource,
   "file_ops.py": fileOpsSource,
+  "helper_pool.py": helperPoolSource,
   "helper.py": helperSource,
   "read_formats.py": readFormatsSource,
   "worker.py": workerSource,

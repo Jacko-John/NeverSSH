@@ -15,7 +15,7 @@ import stat
 import subprocess
 import sys
 import time
-from neverssh_archive import ArchiveError, ArchiveStore
+from archive import ArchiveError, ArchiveStore
 
 
 def emit(value):
@@ -128,8 +128,9 @@ def viewed_revision(path, stamp, requested_cwd):
         pass  # Revision tracking is optional when a file disappears during the command.
 
 
-def command_session(requested_cwd):
+def command_session(request, requested_cwd, controls):
     """Run one noninteractive Bash with a private archive and an owned process group."""
+    args = request["args"]
     bash = shutil.which("bash")
     if bash is None:
         raise ArchiveError("BASH_UNAVAILABLE", "Bash is required on the remote host")
@@ -145,7 +146,7 @@ def command_session(requested_cwd):
     stopping_at = None
     ended_at = None
     kill_sent = False
-    controls = bytearray()
+
 
     def send_signal(signum):
         """Signal only the process group created for this command."""
@@ -221,14 +222,21 @@ def command_session(requested_cwd):
                 deadlines.append(ended_at + (2.5 if kill_sent else 0.2))
 
             timeout = max(0, min(deadlines) - time.monotonic()) if deadlines else None
-            for key, _ in selector.select(timeout):
+            # A preview or stop can arrive in the same read as the initial request.
+            if b"\n" in controls:
+                events = [(selector.get_key(sys.stdin), selectors.EVENT_READ)]
+                pending_controls = True
+            else:
+                events = selector.select(timeout)
+                pending_controls = False
+            for key, _ in events:
                 try:
-                    chunk = os.read(key.fd, 16384)
+                    chunk = b"" if pending_controls else os.read(key.fd, 16384)
                 except BlockingIOError:
                     continue
                 if key.data == "signal":
                     continue
-                if not chunk:
+                if not chunk and not pending_controls:
                     selector.unregister(key.fileobj)
                     if key.data == "control":
                         stop("disconnected")
@@ -312,20 +320,45 @@ def command_session(requested_cwd):
           "outputComplete": output_complete})
 
 
-# The worker supplies one command request before starting this process.
-request = payload["request"]
-args = request.get("args", {})
+def run_task(request, controls):
+    """Finish one task, including group cleanup, before releasing its pipes."""
+    try:
+        requested_cwd = os.path.abspath(os.path.expanduser(request["cwd"]))
+        os.chdir(requested_cwd)
+        command_session(request, requested_cwd, controls)
+        return 0
+    except Exception as error:
+        code = getattr(error, "code", type(error).__name__)
+        emit({"ok": False, "error": {"code": code, "message": str(error)}})
+        return 2 if code in ("TASK_ID_EXISTS", "BASH_UNAVAILABLE") else 1
 
 
-try:
+def serve(channel):
+    """Receive private task pipes. EOF on the pool channel retires an idle helper."""
+    import array
+    import socket
     die_with_parent()
-    cwd = os.path.expanduser(request["cwd"])
-    requested_cwd = os.path.abspath(cwd)
-    os.chdir(cwd)
-    command_session(requested_cwd)
-except Exception as error:
-    code = getattr(error, "code", type(error).__name__)
-    emit({"ok": False, "error": {"code": code,
-                                 "message": str(error)}})
-    # Exit 2 tells the worker this explicit rejection happened before Bash existed.
-    sys.exit(2 if code in ("TASK_ID_EXISTS", "BASH_UNAVAILABLE") else 1)
+    handles = array.array("i")
+    while True:
+        ticket, ancillary, _, _ = channel.recvmsg(1, socket.CMSG_SPACE(3 * handles.itemsize))
+        if not ticket:
+            return
+        handles = array.array("i")
+        handles.frombytes(ancillary[0][2])
+        for target, descriptor in enumerate(handles):
+            os.dup2(descriptor, target)
+            os.close(descriptor)
+        incoming = bytearray()
+        while b"\n" not in incoming:
+            chunk = os.read(0, 65536)
+            if not chunk:
+                return
+            incoming.extend(chunk)
+        record, _, controls = incoming.partition(b"\n")
+        code = run_task(json.loads(record), controls)
+        os.chdir(os.path.expanduser("~"))
+        channel.sendall(bytes([code]))
+        # Keep fd 0/1/2 allocated so the next received descriptors cannot alias them.
+        with open(os.devnull, "r+b", buffering=0) as sink:
+            for descriptor in range(3):
+                os.dup2(sink.fileno(), descriptor)

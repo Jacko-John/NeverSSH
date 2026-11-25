@@ -16,15 +16,8 @@ import unittest
 from unittest.mock import patch
 
 
-# Load the bootstrap-owned module without running its connection event loop.
-source = Path(__file__).resolve().parents[1] / "src" / "remote" / "worker.py"
-worker_module = types.ModuleType("neverssh_worker_output_test")
-worker_module.payload = {"archiveSource": "", "fileOpsSource": (source.parent / "file_ops.py").read_text(),
-                         "readFormatsSource": (source.parent / "read_formats.py").read_text(),
-                         "workspaceSource": (source.parent / "workspace.py").read_text()}
-sys.modules[worker_module.__name__] = worker_module
-exec(compile(source.read_text().rsplit("\nWorker(payload).run()", 1)[0], str(source), "exec"),
-     worker_module.__dict__)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "remote"))
+import worker as worker_module
 
 
 class WorkerOutputTests(unittest.TestCase):
@@ -83,7 +76,7 @@ class WorkerOutputTests(unittest.TestCase):
                 })
                 records = []
                 try:
-                    with patch.object(worker, "emit", side_effect=records.append):
+                    with patch.object(worker, "emit", side_effect=records.append), patch.object(worker.pool, "release"):
                         for index, code in enumerate(exit_codes):
                             process = types.SimpleNamespace(stdin=io.BytesIO(), returncode=code, poll=lambda: code)
                             request = worker_module.ChildRequest(process, bytearray(), open_output_streams=0)

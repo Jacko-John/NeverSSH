@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.1
+
+- Reconnecting reuses the installed build manifest. If a startup module fails to load and its sources are damaged, the connection can repair an unused build and retry once.
+- Sequential Bash commands can reuse a Python helper. Each command keeps its own Bash process group and output streams.
+- Old builds and expired command logs are cleaned up in the background. Quota reconciliation retries after concurrent writes without repeating the log sweep.
+
 ## 0.9.0
 
 - Use `ssh_task_output` with `wait_seconds: -1` to wait for a remote task to finish in one query. Cancelling the query leaves the command running, and the same task ID can be queried again.

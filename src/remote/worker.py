@@ -5,11 +5,14 @@ import json
 import os
 import selectors
 import signal
-import subprocess
 import sys
 import threading
 import time
-import types
+import build_cache
+import archive as archive_module
+import file_ops as file_ops_module
+import workspace as workspace_module
+from helper_pool import HelperPool, TaskPipes
 from typing import Dict, Optional
 
 
@@ -18,34 +21,11 @@ OUTPUT_LOW_WATER = 131072
 RESPONSE_CHUNK_BYTES = 16384
 
 
-HELPER_BOOTSTRAP = (
-    'import json,sys; payload=json.loads(sys.stdin.buffer.readline()); '
-    'import types; archive=types.ModuleType("neverssh_archive"); '
-    'exec(compile(open(payload["archivePath"],"rb").read(),payload["archivePath"],"exec"),archive.__dict__); '
-    'sys.modules["neverssh_archive"]=archive; '
-    'exec(compile(open(payload["sourcePath"],"rb").read(),payload["sourcePath"],"exec"))'
-)
-
-archive_module = types.ModuleType("neverssh_archive")
-exec(compile(payload["archiveSource"], "<neverssh-archive>", "exec"), archive_module.__dict__)
-
-read_formats_module = types.ModuleType("neverssh_read_formats")
-exec(compile(payload["readFormatsSource"], "<neverssh-read-formats>", "exec"), read_formats_module.__dict__)
-sys.modules["read_formats"] = read_formats_module
-
-file_ops_module = types.ModuleType("neverssh_file_ops")
-exec(compile(payload["fileOpsSource"], "<neverssh-file-ops>", "exec"), file_ops_module.__dict__)
-sys.modules["file_ops"] = file_ops_module
-
-workspace_module = types.ModuleType("neverssh_workspace")
-exec(compile(payload["workspaceSource"], "<neverssh-workspace>", "exec"), workspace_module.__dict__)
-
-
 @dataclass
 class ChildRequest:
     """Track a helper's pipes and cleanup deadline separately from the worker's connection state."""
 
-    process: subprocess.Popen
+    process: TaskPipes
     input_buffer: bytearray
     close_input: bool = False
     stdin_registered: bool = False
@@ -115,9 +95,12 @@ class Worker:
         self.archive_format = bootstrap_payload["archiveFormat"]
         self.archive_limits = {"maxTaskOutputBytes": bootstrap_payload["maxTaskOutputBytes"],
                                "maxArchiveBytes": bootstrap_payload["maxArchiveBytes"]}
+        self.pool = HelperPool(self.build_dir)
         self.archive = None
         self.session_lock = None
-        self.next_archive_cleanup = 0
+        self.maintenance = None
+        self.stop_maintenance = threading.Event()
+        self.installed_build = bootstrap_payload.get("installedBuild", False)
         self.selector = selectors.DefaultSelector()
         self.requests: Dict[str, ChildRequest] = {}
         self.incoming = bytearray()
@@ -192,7 +175,6 @@ class Worker:
         try:
             self.archive = archive_module.ArchiveStore(self.archive_limits["maxTaskOutputBytes"],
                                                         self.archive_limits["maxArchiveBytes"])
-            self.cleanup_archives()
             self.session_lock = self.archive.new_session(self.connection_id)
         except Exception as error:
             self.emit({"type": "startup_error", "code": getattr(error, "code", "ARCHIVE_UNAVAILABLE"),
@@ -250,20 +232,11 @@ class Worker:
             return
 
         try:
-            process = subprocess.Popen(
-                [sys.executable, "-I", "-B", "-u", "-c", HELPER_BOOTSTRAP],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
+            process = self.pool.acquire()
         except OSError as error:
             self.reject_request(request_id, str(error))
             return
 
-        request_payload = {
-            "sourcePath": os.path.join(self.build_dir, "helper.py"),
-            "archivePath": os.path.join(self.build_dir, "archive.py"),
-            "request": request_payload,
-        }
         data = json.dumps(request_payload, ensure_ascii=True).encode("utf-8") + b"\n"
         self.requests[request_id] = ChildRequest(process, bytearray(data))
         for pipe, stream in ((process.stdout, "stdout"), (process.stderr, "stderr")):
@@ -344,9 +317,9 @@ class Worker:
                 if request.stdin_registered:
                     self.selector.unregister(request.process.stdin)
                 request.process.stdin.close()
+                self.pool.release(request.process, request.stopping_at is None)
                 self.emit({"type": "close", "id": request_id, "code": request.process.returncode})
                 del self.requests[request_id]
-                self.next_archive_cleanup = 0
             else:
                 self.update_stdin(request_id, request)
 
@@ -387,17 +360,28 @@ class Worker:
                 self.selector.register(key.fileobj, key.events, key.data)
             self.paused_output_streams.clear()
 
-    def cleanup_archives(self):
-        """Reclaim expired logs after requests and once an hour while connected."""
-        if self.archive is None or time.monotonic() < self.next_archive_cleanup:
-            return
-        self.next_archive_cleanup = time.monotonic() + 3600
+    def maintain(self):
+        """Run optional build reclamation and periodically check both archive markers."""
+        if self.installed_build:
+            try:
+                build_cache.cleanup_builds(os.path.dirname(self.build_dir), self.build_id)
+            except OSError as error:
+                print("NeverSSH build cleanup failed: " + str(error), file=sys.stderr, flush=True)
+        # Independent descriptor: flock ownership is shared by threads using the same fd.
+        store = None
         try:
-            if self.archive.cleanup_due():
-                self.archive.cleanup()
-                self.archive.mark_cleanup()
-        except Exception as error:
-            print("NeverSSH archive cleanup failed: " + str(error), file=sys.stderr, flush=True)
+            while not self.stop_maintenance.is_set():
+                try:
+                    if store is None:
+                        store = archive_module.ArchiveStore(self.archive_limits["maxTaskOutputBytes"],
+                                                            self.archive_limits["maxArchiveBytes"])
+                    store.maintain(self.stop_maintenance)
+                except Exception as error:
+                    print("NeverSSH archive maintenance failed: " + str(error), file=sys.stderr, flush=True)
+                self.stop_maintenance.wait(30)
+        finally:
+            if store is not None:
+                store.close()
 
     def flush_output(self, descriptor):
         """Make bounded progress on the shared protocol stream without blocking the loop."""
@@ -480,6 +464,7 @@ class Worker:
 
     def cleanup(self):
         """Reap owned helpers after normal exit, malformed input, or a broken peer."""
+        self.stop_maintenance.set()
         for request in self.requests.values():
             request.stop()
         # All workspace Git polls observe cancellation within 50 ms; share one bounded join budget.
@@ -505,7 +490,7 @@ class Worker:
             process = request.process
             if process.poll() is None:
                 process.kill()
-            process.wait()
+            self.pool.release(process, False)
             for pipe in (process.stdin, process.stdout, process.stderr):
                 pipe.close()
         try:
@@ -522,17 +507,22 @@ class Worker:
                 os.close(self.wakeup_writer)
                 self.wakeup_writer = None
             os.close(self.wakeup_reader)
+        if self.maintenance is not None:
+            self.maintenance.join(timeout=0.25)
+        self.pool.close()
         self.selector.close()
         if self.session_lock is not None:
             os.close(self.session_lock)
         if self.archive is not None:
-            self.cleanup_archives()
             self.archive.close()
 
     def run(self):
         """Advance cleanup and I/O until the final acknowledgement has left the connection."""
         try:
             self.initialize()
+            if not self.stopping:
+                self.maintenance = threading.Thread(target=self.maintain, daemon=True)
+                self.maintenance.start()
             while True:
                 if self.stop_requested:
                     self.stopping = True
@@ -540,7 +530,6 @@ class Worker:
                     for request in self.requests.values():
                         request.stop()
                 self.update_requests()
-                self.cleanup_archives()
                 self.prepare_output()
                 if self.bye_sent and not self.outgoing:
                     break
@@ -549,12 +538,8 @@ class Worker:
                 if self.stopping or any(req.stopping_at is not None for req in self.requests.values()):
                     timeout = 0.05
                 else:
-                    timeout = min(60, max(0.05, self.next_archive_cleanup - time.monotonic()))
+                    timeout = 60
                 for key, _ in self.selector.select(timeout):
                     self.dispatch_io(key)
         finally:
             self.cleanup()
-
-
-# The SSH bootstrap supplies payload once; no service or import-time installation is needed.
-Worker(payload).run()

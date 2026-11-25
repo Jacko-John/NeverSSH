@@ -1,9 +1,11 @@
 """Exercise the remote build cache with real files, locks, and cleanup."""
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import io
 import json
-import multiprocessing
+import subprocess
+import threading
 import os
 from pathlib import Path
 import shutil
@@ -46,31 +48,6 @@ def build_id(value):
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
 
 
-def competing_bootstrap(identifier, channel):
-    """Report whether the real bootstrap encounters a locked cache guard, then wait normally."""
-    flock = fcntl.flock
-
-    def probe_guard(descriptor, operation):
-        if operation == fcntl.LOCK_EX:
-            try:
-                flock(descriptor, operation | fcntl.LOCK_NB)
-            except BlockingIOError:
-                channel.send("waiting")
-            else:
-                channel.send("unlocked")
-        return flock(descriptor, operation)
-
-    try:
-        with patch.object(fcntl, "flock", probe_guard):
-            directory, lease = build_cache.ensure_build(make_payload(identifier), SOURCES)
-        try:
-            channel.send(os.path.samestat(os.fstat(lease), os.stat(os.path.join(directory, ".lock"))))
-        finally:
-            os.close(lease)
-    finally:
-        channel.close()
-
-
 class BuildCacheTests(unittest.TestCase):
     """Keep every test inside a private HOME and temporary build root."""
 
@@ -99,13 +76,15 @@ class BuildCacheTests(unittest.TestCase):
         self.assertEqual(manifest["build_id"], identifier)
         self.assertEqual(manifest["format"], build_cache.BUILD_FORMAT)
         created = manifest["created_at"]
-        self.ensure(identifier)
+        with patch.object(build_cache, "verify", side_effect=AssertionError("warm rehash")), \
+                patch.object(build_cache, "cleanup_builds", side_effect=AssertionError("warm cleanup")):
+            self.ensure(identifier)
         self.assertEqual(json.loads((directory / "manifest.json").read_text())["created_at"], created)
 
     def test_corrupt_cache_is_reinstalled_when_unlocked(self):
         identifier = build_id("corrupt")
         directory = self.ensure(identifier)
-        (directory / "worker.py").write_text("tampered\n")
+        (directory / "manifest.json").write_text("{}")
         self.assertFalse(build_cache.verify(str(directory), make_payload(identifier)["manifest"]))
         self.ensure(identifier)
         self.assertTrue(build_cache.verify(str(directory), make_payload(identifier)["manifest"]))
@@ -115,7 +94,7 @@ class BuildCacheTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "verification failed"):
             build_cache.ensure_build(make_payload(identifier), {**SOURCES, "worker.py": "wrong"})
         self.assertFalse((self.builds / identifier).exists())
-        self.assertEqual(list(self.builds.glob(".tmp-*")), [])
+        self.assertEqual(list(self.builds.glob(".stage-*")), [])
 
     def test_cache_miss_releases_guard_until_sources_arrive_and_rechecks_competing_install(self):
         identifier = build_id("sources-on-demand")
@@ -134,7 +113,7 @@ class BuildCacheTests(unittest.TestCase):
             return directory
 
         with patch.object(sys, "stdin") as input_stream, patch.object(sys, "stdout", new_callable=io.StringIO) as output, \
-                patch.object(build_cache, "install", wraps=build_cache.install) as install:
+                patch.object(build_cache, "staged_build", wraps=build_cache.staged_build) as install:
             input_stream.buffer.readline.side_effect = deliver_sources
             directory = acquire()
             self.assertEqual(acquire(), directory)
@@ -147,41 +126,122 @@ class BuildCacheTests(unittest.TestCase):
         directory, lease = build_cache.ensure_build(make_payload(identifier), SOURCES)
         lock_path = Path(directory) / ".lock"
         try:
-            (Path(directory) / "worker.py").write_text("damaged")
+            (Path(directory) / "manifest.json").write_text("{}")
             with self.assertRaisesRegex(RuntimeError, "currently in use"):
                 self.ensure(identifier)
             self.assertTrue(os.path.samestat(os.fstat(lease), lock_path.stat()))
         finally:
             os.close(lease)
 
-        context = multiprocessing.get_context("spawn")
-        receiver, sender = context.Pipe(duplex=False)
-        contender = context.Process(target=competing_bootstrap, args=(identifier, sender))
-        rmtree = shutil.rmtree
+        old_inode = lock_path.stat()
+        self.ensure(identifier)
+        self.assertFalse(os.path.samestat(old_inode, lock_path.stat()))
+        directory, lease = build_cache.ensure_build(make_payload(identifier))
+        try:
+            self.assertTrue(os.path.samestat(os.fstat(lease), lock_path.stat()))
+        finally:
+            os.close(lease)
 
-        def remove(path):
-            # At the deletion boundary the leaf lock is free, but a competing bootstrap
-            # must block before it can even open that inode.
-            with lock_path.open("r+b") as probe:
-                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            contender.start()
-            self.assertTrue(receiver.poll(10))
-            self.assertEqual(receiver.recv(), "waiting")
-            rmtree(path)
+    def sweep(self, current):
+        build_cache.cleanup_builds(str(self.builds), current)
+
+    def test_cleanup_rechecks_a_lease_acquired_after_the_scan(self):
+        current = build_id("cleaner")
+        self.ensure(current)
+        identifier = build_id("became-active")
+        old = self.ensure(identifier)
+        manifest = json.loads((old / "manifest.json").read_text())
+        manifest["created_at"] = "2000-01-01T00:00:00Z"
+        (old / "manifest.json").write_text(json.dumps(manifest))
+        guard = build_cache.cache_guard
+        leases = []
+
+        @contextmanager
+        def acquire_before_retirement(builds, mode):
+            if mode == fcntl.LOCK_EX and not leases:
+                _, lease = build_cache.ensure_build(make_payload(identifier))
+                leases.append(lease)
+            with guard(builds, mode):
+                yield
 
         try:
-            with patch.object(shutil, "rmtree", remove):
-                self.ensure(identifier)
-            self.assertTrue(receiver.poll(10))
-            self.assertIs(receiver.recv(), True)
-            contender.join(10)
-            self.assertEqual(contender.exitcode, 0)
+            with patch.object(build_cache, "cache_guard", acquire_before_retirement):
+                self.sweep(current)
+            self.assertEqual(len(leases), 1)
+            self.assertTrue(os.path.samestat(os.fstat(leases[0]), (old / ".lock").stat()))
         finally:
-            sender.close()
-            receiver.close()
-            if contender.is_alive():
-                contender.terminate()
-                contender.join(5)
+            for lease in leases:
+                os.close(lease)
+        self.sweep(current)
+        self.assertFalse(old.exists())
+
+    def test_warm_connection_proceeds_during_slow_retired_build_deletion(self):
+        current = build_id("warm")
+        self.ensure(current)
+        old = self.ensure(build_id("expired"))
+        manifest = json.loads((old / "manifest.json").read_text())
+        manifest["created_at"] = "2000-01-01T00:00:00Z"
+        (old / "manifest.json").write_text(json.dumps(manifest))
+        deleting, resume = threading.Event(), threading.Event()
+        removed = []
+        rmtree = shutil.rmtree
+
+        def slow_remove(path):
+            deleting.set()
+            resume.wait(5)
+            rmtree(path)
+            removed.append(path)
+
+        with patch.object(shutil, "rmtree", slow_remove):
+            cleaner = threading.Thread(target=self.sweep, args=(current,))
+            cleaner.start()
+            try:
+                self.assertTrue(deleting.wait(3))
+                # Fail immediately if deletion holds even a shared global lock:
+                # older warm clients take the exclusive lock.
+                with (self.builds / ".lock").open("rb+") as guard:
+                    fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                directory, lease = build_cache.ensure_build(make_payload(current))
+                os.close(lease)
+                self.assertEqual(Path(directory).name, current)
+                self.assertFalse(removed)
+            finally:
+                resume.set()
+                cleaner.join(5)
+        self.assertEqual(len(removed), 1)
+        self.assertFalse(old.exists())
+
+    def test_warm_import_failure_repairs_once_in_the_same_bootstrap(self):
+        bootstrap = Path(build_cache.__file__).read_text()
+        sources = dict(SOURCES, **{
+            "worker.py": "from file_ops import word\nclass Worker:\n def __init__(self,p): pass\n def run(self): print(word)\n",
+            "file_ops.py": "word = 'ready'\n",
+            "build_cache.py": bootstrap,
+        })
+        identifier = build_id("warm import repair")
+        directory = self.ensure(identifier, sources)
+        payload = dict(make_payload(identifier, sources), bootstrap=bootstrap)
+        protocol = json.dumps(payload) + "\n" + json.dumps({k: v for k, v in sources.items() if k != "build_cache.py"}) + "\n"
+        def connect():
+            return subprocess.run([sys.executable, "-I", "-B", "-c",
+                                   'import json,sys; payload=json.loads(sys.stdin.buffer.readline()); exec(payload["bootstrap"])'],
+                                  input=protocol, capture_output=True, text=True, timeout=5)
+        for damaged in ("worker.py", "file_ops.py"):
+            with self.subTest(damaged=damaged):
+                (directory / damaged).unlink()
+                repaired = connect()
+                self.assertEqual(repaired.returncode, 0, repaired.stderr)
+                self.assertEqual(repaired.stdout.splitlines(), ['{"type":"need_sources"}', "ready"])
+                self.assertEqual(connect().stdout.splitlines(), ["ready"])
+        _, lease = build_cache.ensure_build(payload)
+        try:
+            (directory / "worker.py").unlink()
+            busy = connect()
+            self.assertEqual(busy.returncode, 3)
+            self.assertIn("currently in use", busy.stderr)
+            self.assertEqual(busy.stdout, "")
+        finally:
+            os.close(lease)
 
     def test_cleanup_keeps_current_and_newest_unlocked_builds(self):
         current = build_id("current")
@@ -194,7 +254,7 @@ class BuildCacheTests(unittest.TestCase):
             manifest["created_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3600))
             (directory / "manifest.json").write_text(json.dumps(manifest))
             others.append((identifier, directory))
-        self.ensure(current)
+        self.sweep(current)
         self.assertTrue(current_dir.is_dir())
         remaining = [identifier for identifier, directory in others if directory.is_dir()]
         self.assertEqual(len(remaining), build_cache.KEEP_BUILDS)
@@ -210,11 +270,11 @@ class BuildCacheTests(unittest.TestCase):
         handle = os.open(str(locked_dir / ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(handle, fcntl.LOCK_SH)
-            self.ensure(current)
+            self.sweep(current)
             self.assertTrue(locked_dir.is_dir())
         finally:
             os.close(handle)
-        self.ensure(current)
+        self.sweep(current)
         self.assertFalse(locked_dir.exists())
         unknown = build_id("unknown-format")
         unknown_dir = self.ensure(unknown)
@@ -222,7 +282,7 @@ class BuildCacheTests(unittest.TestCase):
         manifest["format"] = 99
         manifest["created_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60 * 86400))
         (unknown_dir / "manifest.json").write_text(json.dumps(manifest))
-        self.ensure(current)
+        self.sweep(current)
         self.assertTrue(unknown_dir.is_dir())
 
     def test_cleanup_removes_stale_temporary_install(self):
@@ -232,7 +292,7 @@ class BuildCacheTests(unittest.TestCase):
         temporary.mkdir(mode=0o700)
         old = time.time() - 2 * 86400
         os.utime(temporary, (old, old))
-        self.ensure(current)
+        self.sweep(current)
         self.assertFalse(temporary.exists())
 
 

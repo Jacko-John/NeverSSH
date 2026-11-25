@@ -4,7 +4,7 @@ import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdir, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, readdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
@@ -1112,13 +1112,24 @@ describe("Bash tasks and archives", () => {
     dev = connectionId(await call("ssh_connect", { host: "fixture" }));
   });
 
+  test("sequential Bash tasks reuse a helper and get fresh shells", async () => {
+    const ids = async () => (await call("ssh_bash", {
+      connection_id: dev, command: 'printf "%s %s" "$PPID" "$$"',
+    })).trim().split(" ");
+    const [helper, shell] = await ids();
+    const [nextHelper, nextShell] = await ids();
+    expect(helper).toMatch(/^\d+$/);
+    expect(nextHelper).toBe(helper);
+    expect(nextShell).not.toBe(shell);
+  });
+
   test("installs and reuses the versioned remote build cache", async () => {
     const build = join(fixture.workspace, ".neverssh", "builds", BUILD_ID);
     const manifest = JSON.parse(await readFile(join(build, "manifest.json"), "utf8"));
     expect(manifest.build_id).toBe(BUILD_ID);
     expect(manifest.protocol).toBe(PROTOCOL_VERSION);
     expect(manifest.server_version).toBe(SERVER_VERSION);
-    for (const name of ["worker.py", "file_ops.py", "helper.py", "archive.py", "build_cache.py", "workspace.py", "read_formats.py"]) {
+    for (const name of ["worker.py", "file_ops.py", "helper.py", "helper_pool.py", "archive.py", "build_cache.py", "workspace.py", "read_formats.py"]) {
       expect((await lstat(join(build, name))).isFile()).toBe(true);
     }
     const before = (await lstat(join(build, "worker.py"))).mtimeMs;
@@ -1127,6 +1138,15 @@ describe("Bash tasks and archives", () => {
       expect((await runtime.ssh.connect({ host: "fixture" })).connection_id).toBeDefined();
     } finally { await runtime.close(); }
     expect((await lstat(join(build, "worker.py"))).mtimeMs).toBe(before);
+  });
+
+  test("ssh_connect repairs a missing cached startup module and runs Bash on that connection", async () => {
+    await call("ssh_close", { connection_id: dev });
+    await unlink(join(fixture.workspace, ".neverssh", "builds", BUILD_ID, "worker.py"));
+    const before = fixture.authentications;
+    dev = connectionId(await call("ssh_connect", { host: "fixture" }));
+    expect(fixture.authentications - before).toBe(1);
+    expect(await call("ssh_bash", { connection_id: dev, command: "printf repaired" })).toBe("repaired");
   });
 
   test("probe runs inside the persistent worker", async () => {
